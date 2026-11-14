@@ -315,3 +315,30 @@ def test_a_train_only_run_counts_the_samples_in_the_config_data(tmp_path):
     assert pipeline.kept_samples() == 2
     pipeline.state["phases"]["filter"] = {"status": "done", "kept": 7}
     assert pipeline.kept_samples() == 7
+
+
+def test_own_processes_include_their_descendants():
+    from emperor.pipeline.processes import OwnProcesses, with_descendants
+
+    parents = {10: 1, 11: 10, 12: 11, 13: 1, 14: 14}
+    assert with_descendants([10], parents) == (10, 11, 12)
+
+    class Alive:
+        pid = 10
+
+        def poll(self):
+            return None
+
+    own = OwnProcesses(parents=lambda: parents)
+    own.add(Alive())
+    assert own.pids() == (10, 11, 12)  # the launcher's child is the real trainer
+
+
+def test_process_parents_reads_this_process():
+    import os
+
+    from emperor.pipeline.processes import process_parents
+
+    parents = process_parents()
+    if parents:  # readable on Windows and Linux
+        assert parents.get(os.getpid()) == os.getppid()

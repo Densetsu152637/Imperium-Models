@@ -369,10 +369,15 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
 def offloading_trainer(base, torch):
     """A trainer whose training steps save activations to pinned CPU memory. Gradient
     checkpointing keeps only each layer's input; those move to RAM and come back for the
-    backward pass, so VRAM holds the weights and one layer's working set."""
+    backward pass, so VRAM holds the weights and one layer's working set.
+
+    Each step starts from an emptied CUDA cache: after a long sample the cache held 0.8 to
+    1.2 GiB in blocks too fragmented for the next one, which then ran out of memory at 16K
+    tokens with the allocator capped near the card's size."""
 
     class OffloadingTrainer(base):
         def training_step(self, *args, **kwargs):
+            torch.cuda.empty_cache()
             with torch.autograd.graph.save_on_cpu(pin_memory=True):
                 return super().training_step(*args, **kwargs)
 

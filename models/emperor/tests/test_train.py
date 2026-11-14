@@ -321,12 +321,17 @@ def test_offloading_is_opt_in_and_wraps_the_training_step():
         class autograd:
             graph = Graph
 
+        class cuda:
+            @staticmethod
+            def empty_cache():
+                entered.append("emptied")
+
     class Base:
         def training_step(self, *args, **kwargs):
             return "loss"
 
     trainer = offloading_trainer(Base, Torch)()
-    assert trainer.training_step() == "loss" and entered == [True]
+    assert trainer.training_step() == "loss" and entered == ["emptied", True]
 
 
 def test_the_training_length_covers_the_p99_of_the_data_up_to_a_cap():

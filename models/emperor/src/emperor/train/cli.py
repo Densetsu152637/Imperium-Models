@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -41,6 +42,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "show":
         print(json.dumps(dataclasses.asdict(config), indent=2))
         return 0
+    # Long samples fragment PyTorch's CUDA cache: at 16K tokens 1.2 GiB sat reserved but unused
+    # and the next allocation ran out of memory. Smaller split blocks and earlier collection
+    # keep it usable (expandable segments would too, but are not supported on Windows).
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,garbage_collection_threshold:0.7"
+    )
     from emperor.train import sft
 
     if args.command == "fit":
