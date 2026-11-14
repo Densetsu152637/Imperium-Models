@@ -8,14 +8,19 @@ attn_implementation = "sdpa"  # flash-attn has no Windows wheel
 [data]
 path = "data/hosted-1/final/final.jsonl"
 # The training length comes from the data: the longest sample, rounded up to 1,024 tokens, at
-# most 14,336. Longer samples are dropped, never truncated (100 of 2,600, 3.8%).
-# 16,384 was tried on 2026-11-15 and failed: real training fragments the CUDA cache, and long
-# samples ran out of memory (13.25 GiB allocated, 0.77 GiB fragmented, 0.2-0.4 GiB physically
-# free) although the single-step probe peaked at 14.03 GiB. Revisit with an OOM-safe trainer.
+# most 12,288 (the user's "local at 12K"). Longer samples are dropped, never truncated (314 of
+# 2,600, about 12%).
+# Longer lengths ran out of memory on the 16 GB card on 2026-11-15, because real training
+# fragments the CUDA cache (0.6-1.2 GiB reserved but unusable) beside the transient input
+# copies of the LoRA layers:
+# - 16,384: within the first 12 micro-steps (the single-step probe had peaked at 14.03 GiB);
+# - 14,336 with LoRA dropout 0.05: at optimiser step 2-3 (the dropout copy);
+# - 14,336 with dropout 0: at optimiser step 68 (the fp32 input cast of the fp32 adapters).
+# Revisit with bf16 adapters (autocast_adapter_dtype=False) or more VRAM.
 max_length_auto = true
 max_length_quantile = 1.0
-max_length_cap = 14336
-max_length = 14336  # replaced by the measured length
+max_length_cap = 12288
+max_length = 12288  # replaced by the measured length
 val_fraction = 0.05
 split_seed = 1337
 
@@ -84,7 +89,7 @@ intended_use = [
 limits = [
   "A 4B model: it can be wrong, and its answers need the checks Imperium applies.",
   "Trained on synthetic data from one teacher model; coverage outside it is untested.",
-  "Trained on traces of at most 14,336 tokens: the longest 3.8% of the hosted traces (100 of 2,600) were dropped, so very long multi-subagent sessions are under-represented.",
+  "Trained on traces of at most 12,288 tokens: the longest 12% of the hosted traces (314 of 2,600) were dropped, so very long multi-subagent sessions are under-represented.",
 ]
 judge = "kimi-k3.1-pro (Moonshot API, a different model family from the teacher; scored 1-5 on eight criteria with a pass or fail)"
 teacher = "deepseek-v4-pro"
