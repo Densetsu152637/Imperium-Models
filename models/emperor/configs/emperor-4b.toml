@@ -22,7 +22,10 @@ split_seed = 1337
 [lora]
 r = 32
 alpha = 64
-dropout = 0.05
+# No LoRA dropout: PEFT's dropout copies each targeted layer's input for the LoRA branch, and on
+# down_proj at 14K tokens that 486 MiB copy ran out of memory (2026-11-15). Without dropout PEFT
+# uses Identity and copies nothing.
+dropout = 0.0
 # Qwen3.5: full-attention layers (q/k/v/o), Gated DeltaNet layers (in_proj_qkv, in_proj_z,
 # out_proj; the per-head in_proj_a/in_proj_b gates stay frozen) and every MLP.
 target_modules = [

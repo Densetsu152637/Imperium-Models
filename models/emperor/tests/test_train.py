@@ -381,6 +381,8 @@ def test_the_emperor_configs(path, name, base):
     # logprob tile, now 121 MiB), so 14,336 until 16K is tried again.
     assert config.data.max_length_auto
     assert config.data.max_length_cap == {"emperor-4b": 14336, "emperor-lite-2b": 16384}[name]
+    # Emperor 4B: no LoRA dropout (its input copies ran out of memory at 14K tokens).
+    assert config.lora.dropout == {"emperor-4b": 0.0, "emperor-lite-2b": 0.05}[name]
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
     # Just over the 16K probe's 14.03 GiB peak: a model left resident blocks the start.
     assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5
