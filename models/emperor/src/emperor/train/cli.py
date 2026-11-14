@@ -10,6 +10,7 @@ from pathlib import Path
 
 from emperor.train.config import ConfigError, load_config
 
+TRAIN_ERROR_EXIT_CODE = 3  # training refused with a reason; config errors exit with 2
 DEFAULT_ALLOC_CONF = "max_split_size_mb:128,garbage_collection_threshold:0.7"
 
 
@@ -62,7 +63,15 @@ def main(argv: list[str] | None = None) -> int:
     from emperor.train import sft
 
     if args.command == "fit":
-        return sft.train(config, args.root, args.pause_file)
+        try:
+            return sft.train(config, args.root, args.pause_file)
+        except SystemExit as error:
+            if isinstance(error.code, int) or error.code is None:
+                raise  # an exit code chosen on purpose (paused, VRAM busy)
+            # A refusal with a reason (no adapter, no trainable samples): a clear failure,
+            # told apart from a process that was killed.
+            print(f"train: error: {error.code}", file=sys.stderr, flush=True)
+            return TRAIN_ERROR_EXIT_CODE
     print(sft.merge(config, args.root))
     return 0
 

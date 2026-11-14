@@ -236,3 +236,45 @@ def test_a_busy_gpu_is_not_now_not_a_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(stages.time, "sleep", lambda seconds: None)
     code = stages.run_fit(Path("c.toml"), tmp_path / "l.log", Gate(), tmp_path / "P", 0, tmp_path)
     assert code == 0 and codes == []  # waited, started again, finished
+
+
+def test_clear_failure_codes_are_not_retried_as_interruptions(tmp_path, monkeypatch):
+    for code in (2, 3):
+        outcome = [(code, "train: error: no adapter")]
+        stage, calls = stage_run(tmp_path / str(code), monkeypatch, outcome)
+        assert stage["status"] == "failed" and stage["attempts"] == 1 and len(calls) == 1
+
+
+def test_a_refusal_with_a_reason_exits_with_its_own_code(tmp_path, monkeypatch, capsys):
+    from emperor.train import cli, sft
+
+    def refuse(config, root, pause_file):
+        raise SystemExit("no adapter to continue at x")
+
+    monkeypatch.setattr(sft, "train", refuse)
+    config = tmp_path / "c.toml"
+    config.write_text("", encoding="utf-8")
+    assert cli.main(["fit", "--config", str(config)]) == cli.TRAIN_ERROR_EXIT_CODE
+    assert "no adapter to continue" in capsys.readouterr().err
+
+
+def test_a_run_dir_outside_the_root_still_gets_a_final_config(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "data.jsonl").write_text(json.dumps({"id": "s0", "messages": []}) + "\n", "utf-8")
+    config = root / "c.toml"
+    config.write_text(
+        '[data]\npath = "data.jsonl"\nmax_length_auto = true\nmax_length_cap = 12288\n'
+        'val_fraction = 0.0\n[release]\nname = "m"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(stages, "measure_lengths", lambda config, train: {"s0": 100})
+    outside = tmp_path / "elsewhere"
+    train_main(
+        [
+            "stages", "--config", str(config), "--root", str(root),
+            "--base-adapter", "a", "--run-dir", str(outside), "--asleep",
+        ]
+    )  # fmt: skip
+    final = (outside / "final.toml").read_text(encoding="utf-8")
+    assert "final-no-train" in final and outside.resolve().as_posix() in final
