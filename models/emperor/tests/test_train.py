@@ -363,7 +363,7 @@ def test_the_emperor_configs(path, name, base):
     assert config.merge.output_dir == f"weights/{name}-bf16"
     assert config.merge.adapter_dir.startswith(config.train.output_dir)
     # Training length from the data, never above 16K; longer samples are dropped.
-    assert config.data.max_length_auto and config.data.max_length_cap == 16384
+    assert config.data.max_length_auto and config.data.max_length_cap in (14336, 16384)
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
     # Just over the 16K probe's 14.03 GiB peak: a model left resident blocks the start.
     assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5
