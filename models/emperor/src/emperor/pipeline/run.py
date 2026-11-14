@@ -270,7 +270,23 @@ class Pipeline:
         self.state_path = settings.run_dir / "state.json"
         if self.state_path.exists():
             self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self._bind_train_config()
         self.started = datetime.now(UTC).isoformat()
+
+    def _bind_train_config(self) -> None:
+        """A run folder belongs to one training config: its train, merge, export and eval
+        records describe that model. Resuming it with another config is refused (each model
+        needs its own run folder); a folder from before this check adopts the config given."""
+        config = Path(self.s.train_config).as_posix()
+        recorded = self.state.get("train_config")
+        if recorded is not None and recorded != config:
+            raise SystemExit(
+                f"{self.s.run_dir} was run with --train-config {recorded}, not {config}; "
+                "each model needs its own run folder"
+            )
+        if recorded is None and self.state_path.parent.is_dir():
+            self.state["train_config"] = config
+            self._save()
 
     # -- helpers ---------------------------------------------------------------------------
 
@@ -685,10 +701,7 @@ class Pipeline:
                 continue
             if self._phase_done(name) and name in ("train", "merge", "export", "eval"):
                 continue
-            if (
-                name == "train"
-                and self.state["phases"].get("filter", {}).get("kept", 0) < self.s.min_samples
-            ):
+            if name == "train" and self.kept_samples() < self.s.min_samples:
                 self._record(
                     name,
                     {
@@ -703,6 +716,21 @@ class Pipeline:
                 status = result["status"]
                 break
         return self.write_summary(status)
+
+    def kept_samples(self) -> int:
+        """Samples available to train on: the filter phase's count when this run filtered,
+        otherwise the lines in the training config's data files (a run that only trains)."""
+        filtered = self.state["phases"].get("filter", {})
+        if "kept" in filtered:
+            return int(filtered["kept"])
+        config = self.sft
+        total = 0
+        for path in (config.data.path, *config.data.extra_paths):
+            file = Path(path) if Path(path).is_absolute() else self.s.root / path
+            if file.is_file():
+                with file.open(encoding="utf-8") as handle:
+                    total += sum(1 for line in handle if line.strip())
+        return total
 
     def write_summary(self, status: str) -> dict:
         data_report = self.s.data_dir / "report.json"

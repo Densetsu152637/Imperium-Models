@@ -1,6 +1,9 @@
 # Consul supervised fine-tuning: bf16 LoRA on full-precision weights (no QLoRA, no 4/8-bit).
 # Paths are relative to the repository root unless absolute. The base is read-only.
 
+# The earlier single-model recipe (8K). Its names end in -8k so it never writes over the
+# outputs of configs/consul-4b.toml.
+
 [model]
 base = "F:/AI-Models/Qwen/Qwen3.5-4B"
 attn_implementation = "sdpa"  # flash-attn has no Windows wheel
@@ -43,10 +46,10 @@ seed = 1337
 
 [merge]
 adapter_dir = "outputs/sft/adapter"
-output_dir = "weights/consul-4b-bf16"
+output_dir = "weights/consul-4b-8k-bf16"
 
 [release]
-name = "consul-4b"  # weights/consul-4b-gguf/, consul-4b-<TYPE>.gguf
+name = "consul-4b-8k"  # weights/consul-4b-8k-gguf/, consul-4b-8k-<TYPE>.gguf
 title = "Consul"
 summary = """Consul is an open-weight critic for Imperium. Given a plan, a diff or an agent \
 report, it reasons in a thinking block, then returns ranked findings (location, impact, \
