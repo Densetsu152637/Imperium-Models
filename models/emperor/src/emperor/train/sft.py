@@ -349,6 +349,22 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
     trainer_class = offloading_trainer(SFTTrainer, torch) if offload else SFTTrainer
     if offload:
         log.info("activations offloaded to pinned RAM during training steps")
+    peft_config = PeftLoraConfig(
+        r=config.lora.r,
+        lora_alpha=config.lora.alpha,
+        lora_dropout=config.lora.dropout,
+        target_modules=config.lora.target_modules,
+        task_type="CAUSAL_LM",
+    )
+    if config.train.init_adapter:
+        from peft import PeftModel
+
+        start = _resolve(config.train.init_adapter, root)
+        if not (start / "adapter_config.json").is_file():
+            raise SystemExit(f"no adapter to continue at {start}")
+        model = PeftModel.from_pretrained(model, str(start), is_trainable=True)
+        peft_config = None
+        log.info("continuing the adapter at %s", start)
     trainer = trainer_class(
         model=model,
         args=args,
@@ -356,13 +372,7 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
         eval_dataset=Dataset.from_list(data["val"]) if has_val else None,
         data_collator=collate,
         processing_class=tokenizer,
-        peft_config=PeftLoraConfig(
-            r=config.lora.r,
-            lora_alpha=config.lora.alpha,
-            lora_dropout=config.lora.dropout,
-            target_modules=config.lora.target_modules,
-            task_type="CAUSAL_LM",
-        ),
+        peft_config=peft_config,
         callbacks=[PauseOnFile(), StepTimer()],
     )
     resume = get_last_checkpoint(str(output_dir)) if output_dir.exists() else None
