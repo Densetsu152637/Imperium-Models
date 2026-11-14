@@ -322,6 +322,16 @@ def test_offloading_is_opt_in_and_wraps_the_training_step():
             graph = Graph
 
         class cuda:
+            idle = 1.0  # GiB reserved but unallocated
+
+            @staticmethod
+            def memory_reserved():
+                return int((13 + Torch.cuda.idle) * 2**30)
+
+            @staticmethod
+            def memory_allocated():
+                return 13 * 2**30
+
             @staticmethod
             def empty_cache():
                 entered.append("emptied")
@@ -332,6 +342,9 @@ def test_offloading_is_opt_in_and_wraps_the_training_step():
 
     trainer = offloading_trainer(Base, Torch)()
     assert trainer.training_step() == "loss" and entered == ["emptied", True]
+    entered.clear()
+    Torch.cuda.idle = 0.2  # little sits idle: the cache is kept
+    assert trainer.training_step() == "loss" and entered == [True]
 
 
 def test_the_training_length_covers_the_p99_of_the_data_up_to_a_cap():
@@ -363,7 +376,9 @@ def test_the_emperor_configs(path, name, base):
     assert config.merge.output_dir == f"weights/{name}-bf16"
     assert config.merge.adapter_dir.startswith(config.train.output_dir)
     # Training length from the data, never above 16K; longer samples are dropped.
-    assert config.data.max_length_auto and config.data.max_length_cap in (14336, 16384)
+    # Emperor 4B: 16K ran out of memory in real training (fragmentation), so 14,336.
+    assert config.data.max_length_auto
+    assert config.data.max_length_cap == {"emperor-4b": 14336, "emperor-lite-2b": 16384}[name]
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
     # Just over the 16K probe's 14.03 GiB peak: a model left resident blocks the start.
     assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5

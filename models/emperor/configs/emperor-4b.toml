@@ -80,6 +80,7 @@ intended_use = [
 limits = [
   "A 4B model: it can be wrong, and its answers need the checks Imperium applies.",
   "Trained on synthetic data from one teacher model; coverage outside it is untested.",
+  "Trained on traces of at most 14,336 tokens: the longest 3.8% of the hosted traces (100 of 2,600) were dropped, so very long multi-subagent sessions are under-represented.",
 ]
 judge = "kimi-k3.1-pro (Moonshot API, a different model family from the teacher; scored 1-5 on eight criteria with a pass or fail)"
 teacher = "deepseek-v4-pro"

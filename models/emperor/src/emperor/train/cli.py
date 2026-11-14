@@ -10,6 +10,8 @@ from pathlib import Path
 
 from emperor.train.config import ConfigError, load_config
 
+DEFAULT_ALLOC_CONF = "max_split_size_mb:128,garbage_collection_threshold:0.7"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="train", description="Emperor bf16 LoRA fine-tuning.")
@@ -44,10 +46,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # Long samples fragment PyTorch's CUDA cache: at 16K tokens 1.2 GiB sat reserved but unused
     # and the next allocation ran out of memory. Smaller split blocks and earlier collection
-    # keep it usable (expandable segments would too, but are not supported on Windows).
-    os.environ.setdefault(
-        "PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,garbage_collection_threshold:0.7"
-    )
+    # keep it usable (expandable segments would too, but are not supported on Windows). A value
+    # the user sets in either variable wins.
+    if not (os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or os.environ.get("PYTORCH_ALLOC_CONF")):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = DEFAULT_ALLOC_CONF
     from emperor.train import sft
 
     if args.command == "fit":

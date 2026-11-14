@@ -321,7 +321,8 @@ def test_own_processes_include_their_descendants():
     from emperor.pipeline.processes import OwnProcesses, with_descendants
 
     parents = {10: 1, 11: 10, 12: 11, 13: 1, 14: 14}
-    assert with_descendants([10], parents) == (10, 11, 12)
+    born = {1: 0, 10: 100, 11: 110, 12: 120, 13: 5, 14: 6}
+    assert with_descendants([10], parents, born.get) == (10, 11, 12)
 
     class Alive:
         pid = 10
@@ -329,7 +330,7 @@ def test_own_processes_include_their_descendants():
         def poll(self):
             return None
 
-    own = OwnProcesses(parents=lambda: parents)
+    own = OwnProcesses(parents=lambda: parents, created=born.get)
     own.add(Alive())
     assert own.pids() == (10, 11, 12)  # the launcher's child is the real trainer
 
@@ -342,3 +343,26 @@ def test_process_parents_reads_this_process():
     parents = process_parents()
     if parents:  # readable on Windows and Linux
         assert parents.get(os.getpid()) == os.getppid()
+
+
+def test_a_reused_pid_does_not_adopt_a_foreign_process_tree():
+    from emperor.pipeline.processes import with_descendants
+
+    # 50 still names 10 as its parent, but it is older than our 10: its real parent died and
+    # the PID was reused for our process.
+    parents = {10: 1, 50: 10, 51: 50}
+    born = {1: 0, 10: 500, 50: 100, 51: 150}
+    assert with_descendants([10], parents, born.get) == (10,)
+    # A process that cannot be opened (None) is not counted either.
+    assert with_descendants([10], {10: 1, 60: 10}, {10: 500}.get) == (10,)
+
+
+def test_process_created_reads_this_process():
+    import os
+
+    from emperor.pipeline.processes import process_created
+
+    now = process_created(os.getpid())
+    if now is not None:
+        parent = process_created(os.getppid())
+        assert parent is None or parent <= now

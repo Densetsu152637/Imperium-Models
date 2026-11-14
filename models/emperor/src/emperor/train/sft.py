@@ -6,6 +6,7 @@ rest of the package and its tests never load them. The base model directory is o
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -230,6 +231,12 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
         raise SystemExit("CUDA is not available; check the torch build (cu128 for RTX 50 series)")
     offload = config.train.offload_activations
     log.info("VRAM cap for training: %.1f GiB", prepare_vram(config))
+    log.info(
+        "CUDA allocator config: %s",
+        os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+        or os.environ.get("PYTORCH_ALLOC_CONF")
+        or "default",
+    )
     use_fused_attention()
     shrink_logprob_tiles()
     base = Path(config.model.base)
@@ -366,18 +373,23 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
     return 0
 
 
+FRAGMENTED_GIB = 0.5
+
+
 def offloading_trainer(base, torch):
     """A trainer whose training steps save activations to pinned CPU memory. Gradient
     checkpointing keeps only each layer's input; those move to RAM and come back for the
     backward pass, so VRAM holds the weights and one layer's working set.
 
-    Each step starts from an emptied CUDA cache: after a long sample the cache held 0.8 to
-    1.2 GiB in blocks too fragmented for the next one, which then ran out of memory at 16K
-    tokens with the allocator capped near the card's size."""
+    A step starts from an emptied CUDA cache when more than `FRAGMENTED_GIB` sits reserved but
+    unused: after a long sample the cache held 0.8 to 1.2 GiB in blocks too fragmented for the
+    next one, which then ran out of memory with the allocator capped near the card's size."""
 
     class OffloadingTrainer(base):
         def training_step(self, *args, **kwargs):
-            torch.cuda.empty_cache()
+            idle = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            if idle > FRAGMENTED_GIB * 2**30:
+                torch.cuda.empty_cache()
             with torch.autograd.graph.save_on_cpu(pin_memory=True):
                 return super().training_step(*args, **kwargs)
 
