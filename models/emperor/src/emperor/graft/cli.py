@@ -27,7 +27,7 @@ from emperor.graft.sources import BUCKETS, SOURCES, Source
 # Per source: samples to keep after conversion and filtering, before mixing (the mixer takes
 # what the target shares ask for; a margin lets it balance subsets).
 DEFAULT_KEEP = 1500
-MAX_THINKING_TOKENS = 4096  # the OpenThoughts thinking cap (longer samples are dropped)
+MAX_THINKING_TOKENS = 8192  # OpenThoughts: at 4096 only ~1% of code and math traces fit
 AGENT_MAX_THINKING_TOKENS = 8192
 
 
@@ -111,13 +111,27 @@ def describe(source: Source) -> dict:
 
 
 def records_of(source: Source, args, cache: Path):
+    """Records from every file of the source, taken in turn (one from each file, then the
+    next), so a caller that stops early still covers every file (OpenThoughts: each domain)."""
+    streams = []
     for file in source.files:
         url = fetch.file_url(source.dataset, file)
         if file.endswith(".parquet"):
             path = fetch.download(url, cache / source.dataset.replace("/", "__") / file)
-            yield from fetch.parquet_rows(path)
+            streams.append(fetch.parquet_rows(path))
         else:
-            yield from fetch.sample_jsonl(url, args.slices, args.slice_bytes, args.seed)
+            streams.append(fetch.sample_jsonl(url, args.slices, args.slice_bytes, args.seed))
+    yield from interleave(streams)
+
+
+def interleave(streams):
+    streams = list(streams)
+    while streams:
+        for stream in list(streams):
+            try:
+                yield next(stream)
+            except StopIteration:
+                streams.remove(stream)
 
 
 def fetch_source(source: Source, args, out: Path) -> dict:
@@ -126,6 +140,10 @@ def fetch_source(source: Source, args, out: Path) -> dict:
     seen: set[str] = set()
     dropped: dict[str, int] = {}
     generators: dict[str, int] = {}
+    # OpenThoughts: an equal share per domain (one file each), so the thinking cap, which
+    # drops most long code and math traces, does not leave science alone.
+    per_domain: dict[str, int] = {}
+    quota = -(-args.keep // len(source.files)) if source.kind == "openthoughts" else 0
     read = 0
     for record in records_of(source, args, out / "cache"):
         read += 1
@@ -139,8 +157,13 @@ def fetch_source(source: Source, args, out: Path) -> dict:
         if sample["id"] in seen:
             dropped["duplicate"] = dropped.get("duplicate", 0) + 1
             continue
+        domain = sample["meta"].get("domain")
+        if domain and quota and per_domain.get(domain, 0) >= quota:
+            continue  # this domain is full; keep reading for the others
         seen.add(sample["id"])
         kept.append(sample)
+        if domain:
+            per_domain[domain] = per_domain.get(domain, 0) + 1
         generators[sample["meta"]["generator"]] = generators.get(sample["meta"]["generator"], 0) + 1
         if len(kept) >= args.keep:
             break
@@ -155,6 +178,7 @@ def fetch_source(source: Source, args, out: Path) -> dict:
         "generators": generators,
         "licence": source.licence,
         "thinking_cap_tokens": cap,
+        "per_domain": per_domain or None,
     }
 
 

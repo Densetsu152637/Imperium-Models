@@ -261,3 +261,9 @@ def test_mix_cli_writes_the_mix_and_report(tmp_path):
     assert report["buckets"]["openthoughts"]["taken"] == 10  # 45:10 with the others missing
     assert report["buckets"]["nemotron"]["missing"]
     assert len((out / "final.jsonl").read_text(encoding="utf-8").splitlines()) == 55
+
+
+def test_files_are_read_in_turn():
+    from emperor.graft.cli import interleave
+
+    assert list(interleave([iter([1, 2, 3]), iter(["a"]), iter([])])) == [1, "a", 2, 3]
