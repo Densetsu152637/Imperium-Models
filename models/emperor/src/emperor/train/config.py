@@ -75,10 +75,10 @@ class TrainConfig:
     offload_activations: bool = False
     offload_min_free_vram_gib: float = 10.0  # weights, LoRA, optimiser and one layer's work
     # The VRAM PyTorch may allocate, in GiB. 0: what is free when training starts, less a
-    # margin. A fixed cap near the card's size (e.g. 15.3 of 16) lets long traces fit when
-    # other apps yield their VRAM; set the min-free check above to 0 so it does not refuse to
-    # start while they still hold some. Overflow past the cap raises out-of-memory at once
-    # instead of spilling into shared system memory.
+    # margin. A fixed cap near the card's size (e.g. 15.3 of 16) lets long traces fit; it is
+    # still clamped to the VRAM free at the start less 0.2 GiB, and the min-free check above
+    # should sit just over the expected peak so a model left resident blocks the start.
+    # Overflow past the cap raises out-of-memory at once instead of spilling into shared memory.
     vram_cap_gib: float = 0.0
     save_steps: int = 50
     save_total_limit: int = 3
@@ -105,7 +105,8 @@ class ReleaseConfig:
     # The card's base model and the memory estimates for it. The KV layout is used only when the
     # merged weights have no config.json to read it from.
     base_model: str = "Qwen/Qwen3.5-4B"  # the Hugging Face id the card names
-    params_billions: float = 4.02  # language-model parameters, for size estimates
+    # Language-model parameters only (no vision tower, no MTP head), for size estimates.
+    params_billions: float = 4.21
     kv_layers: int = 8  # layers with a KV cache (Qwen3.5: the full-attention layers only)
     kv_heads: int = 4
     head_dim: int = 256

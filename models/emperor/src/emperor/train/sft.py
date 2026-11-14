@@ -39,12 +39,29 @@ def require_free_vram(min_gib: float) -> None:
         )
 
 
+CAP_MARGIN_GIB = 0.2  # with a fixed cap: the user freed the card, so only a small margin
+
+
 def vram_fraction(free: int, total: int, cap_gib: float = 0.0, margin_gib: float = 0.5) -> float:
-    """The share of the card PyTorch may allocate: `cap_gib` when set (at most the whole card),
-    otherwise the VRAM free now less a margin; never below a tenth."""
+    """The share of the card PyTorch may allocate; never below a tenth.
+
+    Without `cap_gib`: the VRAM free now, less `margin_gib`. With it: `cap_gib`, but never more
+    than the VRAM free now less `CAP_MARGIN_GIB`, so memory another process holds is never
+    counted on (training would spill into shared memory and crawl instead of failing)."""
     if cap_gib > 0:
-        return max(min(cap_gib * 2**30 / total, 1.0), 0.1)
+        cap = min(cap_gib * 2**30, free - CAP_MARGIN_GIB * 2**30)
+        return max(min(cap / total, 1.0), 0.1)
     return max(min((free - margin_gib * 2**30) / total, 1.0), 0.1)
+
+
+def prepare_vram(config: SftConfig) -> float:
+    """Refuse to start when too little VRAM is free, then cap the allocator; returns the cap in
+    GiB."""
+    offload = config.train.offload_activations
+    require_free_vram(
+        config.train.offload_min_free_vram_gib if offload else config.model.min_free_vram_gib
+    )
+    return cap_vram(config.train.vram_cap_gib)
 
 
 def cap_vram(cap_gib: float = 0.0, margin_gib: float = 0.5) -> float:
@@ -212,10 +229,7 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is not available; check the torch build (cu128 for RTX 50 series)")
     offload = config.train.offload_activations
-    require_free_vram(
-        config.train.offload_min_free_vram_gib if offload else config.model.min_free_vram_gib
-    )
-    log.info("VRAM cap for training: %.1f GiB", cap_vram(config.train.vram_cap_gib))
+    log.info("VRAM cap for training: %.1f GiB", prepare_vram(config))
     use_fused_attention()
     shrink_logprob_tiles()
     base = Path(config.model.base)

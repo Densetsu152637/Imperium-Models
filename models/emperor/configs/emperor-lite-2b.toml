@@ -39,10 +39,12 @@ per_device_batch_size = 1
 gradient_accumulation_steps = 16
 gradient_checkpointing = true
 # 16K traces: activations in pinned RAM, and the allocator capped at 15.3 GiB of the 16 GB card
-# (probe, 2026-11-15: Emperor 4B peaked at 14.03 GiB, 19.4 s a step at 16,384 tokens). Other apps
-# yield VRAM as training grows, so the free-VRAM precheck is off.
+# (probe, 2026-11-15: Emperor 4B peaked at 14.03 GiB, 19.4 s a step at 16,384 tokens). The cap is
+# clamped to the VRAM free at the start less 0.2 GiB, and training refuses to start with less
+# than 14.1 GiB free (just over the probe's peak): a model left resident blocks it, an idle
+# desktop (about 14.2-14.6 GiB free) does not.
 offload_activations = true
-offload_min_free_vram_gib = 0.0
+offload_min_free_vram_gib = 14.1
 vram_cap_gib = 15.3
 save_steps = 25  # a checkpoint every N optimiser steps; training resumes from the last one
 save_total_limit = 3
@@ -62,7 +64,7 @@ size = "2B"
 eval_alias = "emperor-lite"
 gguf_types = ["Q8_0", "Q6_K", "Q4_K_M"]
 base_model = "Qwen/Qwen3.5-2B"
-params_billions = 1.88
+params_billions = 1.88  # language model only: no vision tower, no MTP head
 kv_layers = 6  # of 24; the 18 Gated DeltaNet layers keep a fixed-size state
 kv_heads = 2
 head_dim = 256
