@@ -380,9 +380,9 @@ def test_the_emperor_configs(path, name, base):
     # Emperor 4B: 16K and 14K ran out of memory in real training (fragmented cache plus the
     # LoRA layers' input copies), so 12,288.
     assert config.data.max_length_auto
-    assert config.data.max_length_cap == {"emperor-4b": 12288, "emperor-lite-2b": 16384}[name]
-    # Emperor 4B: no LoRA dropout (its input copies ran out of memory at 14K tokens).
-    assert config.lora.dropout == {"emperor-4b": 0.0, "emperor-lite-2b": 0.05}[name]
+    assert config.data.max_length_cap == 12288
+    # No LoRA dropout (its input copies ran Emperor 4B out of memory at 14K tokens).
+    assert config.lora.dropout == 0.0
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
     # Just over the 16K probe's 14.03 GiB peak: a model left resident blocks the start.
     assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5

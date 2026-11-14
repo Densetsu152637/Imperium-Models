@@ -512,6 +512,7 @@ def test_the_consul_configs(name, base):
     assert config.merge.output_dir == f"weights/{name}-bf16"
     assert config.merge.adapter_dir.startswith(config.train.output_dir)
     assert config.data.path == "data/hosted-1/final/final.jsonl"
-    assert config.data.max_length_auto and config.data.max_length_cap == 16384
+    assert config.data.max_length_auto and config.data.max_length_cap == 12288
+    assert config.lora.dropout == 0.0
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
     assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5
