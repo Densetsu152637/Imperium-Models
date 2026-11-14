@@ -340,3 +340,73 @@ def test_the_training_length_covers_the_p99_of_the_data_up_to_a_cap():
     assert pick_max_length(lengths, quantile=1.0) == 11264  # the longest, 10,900
     config = parse_config({"data": {"max_length_auto": True}})
     assert config.data.max_length_cap == 32768 and config.data.max_length_quantile == 1.0
+
+
+@pytest.mark.parametrize(
+    ("path", "name", "base"),
+    [
+        ("configs/emperor-4b.toml", "emperor-4b", "4B"),
+        ("configs/emperor-lite-2b.toml", "emperor-lite-2b", "2B"),
+        ("../consul/configs/consul-4b.toml", "consul-4b", "4B"),
+        ("../consul/configs/consul-lite-2b.toml", "consul-lite-2b", "2B"),
+    ],
+)
+def test_the_four_model_configs(path, name, base):
+    config = load_config(ROOT / path)
+    assert config.model.base.endswith(f"Qwen3.5-{base}")
+    assert config.release.name == name and config.release.size == base
+    assert config.release.base_model == f"Qwen/Qwen3.5-{base}"
+    assert config.train.output_dir == f"outputs/{name}"
+    assert config.merge.output_dir == f"weights/{name}-bf16"
+    assert config.merge.adapter_dir.startswith(config.train.output_dir)
+    # Training length from the data, never above 16K; longer samples are dropped.
+    assert config.data.max_length_auto and config.data.max_length_cap == 16384
+    assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
+    assert config.train.offload_min_free_vram_gib == 0
+
+
+def test_the_four_configs_have_distinct_names_and_aliases():
+    paths = [
+        "configs/emperor-4b.toml",
+        "configs/emperor-lite-2b.toml",
+        "../consul/configs/consul-4b.toml",
+        "../consul/configs/consul-lite-2b.toml",
+    ]
+    releases = [load_config(ROOT / p).release for p in paths]
+    assert len({r.name for r in releases}) == 4
+    assert len({r.eval_alias for r in releases}) == 4
+    assert len({r.summary for r in releases}) == 4
+
+
+def test_vram_cap_is_a_fixed_size_or_the_free_vram():
+    from emperor.train.sft import vram_fraction
+
+    gib = 2**30
+    total = 16 * gib
+    assert vram_fraction(4 * gib, total, cap_gib=15.3) == pytest.approx(15.3 / 16)
+    assert vram_fraction(4 * gib, total, cap_gib=20.0) == 1.0  # never above the card
+    assert vram_fraction(12.5 * gib, total) == pytest.approx(12 / 16)  # free less 0.5 GiB
+    assert vram_fraction(0, total) == 0.1
+
+
+def test_a_zero_min_free_vram_skips_the_check(monkeypatch):
+    import sys
+
+    from emperor.train.sft import require_free_vram
+
+    monkeypatch.setitem(sys.modules, "torch", None)  # importing torch would fail
+    require_free_vram(0)
+
+
+def test_vram_settings_and_length_keys_are_validated():
+    assert parse_config({"data": {"max_length_quantile": 0.99}}).data.max_length_quantile == 0.99
+    with pytest.raises(ConfigError, match="not supported"):
+        parse_config({"data": {"quantile_bits": 4}})
+    with pytest.raises(ConfigError, match="vram_cap_gib"):
+        parse_config({"train": {"vram_cap_gib": -1}})
+    with pytest.raises(ConfigError, match="minimum free VRAM"):
+        parse_config({"train": {"offload_min_free_vram_gib": -1}})
+    with pytest.raises(ConfigError, match="max_length_quantile"):
+        parse_config({"data": {"max_length_quantile": 0}})
+    with pytest.raises(ConfigError, match="KV layout"):
+        parse_config({"release": {"kv_heads": 0}})

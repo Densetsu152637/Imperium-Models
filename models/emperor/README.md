@@ -21,7 +21,8 @@ Imperium's `spawn_agent` and `await_tasks` tools.
 | `src/emperor/export/` | GGUF export through llama.cpp: bf16 and quantised variants (stage 6) |
 | `src/emperor/release/` | Model cards, and the guarded Hugging Face publish |
 | `src/emperor/pipeline/` | The idle-gated orchestrator: data, train, merge, eval |
-| `configs/sft.toml` | The training recipe |
+| `configs/emperor-4b.toml`, `configs/emperor-lite-2b.toml` | Emperor (Qwen3.5-4B) and Emperor Lite (Qwen3.5-2B): recipe, 16K length from the data, VRAM cap, release text |
+| `configs/sft.toml` | The earlier single-model recipe (8K, old data layout) |
 | `data/`, `runs/`, `outputs/`, `weights/` | Generated locally and ignored by Git |
 
 Weights and datasets are not stored in Git. They are written under `data/` and `weights/`
