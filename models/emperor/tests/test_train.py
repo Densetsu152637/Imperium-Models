@@ -377,10 +377,10 @@ def test_the_emperor_configs(path, name, base):
     assert config.merge.output_dir == f"weights/{name}-bf16"
     assert config.merge.adapter_dir.startswith(config.train.output_dir)
     # Training length from the data, never above 16K; longer samples are dropped.
-    # Emperor 4B: 16K ran out of memory in real training (fragmented cache plus the 486 MiB
-    # logprob tile, now 121 MiB), so 14,336 until 16K is tried again.
+    # Emperor 4B: 16K and 14K ran out of memory in real training (fragmented cache plus the
+    # LoRA layers' input copies), so 12,288.
     assert config.data.max_length_auto
-    assert config.data.max_length_cap == {"emperor-4b": 14336, "emperor-lite-2b": 16384}[name]
+    assert config.data.max_length_cap == {"emperor-4b": 12288, "emperor-lite-2b": 16384}[name]
     # Emperor 4B: no LoRA dropout (its input copies ran out of memory at 14K tokens).
     assert config.lora.dropout == {"emperor-4b": 0.0, "emperor-lite-2b": 0.05}[name]
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
