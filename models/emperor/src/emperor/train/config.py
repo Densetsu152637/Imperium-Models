@@ -80,6 +80,9 @@ class TrainConfig:
     # should sit just over the expected peak so a model left resident blocks the start.
     # Overflow past the cap raises out-of-memory at once instead of spilling into shared memory.
     vram_cap_gib: float = 0.0
+    # Continue training this LoRA adapter (a directory saved by an earlier run) instead of
+    # starting a new one; the long-sample stages use it. Empty: a new adapter.
+    init_adapter: str = ""
     save_steps: int = 50
     save_total_limit: int = 3
     eval_steps: int = 50

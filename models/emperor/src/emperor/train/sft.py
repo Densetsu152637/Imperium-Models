@@ -7,6 +7,7 @@ rest of the package and its tests never load them. The base model directory is o
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -25,19 +26,26 @@ log = logging.getLogger("emperor.train")
 PAUSED_EXIT_CODE = 75  # EX_TEMPFAIL: a checkpoint was saved and the run should be resumed
 
 
+VRAM_BUSY_EXIT_CODE = 76  # "not now": another process holds the VRAM; nothing was trained
+
+
 def require_free_vram(min_gib: float) -> None:
     """Stop before loading anything when another process holds the VRAM training needs. Layers
-    offloaded to the CPU break LoRA's backward pass, so training only runs fully on the GPU."""
+    offloaded to the CPU break LoRA's backward pass, so training only runs fully on the GPU.
+    Exits with VRAM_BUSY_EXIT_CODE, so a caller can wait and retry instead of failing."""
     if min_gib <= 0:
         return  # check off: other apps are expected to yield VRAM (see train.vram_cap_gib)
     import torch
 
     free_gib = torch.cuda.mem_get_info(0)[0] / 2**30
     if free_gib < min_gib:
-        raise SystemExit(
+        message = (
             f"only {free_gib:.1f} GiB of VRAM is free and training needs {min_gib:.1f} GiB; "
             "close other GPU apps (games, browsers, llama-server) and resume the run"
         )
+        log.error(message)
+        print(f"train: {message}", file=sys.stderr, flush=True)
+        raise SystemExit(VRAM_BUSY_EXIT_CODE)
 
 
 CAP_MARGIN_GIB = 0.2  # with a fixed cap: the user freed the card, so only a small margin
@@ -349,6 +357,22 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
     trainer_class = offloading_trainer(SFTTrainer, torch) if offload else SFTTrainer
     if offload:
         log.info("activations offloaded to pinned RAM during training steps")
+    peft_config = PeftLoraConfig(
+        r=config.lora.r,
+        lora_alpha=config.lora.alpha,
+        lora_dropout=config.lora.dropout,
+        target_modules=config.lora.target_modules,
+        task_type="CAUSAL_LM",
+    )
+    if config.train.init_adapter:
+        from peft import PeftModel
+
+        start = _resolve(config.train.init_adapter, root)
+        if not (start / "adapter_config.json").is_file():
+            raise SystemExit(f"no adapter to continue at {start}")
+        model = PeftModel.from_pretrained(model, str(start), is_trainable=True)
+        peft_config = None
+        log.info("continuing the adapter at %s", start)
     trainer = trainer_class(
         model=model,
         args=args,
@@ -356,13 +380,7 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
         eval_dataset=Dataset.from_list(data["val"]) if has_val else None,
         data_collator=collate,
         processing_class=tokenizer,
-        peft_config=PeftLoraConfig(
-            r=config.lora.r,
-            lora_alpha=config.lora.alpha,
-            lora_dropout=config.lora.dropout,
-            target_modules=config.lora.target_modules,
-            task_type="CAUSAL_LM",
-        ),
+        peft_config=peft_config,
         callbacks=[PauseOnFile(), StepTimer()],
     )
     resume = get_last_checkpoint(str(output_dir)) if output_dir.exists() else None

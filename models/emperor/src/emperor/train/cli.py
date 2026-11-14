@@ -20,10 +20,15 @@ def build_parser() -> argparse.ArgumentParser:
         ("show", "print the validated configuration"),
         ("fit", "train (or resume from the last checkpoint)"),
         ("merge", "merge the adapter into the base and save bf16 safetensors"),
+        ("stages", "train the samples too long for the base run, raising the cap 1K a stage"),
     ):
         p = sub.add_parser(name, help=text)
         p.add_argument("--config", type=Path, default=Path("configs/sft.toml"))
         p.add_argument("--root", type=Path, default=Path.cwd(), help="base for relative paths")
+        if name == "stages":
+            from emperor.train.stages import add_arguments
+
+            add_arguments(p)
         if name == "fit":
             p.add_argument(
                 "--pause-file",
@@ -50,6 +55,10 @@ def main(argv: list[str] | None = None) -> int:
     # the user sets in either variable wins.
     if not (os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or os.environ.get("PYTORCH_ALLOC_CONF")):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = DEFAULT_ALLOC_CONF
+    if args.command == "stages":
+        from emperor.train.stages import main as stages_main
+
+        return stages_main(args, config)
     from emperor.train import sft
 
     if args.command == "fit":
