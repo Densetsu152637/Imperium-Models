@@ -38,13 +38,27 @@ def python_of(folder: Path) -> str:
     return str(exe)
 
 
-def pipeline(folder: Path, module: str, config: str, run: str, data_dir: str) -> list[str]:
+BASE_PHASES = ("train", "merge", "export", "eval")
+FINAL_PHASES = ("merge", "export", "eval")  # the final adapter is never trained again
+
+
+def pipeline(
+    folder: Path, module: str, config: str, run: str, data_dir: str, phases=BASE_PHASES
+) -> list[str]:
+    only = [arg for phase in phases for arg in ("--only", phase)]
     return [
         python_of(folder), "-m", module, "--root", str(folder),
         "--train-config", config, "--resume", run, "--data-dir", data_dir,
-        "--eval-tier", EVAL_TIER,
-        "--only", "train", "--only", "merge", "--only", "export", "--only", "eval",
+        "--eval-tier", EVAL_TIER, *only,
     ]  # fmt: skip
+
+
+def final_step(folder: Path, module: str, stage_run: str, data_dir: str):
+    final = folder / stage_run / "final.toml"
+    return (
+        pipeline(folder, module, str(final), f"{stage_run}-final", data_dir, FINAL_PHASES),
+        final,
+    )
 
 
 def steps(
@@ -72,12 +86,8 @@ def steps(
         ],
         folder,
     )  # fmt: skip
-    final = folder / stage_run / "final.toml"
-    yield (
-        f"{name}: final adapter merge, export, eval",
-        pipeline(folder, module, str(final), f"{stage_run}-final", data_dir),
-        folder,
-    )
+    command, _ = final_step(folder, module, stage_run, data_dir)
+    yield (f"{name}: final adapter merge, export, eval", command, folder)
 
 
 def main() -> int:

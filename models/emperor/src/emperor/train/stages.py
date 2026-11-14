@@ -35,6 +35,7 @@ from emperor.train.data import load_combined, split_records
 log = logging.getLogger("emperor.stages")
 PAUSED = 75
 OOM_MARKER = "OutOfMemoryError"
+MAX_INTERRUPTIONS = 3
 
 
 def add_arguments(p) -> None:
@@ -128,13 +129,19 @@ def stage_config(
     return data
 
 
-def final_config(raw: dict, adapter: str, suffix: str) -> dict:
-    """The base config with merge, export and release names for the stages' final adapter."""
+def final_config(raw: dict, adapter: str, suffix: str, run_dir: str = "") -> dict:
+    """The base config with merge, export and release names for the stages' final adapter.
+    It is for merge, export and eval only; its training output points into the stage run
+    (`<run_dir>/final-no-train`), so even a mistaken `train fit` with it could never reach the
+    base run's outputs or a stage's adapter."""
     data = json.loads(json.dumps(raw))
     release = data.setdefault("release", {})
     name = f"{release.get('name', 'emperor-4b')}-{suffix}"
     release["name"] = name
     data.setdefault("merge", {}).update(adapter_dir=adapter, output_dir=f"weights/{name}-bf16")
+    train = data.setdefault("train", {})
+    train["output_dir"] = f"{run_dir or 'runs/' + name}/final-no-train"
+    train.pop("init_adapter", None)
     return data
 
 
@@ -217,10 +224,22 @@ def measure_lengths(config: SftConfig, records: list[dict]) -> dict[str, int]:
     return lengths
 
 
-def run_fit(config_path: Path, log_path: Path, gate, pause_file: Path, poll: float) -> int:
+def fit_command(config_path: Path, pause_file: Path, root: Path) -> list[str]:
+    """The child `train fit`, with the same root, so its relative paths resolve alike."""
+    return [
+        sys.executable, "-m", "emperor.train.cli", "fit",
+        "--config", str(config_path), "--root", str(root), "--pause-file", str(pause_file),
+    ]  # fmt: skip
+
+
+def run_fit(
+    config_path: Path, log_path: Path, gate, pause_file: Path, poll: float, root: Path
+) -> int:
     """`train fit` in a fresh process, paused (checkpoint, exit 75) when the gate says so and
-    resumed when it allows again; returns the final exit code."""
+    resumed when it allows again. A refusal because another process holds the VRAM is "not
+    now": it waits and starts again. Returns the final exit code."""
     from emperor.pipeline.processes import ManagedProcess, OwnProcesses
+    from emperor.train.sft import VRAM_BUSY_EXIT_CODE
 
     own = OwnProcesses()
     gate.own_pids = own.pids
@@ -229,10 +248,7 @@ def run_fit(config_path: Path, log_path: Path, gate, pause_file: Path, poll: flo
             log.info("waiting for an idle machine: %s", status.reason)
             time.sleep(poll)
         pause_file.unlink(missing_ok=True)
-        command = [
-            sys.executable, "-m", "emperor.train.cli", "fit",
-            "--config", str(config_path), "--pause-file", str(pause_file),
-        ]  # fmt: skip
+        command = fit_command(config_path, pause_file, root)
         trainer = ManagedProcess(command, log_path, own).start()
         log.info("stage trainer pid %s", trainer.pid)
         while trainer.poll() is None:
@@ -241,6 +257,10 @@ def run_fit(config_path: Path, log_path: Path, gate, pause_file: Path, poll: flo
                 log.info("pausing: %s", status.reason)
                 pause_file.touch()
         code = trainer.poll()
+        if code == VRAM_BUSY_EXIT_CODE:
+            log.info("another process holds the VRAM; waiting before starting again")
+            time.sleep(poll)
+            continue
         if code != PAUSED:
             return code
 
@@ -311,14 +331,25 @@ def main(args, config: SftConfig) -> int:
         if args.plan_only:
             previous = cap
             continue
+        # An attempt counts only once its result is known: success, an out-of-memory error or
+        # another failure of the child (a traceback). An attempt cut short by a kill or a reboot
+        # (no traceback) runs again without counting, up to MAX_INTERRUPTIONS times in a row.
+        interruptions = 0
         while stage.attempts < 2:
-            stage.attempts += 1
-            state.save(state_path)
-            log_path = stage_dir / f"train-{stage.attempts}.log"
-            code = run_fit(config_path, log_path, gate, stage_dir / "PAUSE", args.poll_seconds)
+            log_path = stage_dir / f"train-{stage.attempts + 1}-{interruptions}.log"
+            code = run_fit(
+                config_path, log_path, gate, stage_dir / "PAUSE", args.poll_seconds, root
+            )
             text = (
                 log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
             )
+            if code != 0 and "Traceback" not in text and interruptions < MAX_INTERRUPTIONS:
+                interruptions += 1
+                log.warning("stage %d was interrupted (exit code %s); starting it again", cap, code)
+                continue
+            interruptions = 0
+            stage.attempts += 1
+            state.save(state_path)
             if code == 0:
                 result = json.loads((stage_dir / "out" / "train_result.json").read_text("utf-8"))
                 stage.status = "done"
@@ -341,7 +372,8 @@ def main(args, config: SftConfig) -> int:
         previous = cap
     state.save(state_path)
     (run_dir / "STAGES.md").write_text(summary(state), encoding="utf-8")
-    final = final_config(raw, state.last_adapter(), args.suffix)
+    rel_run = run_dir.resolve().relative_to(root).as_posix()
+    final = final_config(raw, state.last_adapter(), args.suffix, rel_run)
     (run_dir / "final.toml").write_text(to_toml(final), encoding="utf-8")
     print(
         json.dumps(
