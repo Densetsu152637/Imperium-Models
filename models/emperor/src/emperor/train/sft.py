@@ -87,10 +87,11 @@ def use_fused_attention() -> None:
     sdpa_attention.use_gqa_in_sdpa = lambda *args, **kwargs: False
 
 
-def shrink_logprob_tiles(tokens: int = 1024) -> None:
-    """TRL's fused loss projects `[4096 tokens, vocabulary chunk]` fp32 tiles (512 MiB each);
-    after the first optimiser step that no longer fits beside the optimiser state on 16 GB.
-    Quarter-size tiles cost little speed."""
+def shrink_logprob_tiles(tokens: int = 256) -> None:
+    """TRL's fused loss projects `[4096 tokens, vocabulary chunk]` fp32 tiles (about 2 GiB with
+    Qwen3.5's half-vocabulary chunks). At 1,024 tokens a tile was the 486 MiB allocation that
+    ran out of memory at 14K tokens on 16 GB (fragmented cache, about 0.4 GiB physically
+    free); 256-token tiles are 121 MiB and cost little speed."""
     from trl.kernels import chunked_logprob
 
     chunked_logprob.TOKEN_CHUNK_SIZE = tokens
