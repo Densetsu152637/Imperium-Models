@@ -47,6 +47,28 @@ def process_parents() -> dict[int, int]:
     return parents
 
 
+def _kernel32():
+    """kernel32 with argument and result types declared, so 64-bit handles are not truncated
+    to C ints."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32First.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel.Process32First.restype = wintypes.BOOL
+    kernel.Process32Next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    kernel.Process32Next.restype = wintypes.BOOL
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    return kernel
+
+
 def _windows_parents() -> dict[int, int]:
     import ctypes
     from ctypes import wintypes
@@ -65,8 +87,7 @@ def _windows_parents() -> dict[int, int]:
             ("szExeFile", ctypes.c_char * 260),
         ]
 
-    kernel = ctypes.windll.kernel32
-    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel = _kernel32()
     snapshot = kernel.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
     if snapshot in (None, wintypes.HANDLE(-1).value):
         return {}
@@ -99,8 +120,7 @@ def _windows_created(pid: int) -> int | None:
     import ctypes
     from ctypes import wintypes
 
-    kernel = ctypes.windll.kernel32
-    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel = _kernel32()
     handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
         return None
