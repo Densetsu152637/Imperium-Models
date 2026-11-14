@@ -15,9 +15,11 @@ Kinds, each turning an input JSONL file into teacher requests and parsed records
 - `paraphrase`: a clear task -> ~10 vague or messy prompts with the same intent and plan.
 - `coref`: a scenario -> a multi-turn conversation whose later turns use coreference and
   ellipsis, including across a summary that replaced earlier turns.
-- `solve`: any record above with a `messages` prefix ending in a user turn -> the same record
-  with the teacher's answer (its reasoning as `reasoning_content`) appended. Only solved records
-  are chat samples the mixer accepts; Emperor and Consul records carry `meta.for_model`.
+- `solve`: a research record (a `messages` prefix ending in a user turn) -> the same record
+  with the teacher's answer (its reasoning as `reasoning_content`) appended. Research planning
+  needs no tools; paraphrase and coref prompts need them, so they go through the hosted
+  pipeline (tools, simulator, judge) instead. Records carry `meta.for_model`, and the mixer
+  takes only judged ones.
 - `ask-dpo`: preference pairs on asking versus guessing (see `ask_pairs`). They are not SFT
   samples (no `messages`), must be judged (`dpo_judge_messages`, Kimi) before use, and need a
   DPO stage (bf16 LoRA, TRL DPOTrainer) that is not written yet.
@@ -33,9 +35,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from emperor.data.teacher import TeacherOutputError
+from emperor.eval.contract import ALL_TOOLS
+from emperor.graft.sources import allowed
 
 TEACHER_LICENCE = "DeepSeek Open Platform Terms of Service 4.2"
 OPEN_TEACHERS = ("deepseek-",)  # generation runs on DeepSeek only
+PAPER_KINDS = ("extract", "research")
 PAPER_LICENCES = ("CC-BY-4.0", "CC0-1.0")
 DEFECTS = ("missing_step", "wrong_order", "too_coarse", "unverifiable_claim", "broken_dependency")
 
@@ -45,8 +50,9 @@ class GeneratorError(ValueError):
 
 
 def require_open_teacher(model: str) -> str:
-    if not model.lower().startswith(OPEN_TEACHERS):
-        raise GeneratorError(f"{model}: generation runs on DeepSeek only")
+    """DeepSeek only, and only models on the generator allow-list."""
+    if not model.lower().startswith(OPEN_TEACHERS) or not allowed(model):
+        raise GeneratorError(f"{model}: generation runs on allow-listed DeepSeek models only")
     return model
 
 
@@ -271,15 +277,24 @@ def paraphrase_records(task: dict, answer: dict, model: str, n: int = 10) -> lis
 
 # -- asking versus guessing (DPO) ----------------------------------------------------------
 
-ASK_SYSTEM = """You write preference data for a root coding agent whose tools read files, \
-search code and run commands, and which can ask the user with the `ask_user` tool. Given a \
-task, answer with JSON: "hidden_constraint": a decision only the user can make (a preference, \
-a policy, a target) that the task depends on and no tool can discover; "discoverable_fact": a \
-fact the agent could look up in the repository; and four assistant turns, each \
-{"content": short text, "tool_calls": [{"name", "arguments": {...}}]}: "ask" calls ask_user \
-with one sharp question about the hidden constraint only; "guess" invents the constraint and \
-acts on it with a tool; "look_up" looks the discoverable fact up with a tool; \
-"needless_question" calls ask_user to ask for the discoverable fact."""
+ASK_SYSTEM = """You write preference data for Emperor, a root agent that never edits files \
+itself: it delegates with spawn_agent (a self-contained brief for a subagent that can read, \
+search and run things), searches with web_search and web_fetch, and asks the user with \
+ask_user. Given a task, answer with JSON: "hidden_constraint": a decision only the user can \
+make (a preference, a policy, a target) that the task depends on and no tool can discover; \
+"discoverable_fact": a fact a subagent could look up in the repository; and four assistant \
+turns, each {"content": short text, "tool_calls": [{"name", "arguments": {...}}]}: "ask" \
+calls ask_user with one sharp question about the hidden constraint only; "guess" invents the \
+constraint and acts on it with spawn_agent; "look_up" has a subagent look the discoverable \
+fact up with spawn_agent; "needless_question" calls ask_user to ask for the discoverable \
+fact."""
+# Which tool each turn must use.
+TURN_TOOLS = {
+    "ask": {"ask_user"},
+    "needless_question": {"ask_user"},
+    "guess": set(ALL_TOOLS) - {"ask_user"},
+    "look_up": set(ALL_TOOLS) - {"ask_user"},
+}
 
 DPO_JUDGE_SYSTEM = """You judge one preference pair for a root coding agent. Answer JSON \
 {"valid": true|false, "reason"}. Valid only if the chosen turn is clearly better: an ask about \
@@ -305,6 +320,8 @@ def _assistant_turn(raw, key: str) -> dict:
         arguments = call.get("arguments")
         if not call.get("name") or not isinstance(arguments, dict):
             raise GeneratorError(f"{key}: each tool call needs a name and object arguments")
+        if call["name"] not in TURN_TOOLS.get(key, set(ALL_TOOLS)):
+            raise GeneratorError(f"{key}: {call['name']} is not a tool this turn may use")
         calls.append(
             {
                 "id": f"call_{key}_{i}",
@@ -425,6 +442,8 @@ def coref_records(seed: dict, answer: dict, model: str) -> list[dict]:
 
 
 def solve_messages(record: dict) -> list[dict]:
+    if not str(record.get("kind", "")).startswith("research/"):
+        raise GeneratorError("solve takes research records only (others need tools)")
     messages = record.get("messages") or []
     if not messages or messages[-1].get("role") != "user":
         raise GeneratorError("solve needs a messages prefix ending in a user turn")
@@ -460,6 +479,17 @@ KINDS = {
 }
 
 
+def input_text(row: dict) -> str:
+    """The user-facing text of an input row, for the held-out overlap check."""
+    parts = [row.get(k) or "" for k in ("prompt", "scenario", "problem", "title")]
+    parts += [
+        m.get("content") or ""
+        for m in row.get("messages") or []
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    ]
+    return "\n".join(p for p in parts if isinstance(p, str) and p)
+
+
 def _paper_of(row: dict) -> str | None:
     return row.get("paper_id") or ((row.get("meta") or {}).get("paper") or {}).get("paper_id")
 
@@ -472,6 +502,7 @@ def run(
     done: set[str] | None = None,
     *,
     heldout_papers: set[str] | None = None,
+    heldout_tasks=None,
 ) -> Iterable[tuple[dict | None, str | None]]:
     """For each input row: (record, None) per record made, or (None, error). `chat` is the
     teacher (`HostedClient.chat`, bound to its options); rows whose id is in `done` are skipped,
@@ -479,6 +510,8 @@ def run(
     require_open_teacher(model)
     spec = KINDS[kind]
     done = done or set()
+    if kind in PAPER_KINDS and heldout_papers is None:
+        raise GeneratorError(f"{kind} needs the held-out paper list")
     heldout_papers = heldout_papers or set()
     for n, row in enumerate(rows):
         key = row.get("id") or row.get("paper_id") or str(n)
@@ -487,6 +520,9 @@ def run(
         paper = _paper_of(row)
         if paper and paper in heldout_papers:
             yield None, f"{key}: paper {paper} is held out for the eval split"
+            continue
+        if heldout_tasks is not None and heldout_tasks.leaks(input_text(row)):
+            yield None, f"{key}: overlaps a held-out eval task"
             continue
         try:
             if kind == "research":

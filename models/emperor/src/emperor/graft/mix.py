@@ -92,17 +92,46 @@ def user_text(row: dict) -> str:
     )
 
 
-def rejection(row: dict, model: str, heldout) -> str | None:
+GRAFT_BUCKETS = ("nemotron", "openthoughts")
+
+
+def graft_rejection(row: dict) -> str | None:
+    """A grafted row must come from a current source: its subset is registered and usable, its
+    revision is the pinned one, and its generator and upstream source are allowed now."""
+    from emperor.graft.sources import SOURCES, allowed, upstream_allowed
+
+    meta = row.get("meta") or {}
+    source = SOURCES.get(meta.get("subset"))
+    if source is None or not source.usable:
+        return "graft_unknown_or_excluded_source"
+    if meta.get("revision") != source.revision:
+        return "graft_stale_revision"
+    if not allowed(meta.get("generator")):
+        return "graft_generator_not_allowed"
+    if not upstream_allowed(source, meta.get("upstream_source")):
+        return "graft_upstream_not_allowed"
+    return None
+
+
+def rejection(row: dict, model: str, heldout, bucket: str = "") -> str | None:
     """Why a row cannot enter this model's mix: not a chat sample ending in an assistant turn,
-    made for the other model (`meta.for_model`), or overlapping a held-out eval task."""
+    made for the other model (`meta.for_model`), a graft from a stale or disallowed source, a
+    generated row that was not judged, or overlapping a held-out eval task."""
     messages = row.get("messages")
     if not isinstance(messages, list) or not messages:
         return "no_messages"
     if messages[-1].get("role") != "assistant":
         return "not_answered"
-    target = (row.get("meta") or {}).get("for_model")
+    meta = row.get("meta") or {}
+    target = meta.get("for_model")
     if target and target != model:
         return f"for_{target}"
+    if bucket in GRAFT_BUCKETS:
+        why = graft_rejection(row)
+        if why:
+            return why
+    elif bucket != ANCHOR and meta.get("judged") is not True:
+        return "not_judged"
     if heldout is not None and heldout.leaks(user_text(row)):
         return "heldout_overlap"
     return None
@@ -117,7 +146,7 @@ def screen(
     for name, rows in buckets.items():
         kept[name] = []
         for row in rows:
-            why = rejection(row, model, heldout)
+            why = rejection(row, model, heldout, name)
             if why:
                 rejected.setdefault(name, {})
                 rejected[name][why] = rejected[name].get(why, 0) + 1
@@ -138,6 +167,9 @@ def mix(
     `HeldoutIndex` (default: the bundled eval tasks) or None to skip the overlap check."""
     if model not in MODELS:
         raise ValueError(f"unknown model {model}")
+    if model == "consul" and heldout == "bundled":
+        # The bundled set is Emperor's; Consul's held-out tasks live in the consul package.
+        raise ValueError("Consul's held-out overlap check is not wired up; pass heldout")
     if heldout == "bundled":
         from emperor.data.prompts import HeldoutIndex
 
@@ -179,14 +211,24 @@ def mix(
                 "revision": meta["revision"],
                 "licence": meta["licence"],
                 "generators": set(),
+                "question_licences": set(),
                 "samples": 0,
             },
         )
         entry["generators"].add(meta["generator"])
         entry["samples"] += 1
+        if meta.get("question_licence"):
+            entry["question_licences"].add(f"{meta['upstream_source']}: {meta['question_licence']}")
     report = {
         "model": model,
-        "grafts": [{**g, "generators": sorted(g["generators"])} for _, g in sorted(grafts.items())],
+        "grafts": [
+            {
+                **g,
+                "generators": sorted(g["generators"]),
+                "question_licences": sorted(g["question_licences"]),
+            }
+            for _, g in sorted(grafts.items())
+        ],
         "seed": seed,
         "total": len(chosen),
         "rejected": rejected,

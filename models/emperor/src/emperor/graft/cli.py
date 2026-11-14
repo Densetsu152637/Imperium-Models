@@ -21,11 +21,12 @@ import json
 import sys
 from pathlib import Path
 
+from emperor.data.prompts import HeldoutIndex
 from emperor.graft import fetch
 from emperor.graft.convert import BLOCKED, convert
-from emperor.graft.generators import KINDS, load_heldout_papers
+from emperor.graft.generators import KINDS, PAPER_KINDS, load_heldout_papers
 from emperor.graft.generators import run as run_generator
-from emperor.graft.mix import MODELS, mix, read_jsonl
+from emperor.graft.mix import mix, read_jsonl
 from emperor.graft.sources import BUCKETS, SOURCES, Source
 
 # Per source: samples to keep after conversion and filtering, before mixing (the mixer takes
@@ -53,11 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument(
         "--config",
         type=Path,
+        required=True,
         help="training config whose base tokenizer and training length every sample must fit "
-        "(needs the train group); without it no fit check runs",
+        "(needs the train group), e.g. configs/emperor-4b.toml",
     )
     m = sub.add_parser("mix", help="mix the hosted data with the grafts at the target shares")
-    m.add_argument("--model", choices=MODELS, required=True, help="whose training mix")
+    m.add_argument(
+        "--model",
+        choices=["emperor"],
+        required=True,
+        help="whose training mix (Consul's needs its own held-out check, not wired up yet)",
+    )
     m.add_argument("--hosted", type=Path, action="append", required=True)
     m.add_argument("--graft", type=Path, default=Path("data/graft"))
     m.add_argument("--research", type=Path, action="append", default=[], help="solved records")
@@ -77,7 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "--heldout-papers",
         type=Path,
-        help="paper ids (one per line) kept for the eval split: never made into training data",
+        help="paper ids (one per line) kept for the eval split: never made into training data "
+        "(required for extract and research)",
+    )
+    g.add_argument(
+        "--budget",
+        type=float,
+        help="DeepSeek budget in USD for this run, overriding budget_usd (the shared ledger "
+        "counts every earlier hosted run)",
     )
     g.add_argument("--limit", type=int, default=0, help="at most this many input rows")
     g.add_argument(
@@ -97,9 +111,15 @@ def generate(args) -> int:
     if provider.name != "deepseek":
         print(f"graft: the teacher must be DeepSeek, not {provider.name}", file=sys.stderr)
         return 2
+    if args.kind in PAPER_KINDS and not args.heldout_papers:
+        print(f"graft: {args.kind} needs --heldout-papers (the eval split)", file=sys.stderr)
+        return 2
     args.out.mkdir(parents=True, exist_ok=True)
     args.ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger = Ledger(args.ledger, {name: p.budget_usd for name, p in config.providers.items()})
+    budgets = {name: p.budget_usd for name, p in config.providers.items()}
+    if args.budget is not None:
+        budgets[provider.name] = args.budget
+    ledger = Ledger(args.ledger, budgets)
     client = make_clients(config, ledger, ("teacher",))["teacher"]
     records_path, errors_path = args.out / "records.jsonl", args.out / "errors.jsonl"
     done = {r.get("input_id") for r in read_jsonl([records_path])}
@@ -117,6 +137,7 @@ def generate(args) -> int:
             role.model,
             done,
             heldout_papers=heldout,
+            heldout_tasks=HeldoutIndex.bundled(),
         ):
             if record is None:
                 failed += 1

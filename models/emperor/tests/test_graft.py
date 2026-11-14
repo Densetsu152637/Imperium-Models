@@ -188,6 +188,21 @@ def chat_rows(prefix, n, subset=None, **meta):
     ]
 
 
+def graft_rows(prefix, n, subset="nemotron-v2-tool-calling", generator="GLM-4.6", **meta):
+    """Rows as `graft fetch` writes them: a registered subset at its pinned revision."""
+    source = SOURCES[subset]
+    return chat_rows(
+        prefix,
+        n,
+        subset=subset,
+        source=source.dataset,
+        revision=source.revision,
+        licence=source.licence,
+        generator=generator,
+        **meta,
+    )
+
+
 def test_the_mix_holds_the_shares_and_renormalises_a_missing_source():
     counts = plan_counts({"hosted": 450, "research": 300, "nemotron": 1000, "openthoughts": 1000})
     assert {k: v["taken"] for k, v in counts.items()} == {
@@ -207,16 +222,18 @@ def test_the_mix_holds_the_shares_and_renormalises_a_missing_source():
 
 
 def test_mix_is_deterministic_and_balances_subsets():
+    ocr = {"upstream_source": "nvidia/OpenCodeReasoning", "question_licence": "CC-BY-4.0"}
     buckets = {
         "hosted": chat_rows("h", 90),
-        "nemotron": chat_rows("a", 100) + chat_rows("b", 5),
-        "openthoughts": chat_rows("o", 100),
+        "nemotron": graft_rows("a", 100)
+        + graft_rows("b", 5, "nemotron-v1-tool-calling", "Qwen3-235B-A22B-Thinking-2507"),
+        "openthoughts": graft_rows("o", 100, "openthoughts3", "QwQ-32B", **ocr),
     }
     one, report = mix(buckets, seed=3, heldout=None)
     two, _ = mix(buckets, seed=3, heldout=None)
     assert [r["id"] for r in one] == [r["id"] for r in two]
     assert report["buckets"]["nemotron"]["taken"] == 30
-    assert report["by_source"]["b"] == 5  # the small subset is not crowded out
+    assert report["by_source"]["nemotron-v1-tool-calling"] == 5  # not crowded out
     assert report["total"] == 90 + 30 + 20
 
 
@@ -229,17 +246,54 @@ def test_mix_rejects_unanswered_rows_other_models_records_and_heldout_overlap():
     leaky[0]["messages"][0]["content"] = "please do the secret task"
     unanswered = chat_rows("u", 1)
     unanswered[0]["messages"].pop()
-    research = chat_rows("r", 4, for_model="emperor") + chat_rows("c", 3, for_model="consul")
+    research = chat_rows("r", 4, for_model="emperor", judged=True)
+    research += chat_rows("c", 3, for_model="consul", judged=True)
+    research += chat_rows("n", 2, for_model="emperor")  # generated but not judged
     buckets = {
         "hosted": chat_rows("h", 45) + leaky,
         "research": research + [{"id": "dpo", "prompt": []}] + unanswered,
     }
     rows, report = mix(buckets, heldout=Heldout(), model="emperor")
     assert report["rejected"]["hosted"] == {"heldout_overlap": 1}
-    assert report["rejected"]["research"] == {"for_consul": 3, "no_messages": 1, "not_answered": 1}
+    assert report["rejected"]["research"] == {
+        "for_consul": 3,
+        "no_messages": 1,
+        "not_answered": 1,
+        "not_judged": 2,
+    }
     assert {r["id"] for r in rows} >= {f"r-{i}" for i in range(4)}
     _, consul = mix(buckets, heldout=None, model="consul")
-    assert consul["rejected"]["research"]["for_emperor"] == 4
+    assert consul["rejected"]["research"]["for_emperor"] == 6
+    with pytest.raises(ValueError, match="Consul"):
+        mix(buckets, model="consul")  # Emperor's held-out set is not Consul's
+
+
+def test_stale_or_disallowed_grafts_are_rejected():
+    stale = graft_rows("s", 2)
+    for row in stale:
+        row["meta"]["revision"] = "0" * 40
+    old = chat_rows("old", 2, subset="openthoughts3")  # an old file: no revision at all
+    gpt = graft_rows("g", 1, generator="GPT-OSS-120B")
+    math = graft_rows(
+        "m", 1, "openthoughts3", "QwQ-32B", upstream_source="ai2-adapt-dev/openmath-2-math"
+    )
+    excluded = graft_rows("x", 1, "nemotron-v2-customer-service", "DeepSeek-V3.2")
+    buckets = {
+        "hosted": chat_rows("h", 45),
+        "nemotron": stale + gpt + excluded,
+        "openthoughts": old + math,
+    }
+    rows, report = mix(buckets, heldout=None)
+    assert len(rows) == 45
+    assert report["rejected"]["nemotron"] == {
+        "graft_stale_revision": 2,
+        "graft_generator_not_allowed": 1,
+        "graft_unknown_or_excluded_source": 1,
+    }
+    assert report["rejected"]["openthoughts"] == {
+        "graft_stale_revision": 2,
+        "graft_upstream_not_allowed": 1,
+    }
 
 
 def test_the_bundled_heldout_index_is_the_default():
@@ -319,8 +373,8 @@ def dpo_answer(**overrides):
         "hidden_constraint": "which colour scheme the brand wants",
         "discoverable_fact": "the test runner configured in pyproject",
         "ask": turn(question="Which brand colours should the theme use?"),
-        "guess": turn("edit_file", path="theme.css"),
-        "look_up": turn("read_file", path="pyproject.toml"),
+        "guess": turn("spawn_agent", brief="Make the theme dark blue."),
+        "look_up": turn("spawn_agent", brief="Report the test runner set in pyproject.toml."),
         "needless_question": turn(question="Which test runner do you use?"),
         **overrides,
     }
@@ -343,6 +397,13 @@ def test_dpo_pairs_are_assistant_tool_turns_and_need_a_judge():
     leaky = turn(question="Is the test runner configured in pyproject?")
     with pytest.raises(generators.GeneratorError, match="discoverable fact"):
         generators.ask_pairs(task, dpo_answer(ask=leaky), "deepseek-v4-pro")
+    for key, bad in (
+        ("guess", turn("edit_file", path="x")),  # not one of Emperor's tools
+        ("look_up", turn("ask_user", question="?")),  # looking up is not asking
+        ("ask", turn("spawn_agent", brief="b")),  # asking is ask_user
+    ):
+        with pytest.raises(generators.GeneratorError, match="may use"):
+            generators.ask_pairs(task, dpo_answer(**{key: bad}), "deepseek-v4-pro")
     judged = generators.apply_dpo_judgement(
         pairs[0], {"content": '{"valid": true}'}, "kimi-k3.1-pro"
     )
@@ -401,6 +462,33 @@ def test_run_resumes_skips_heldout_papers_and_survives_teacher_errors():
         )
     )
     assert held == [(None, "p1: paper p1 is held out for the eval split")]
+    with pytest.raises(generators.GeneratorError, match="held-out paper list"):
+        list(generators.run("research", [research_paper()], chat, "deepseek-v4-pro"))
+
+    class Heldout:
+        def leaks(self, text):
+            return "do x" in text
+
+    out = list(
+        generators.run("ask-dpo", rows[:1], chat, "deepseek-v4-pro", heldout_tasks=Heldout())
+    )
+    assert out == [(None, "t1: overlaps a held-out eval task")]
+
+
+def test_solve_takes_research_records_only():
+    with pytest.raises(generators.GeneratorError, match="research records only"):
+        generators.solve_messages(
+            {"kind": "paraphrase", "messages": [{"role": "user", "content": "x"}]}
+        )
+
+
+def test_allow_list_is_anchored():
+    assert not allowed("DeepSeek-R1-Distill-Llama-70B")
+    assert not allowed("deepseek-v3-but-actually-gpt")
+    for model in ("deepseek-v4-pro", "deepseek-flash"):
+        assert generators.require_open_teacher(model) == model
+    with pytest.raises(generators.GeneratorError):
+        generators.require_open_teacher("deepseek-r1-distill-llama-70b")
 
 
 def test_generate_refuses_without_confirm_spend_and_shares_the_hosted_ledger(tmp_path, capsys):
@@ -414,8 +502,11 @@ def test_mix_cli_writes_the_mix_and_report(tmp_path):
     hosted.write_text("".join(json.dumps(s) + "\n" for s in chat_rows("h", 45)), encoding="utf-8")
     graft = tmp_path / "graft"
     graft.mkdir()
+    ocr = graft_rows(
+        "o", 50, "openthoughts3", "QwQ-32B", upstream_source="nvidia/OpenCodeReasoning"
+    )
     (graft / "openthoughts3.jsonl").write_text(
-        "".join(json.dumps(s) + "\n" for s in chat_rows("o", 50)), encoding="utf-8"
+        "".join(json.dumps(s) + "\n" for s in ocr), encoding="utf-8"
     )
     out = tmp_path / "mix"
     args = ["mix", "--model", "emperor", "--hosted", str(hosted), "--graft", str(graft)]
@@ -427,28 +518,31 @@ def test_mix_cli_writes_the_mix_and_report(tmp_path):
 
 
 def test_the_card_credits_grafts_and_does_not_call_them_judged():
-    graft = chat_rows("g", 2, subset="nemotron-v2-tool-calling")
-    for row in graft:
-        row["meta"].update(
-            source="nvidia/Nemotron-SFT-Agentic-v2",
-            revision="7" * 40,
-            licence="CC-BY-4.0",
-            generator="GLM-4.6",
-        )
-    _, report = mix({"hosted": chat_rows("h", 45), "nemotron": graft}, heldout=None)
-    assert report["grafts"] == [
-        {
-            "dataset": "nvidia/Nemotron-SFT-Agentic-v2",
-            "subset": "nemotron-v2-tool-calling",
-            "revision": "7" * 40,
-            "licence": "CC-BY-4.0",
-            "generators": ["GLM-4.6"],
-            "samples": 2,
-        }
-    ]
+    graft = graft_rows("g", 2)
+    ocr = graft_rows(
+        "o",
+        1,
+        "openthoughts3",
+        "QwQ-32B",
+        upstream_source="nvidia/OpenCodeReasoning",
+        question_licence="CC-BY-4.0",
+    )
+    buckets = {"hosted": chat_rows("h", 45), "nemotron": graft, "openthoughts": ocr}
+    _, report = mix(buckets, heldout=None)
+    assert report["grafts"][0] == {
+        "dataset": "nvidia/Nemotron-SFT-Agentic-v2",
+        "subset": "nemotron-v2-tool-calling",
+        "revision": SOURCES["nemotron-v2-tool-calling"].revision,
+        "licence": "CC-BY-4.0",
+        "generators": ["GLM-4.6"],
+        "question_licences": [],
+        "samples": 2,
+    }
+    assert report["grafts"][1]["question_licences"] == ["nvidia/OpenCodeReasoning: CC-BY-4.0"]
     text = card.render_card(card.CardInputs(config=parse_config({}), mix_report=report), "bf16")
     assert "Filters (our hosted samples)" in text and "**not** judged" in text
     assert "nvidia/Nemotron-SFT-Agentic-v2 (nemotron-v2-tool-calling" in text
     assert "creativecommons.org/licenses/by/4.0" in text
+    assert "questions nvidia/OpenCodeReasoning: CC-BY-4.0" in text
     plain = card.render_card(card.CardInputs(config=parse_config({})), "bf16")
     assert "grafts" not in plain.lower()

@@ -14,14 +14,20 @@ OpenThoughts also carries its questions' upstream sources; only allow-listed ups
 import re
 from dataclasses import dataclass, field
 
-# Open models whose outputs may be trained on (matched against the normalised name, without an
-# organisation prefix). Everything else, including every GPT/gpt-oss, Claude and Gemini model,
-# and any unnamed model, is dropped.
-ALLOWED_GENERATORS = (
-    re.compile(r"^deepseek-(v3(\.\d+)?|r1|v4)", re.IGNORECASE),
-    re.compile(r"^qwen3", re.IGNORECASE),
-    re.compile(r"^qwq", re.IGNORECASE),
-    re.compile(r"^glm-4(\.\d+)?", re.IGNORECASE),
+# Open models whose outputs may be trained on, matched in full against the name without an
+# organisation prefix. Everything else is dropped: every GPT/gpt-oss, Claude and Gemini model,
+# distills of other families (DeepSeek-R1-Distill-Llama), and any unnamed model.
+ALLOWED_GENERATORS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"deepseek-v3(\.\d+)?(-(exp|terminus|0324))?",
+        r"deepseek-v4(\.\d+)?(-(pro|flash))?",
+        r"deepseek-flash",
+        r"deepseek-r1(-0528)?",
+        r"qwen3(\.\d+)?-\d+(\.\d+)?b(-a\d+(\.\d+)?b)?(-(instruct|thinking))?(-\d{4})?",
+        r"qwq-32b(-preview)?",
+        r"glm-4\.\d+(-air)?",
+    )
 )
 
 
@@ -34,7 +40,11 @@ def allowed(generator: str | None) -> bool:
     if not generator or not generator.strip():
         return False
     names = [normalise(name) for name in generator.split("+")]
-    return all(any(p.match(name) for p in ALLOWED_GENERATORS) for name in names)
+    return all(any(p.fullmatch(name) for p in ALLOWED_GENERATORS) for name in names)
+
+
+def upstream_allowed(source: "Source", upstream: str | None) -> bool:
+    return not source.upstream_allow or upstream in source.upstream_allow
 
 
 @dataclass(frozen=True)
@@ -183,8 +193,9 @@ SOURCES: dict[str, Source] = {
             key="openthoughts3",
             dataset=OPENTHOUGHTS,
             revision=OPENTHOUGHTS_REV,
-            # The code block: the only allowed upstream source (OpenCodeReasoning) is there.
-            files=tuple(f"data/train-{n:05d}-of-00120.parquet" for n in range(6)),
+            # The code block, where the only allowed upstream source (OpenCodeReasoning) is:
+            # 16 shards give about 390 traces that fit an 8K thinking cap and 16K tokens.
+            files=tuple(f"data/train-{n:05d}-of-00120.parquet" for n in range(16)),
             licence="Apache-2.0",
             kind="openthoughts",
             card_generators=("QwQ-32B",),
