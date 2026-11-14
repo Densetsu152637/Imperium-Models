@@ -341,6 +341,7 @@ def test_offloading_is_opt_in_and_wraps_the_training_step():
             return "loss"
 
     trainer = offloading_trainer(Base, Torch)()
+    # 1 GiB sits reserved but unused: the cache is emptied before the step.
     assert trainer.training_step() == "loss" and entered == ["emptied", True]
     entered.clear()
     Torch.cuda.idle = 0.2  # little sits idle: the cache is kept
@@ -376,7 +377,8 @@ def test_the_emperor_configs(path, name, base):
     assert config.merge.output_dir == f"weights/{name}-bf16"
     assert config.merge.adapter_dir.startswith(config.train.output_dir)
     # Training length from the data, never above 16K; longer samples are dropped.
-    # Emperor 4B: 16K ran out of memory in real training (fragmentation), so 14,336.
+    # Emperor 4B: 16K ran out of memory in real training (fragmented cache plus the 486 MiB
+    # logprob tile, now 121 MiB), so 14,336 until 16K is tried again.
     assert config.data.max_length_auto
     assert config.data.max_length_cap == {"emperor-4b": 14336, "emperor-lite-2b": 16384}[name]
     assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
@@ -474,3 +476,22 @@ def test_vram_settings_and_length_keys_are_validated():
         parse_config({"data": {"max_length_quantile": 0}})
     with pytest.raises(ConfigError, match="KV layout"):
         parse_config({"release": {"kv_heads": 0}})
+
+
+def test_the_allocator_config_log_names_every_variable_set(monkeypatch):
+    from emperor.train.sft import allocator_config
+
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    assert allocator_config() == "default"
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "a:1")
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "b:2")
+    assert allocator_config() == "PYTORCH_ALLOC_CONF=b:2; PYTORCH_CUDA_ALLOC_CONF=a:1"
+
+
+def test_logprob_tiles_are_small(monkeypatch):
+    import inspect
+
+    from emperor.train.sft import shrink_logprob_tiles
+
+    assert inspect.signature(shrink_logprob_tiles).parameters["tokens"].default == 256

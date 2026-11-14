@@ -87,6 +87,17 @@ def use_fused_attention() -> None:
     sdpa_attention.use_gqa_in_sdpa = lambda *args, **kwargs: False
 
 
+def allocator_config() -> str:
+    """The allocator settings PyTorch reads, both names shown when both are set (newer
+    PyTorch prefers PYTORCH_ALLOC_CONF)."""
+    found = [
+        f"{name}={os.environ[name]}"
+        for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+        if os.environ.get(name)
+    ]
+    return "; ".join(found) or "default"
+
+
 def shrink_logprob_tiles(tokens: int = 256) -> None:
     """TRL's fused loss projects `[4096 tokens, vocabulary chunk]` fp32 tiles (about 2 GiB with
     Qwen3.5's half-vocabulary chunks). At 1,024 tokens a tile was the 486 MiB allocation that
@@ -232,12 +243,7 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
         raise SystemExit("CUDA is not available; check the torch build (cu128 for RTX 50 series)")
     offload = config.train.offload_activations
     log.info("VRAM cap for training: %.1f GiB", prepare_vram(config))
-    log.info(
-        "CUDA allocator config: %s",
-        os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-        or os.environ.get("PYTORCH_ALLOC_CONF")
-        or "default",
-    )
+    log.info("CUDA allocator config: %s", allocator_config())
     use_fused_attention()
     shrink_logprob_tiles()
     base = Path(config.model.base)
