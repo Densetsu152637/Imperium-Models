@@ -140,7 +140,9 @@ def test_front_matter_and_kv_cache():
     text = card.front_matter({"license": "apache-2.0", "tags": ["a", "b"], "flag": True})
     assert text == '---\nlicense: "apache-2.0"\ntags:\n- "a"\n- "b"\nflag: true\n---'
     # Qwen3.5-4B: 8 full-attention layers x 4 KV heads x 256 x 2 (K,V) x 2 bytes = 32 KiB/token
-    assert card.kv_cache_gib(1024) == pytest.approx(0.03125)
+    assert card.kv_cache_gib(1024, card.config_arch(parse_config({}).release)) == pytest.approx(
+        0.03125
+    )
     # Qwen3-4B: 36 layers x 8 KV heads x 128 = 144 KiB per token
     qwen3 = {"num_hidden_layers": 36, "num_key_value_heads": 8, "head_dim": 128}
     assert card.kv_cache_gib(1024, qwen3) == pytest.approx(0.140625)
@@ -396,3 +398,16 @@ def test_card_names_the_models_the_samples_record():
         "licences": {"Apache-2.0": 5},
     }
     assert "No hosted API produced" in card.datasheet(parse_config({}).release, local)
+
+
+def test_card_base_model_and_kv_layout_come_from_the_config():
+    config = load_config(Path(__file__).parent.parent / "configs" / "emperor-lite-2b.toml")
+    text = card.render_card(card.CardInputs(config=config), "bf16")
+    assert 'base_model: "Qwen/Qwen3.5-2B"' in text and "# Emperor Lite 2B" in text
+    assert "Base: `Qwen/Qwen3.5-2B`" in text and "Qwen3.5-4B" not in text
+    # Qwen3.5-2B: 6 KV layers x 2 heads x 256 x 2 x 2 bytes = 12 KiB/token; 64K = 0.75 GiB
+    assert "| bf16 | 3.5 | 0.8 | 4.3 |" in text
+    # The merged weights' own config.json still wins over the config's layout.
+    own = {"num_hidden_layers": 12, "num_key_value_heads": 2, "head_dim": 256}
+    text = card.render_card(card.CardInputs(config=config, arch=own), "bf16")
+    assert "| bf16 | 3.5 | 1.5 | 5.0 |" in text

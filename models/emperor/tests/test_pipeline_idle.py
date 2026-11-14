@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from emperor.pipeline.idle import (
     IdleGate,
     parse_pmon_other,
@@ -268,3 +270,48 @@ def test_teacher_and_judge_run_on_their_own_servers(tmp_path, monkeypatch):
     pipeline.phase_judge()
     assert calls[0] == ("generate", str(Path(DEFAULT_TEACHER_GGUF)), 2, TEACHER_SERVER_ARGS)
     assert calls[1] == ("judge", str(Path(DEFAULT_JUDGE_GGUF)), 1, None)
+
+
+def test_a_run_folder_belongs_to_one_training_config(tmp_path):
+    import json
+
+    import pytest
+
+    from emperor.pipeline.processes import OwnProcesses
+    from emperor.pipeline.run import Pipeline, Settings
+
+    def make(config):
+        settings = Settings(
+            root=tmp_path, run_dir=tmp_path, data_dir=tmp_path / "data", train_config=Path(config)
+        )
+        return Pipeline(settings, None, OwnProcesses())
+
+    make("configs/emperor-4b.toml")
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["train_config"] == "configs/emperor-4b.toml"
+    make("configs/emperor-4b.toml")  # resuming with the same config is fine
+    with pytest.raises(SystemExit, match="its own run folder"):
+        make("configs/emperor-lite-2b.toml")
+
+
+def test_a_train_only_run_counts_the_samples_in_the_config_data(tmp_path):
+    from emperor.pipeline.processes import OwnProcesses
+    from emperor.pipeline.run import Pipeline, Settings
+
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs" / "x.toml").write_text(
+        '[data]\npath = "d/final.jsonl"\n', encoding="utf-8"
+    )
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "final.jsonl").write_text('{"id": 1}\n{"id": 2}\n\n', encoding="utf-8")
+    settings = Settings(
+        root=tmp_path,
+        run_dir=tmp_path / "run",
+        data_dir=tmp_path / "data",
+        train_config=Path("configs/x.toml"),
+    )
+    (tmp_path / "run").mkdir()
+    pipeline = Pipeline(settings, None, OwnProcesses())
+    assert pipeline.kept_samples() == 2
+    pipeline.state["phases"]["filter"] = {"status": "done", "kept": 7}
+    assert pipeline.kept_samples() == 7

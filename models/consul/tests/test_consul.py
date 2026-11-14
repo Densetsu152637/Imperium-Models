@@ -245,8 +245,8 @@ def test_eval_dry_run_scores_perfectly_and_refuses_overlap(tmp_path, capsys):
 
 def test_consul_config_is_emperors_recipe_with_consul_names():
     config = load_config(ROOT / "configs" / "sft.toml")
-    assert config.merge.output_dir == "weights/consul-4b-bf16"
-    assert config.release.name == "consul-4b" and config.release.eval_alias == "consul"
+    assert config.merge.output_dir == "weights/consul-4b-8k-bf16"
+    assert config.release.name == "consul-4b-8k" and config.release.eval_alias == "consul"
     assert config.model.base.endswith("Qwen3.5-4B")
     assert config.data.max_length == 8192
     assert {"in_proj_qkv", "in_proj_z", "out_proj"} <= set(config.lora.target_modules)
@@ -499,3 +499,19 @@ def test_research_plans_do_not_offer_an_embedded_store():
         task = make_task(seed, kind="plan")
         if task.family == "research":
             assert "SQLite" not in task.artifact
+
+
+@pytest.mark.parametrize(("name", "base"), [("consul-4b", "4B"), ("consul-lite-2b", "2B")])
+def test_the_consul_configs(name, base):
+    config = load_config(ROOT / "configs" / f"{name}.toml")
+    assert config.model.base.endswith(f"Qwen3.5-{base}")
+    assert config.release.name == name and config.release.size == base
+    assert config.release.base_model == f"Qwen/Qwen3.5-{base}"
+    assert config.release.eval_alias == name.rsplit("-", 1)[0]
+    assert config.train.output_dir == f"outputs/{name}"
+    assert config.merge.output_dir == f"weights/{name}-bf16"
+    assert config.merge.adapter_dir.startswith(config.train.output_dir)
+    assert config.data.path == "data/hosted-1/final/final.jsonl"
+    assert config.data.max_length_auto and config.data.max_length_cap == 16384
+    assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
+    assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5

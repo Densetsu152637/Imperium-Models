@@ -1,0 +1,84 @@
+# Emperor Lite (emperor-lite-2b): bf16 LoRA on full-precision weights (no QLoRA, no 4/8-bit).
+# Paths are relative to the model folder unless absolute. The base is read-only.
+
+[model]
+base = "F:/AI-Models/Qwen/Qwen3.5-2B"
+attn_implementation = "sdpa"  # flash-attn has no Windows wheel
+
+[data]
+path = "data/hosted-1/final/final.jsonl"
+# The training length comes from the data: the longest sample, rounded up to 1,024 tokens, at
+# most 16,384. Longer samples are dropped, never truncated.
+max_length_auto = true
+max_length_quantile = 1.0
+max_length_cap = 16384
+max_length = 16384  # replaced by the measured length
+val_fraction = 0.05
+split_seed = 1337
+
+[lora]
+r = 32
+alpha = 64
+dropout = 0.05
+# Qwen3.5: full-attention layers (q/k/v/o), Gated DeltaNet layers (in_proj_qkv, in_proj_z,
+# out_proj; the per-head in_proj_a/in_proj_b gates stay frozen) and every MLP.
+target_modules = [
+  "q_proj", "k_proj", "v_proj", "o_proj",
+  "in_proj_qkv", "in_proj_z", "out_proj",
+  "gate_proj", "up_proj", "down_proj",
+]
+
+[train]
+output_dir = "outputs/emperor-lite-2b"
+epochs = 2.0
+learning_rate = 1.0e-4
+lr_scheduler = "cosine"
+warmup_ratio = 0.03
+weight_decay = 0.0
+per_device_batch_size = 1
+gradient_accumulation_steps = 16
+gradient_checkpointing = true
+# 16K traces: activations in pinned RAM, and the allocator capped at 15.3 GiB of the 16 GB card
+# (probe, 2026-11-15: Emperor 4B peaked at 14.03 GiB, 19.4 s a step at 16,384 tokens). The cap is
+# clamped to the VRAM free at the start less 0.2 GiB, and training refuses to start with less
+# than 14.1 GiB free (just over the probe's peak): a model left resident blocks it, an idle
+# desktop (about 14.2-14.6 GiB free) does not.
+offload_activations = true
+offload_min_free_vram_gib = 14.1
+vram_cap_gib = 15.3
+save_steps = 25  # a checkpoint every N optimiser steps; training resumes from the last one
+save_total_limit = 3
+eval_steps = 25
+logging_steps = 1
+max_grad_norm = 1.0
+seed = 1337
+
+[merge]
+adapter_dir = "outputs/emperor-lite-2b/adapter"
+output_dir = "weights/emperor-lite-2b-bf16"
+
+[release]
+name = "emperor-lite-2b"  # weights/emperor-lite-2b-gguf/, emperor-lite-2b-<TYPE>.gguf
+title = "Emperor Lite"
+size = "2B"
+eval_alias = "emperor-lite"
+gguf_types = ["Q8_0", "Q6_K", "Q4_K_M"]
+base_model = "Qwen/Qwen3.5-2B"
+params_billions = 1.88  # language model only: no vision tower, no MTP head
+kv_layers = 6  # of 24; the 18 Gated DeltaNet layers keep a fixed-size state
+kv_heads = 2
+head_dim = 256
+summary = "Emperor Lite is the smallest open-weight root agent for Imperium: it plans, writes compact briefs and delegates the work to subagents through tool calls, on machines too small for Emperor."
+tags = ["imperium", "agent", "lora", "qwen3", "reasoning"]
+context_tokens = 65536
+intended_use = [
+  "Acting as the root agent of an Imperium session on the smallest machines: planning, briefing and delegating.",
+]
+limits = [
+  "A 2B model: it plans less reliably than Emperor (4B), and its answers need the checks Imperium applies.",
+  "Trained on synthetic data from one teacher model; coverage outside it is untested.",
+]
+judge = "kimi-k3.1-pro (Moonshot API, a different model family from the teacher; scored 1-5 on eight criteria with a pass or fail)"
+teacher = "deepseek-v4-pro"
+teacher_licence = "DeepSeek Open Platform Terms of Service"
+teacher_policy = "DeepSeek's outputs are used under section 4.2 of the DeepSeek Open Platform Terms of Service, which assigns the outputs to the user and lists \"training other models (such as model distillation)\" among the permitted uses (https://cdn.deepseek.com/policies/en-US/deepseek-open-platform-terms-of-service.html)."

@@ -26,7 +26,8 @@ as the `<think>` block), and the eval removes the thinking before it scores the 
 | `src/consul/score.py`, `overlap.py` | Scoring a critique against ground truth; held-out vs training overlap |
 | `src/consul/eval/` | The held-out harness: C1 (recall, false findings), C3 (format), C2 (citations) |
 | `src/consul/pipeline/` | The idle-gated pipeline, a subclass of Emperor's |
-| `configs/sft.toml` | The training recipe and release text (output `weights/consul-4b-bf16/`) |
+| `configs/consul-4b.toml`, `configs/consul-lite-2b.toml` | Consul (Qwen3.5-4B) and Consul Lite (Qwen3.5-2B): recipe, 16K length from the data, VRAM cap, release text |
+| `configs/sft.toml` | The earlier single-model recipe (8K, old data layout) |
 | `data/`, `runs/`, `outputs/`, `weights/`, `tools/` | Generated locally and ignored by Git |
 
 Training, merge, GGUF export, model cards and the guarded publish are

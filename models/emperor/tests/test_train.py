@@ -31,7 +31,7 @@ def test_shipped_config_loads_and_is_bf16_lora():
     assert config.dtype == "bfloat16"
     assert config.data.max_length == 8192
     assert config.model.base.endswith("Qwen3.5-4B")
-    assert config.merge.output_dir == "weights/emperor-4b-bf16"
+    assert config.merge.output_dir == "weights/emperor-4b-8k-bf16"
     assert config.train.save_steps > 0 and config.train.gradient_checkpointing
 
 
@@ -340,3 +340,117 @@ def test_the_training_length_covers_the_p99_of_the_data_up_to_a_cap():
     assert pick_max_length(lengths, quantile=1.0) == 11264  # the longest, 10,900
     config = parse_config({"data": {"max_length_auto": True}})
     assert config.data.max_length_cap == 32768 and config.data.max_length_quantile == 1.0
+
+
+@pytest.mark.parametrize(
+    ("path", "name", "base"),
+    [
+        ("configs/emperor-4b.toml", "emperor-4b", "4B"),
+        ("configs/emperor-lite-2b.toml", "emperor-lite-2b", "2B"),
+    ],
+)
+def test_the_emperor_configs(path, name, base):
+    config = load_config(ROOT / path)
+    assert config.model.base.endswith(f"Qwen3.5-{base}")
+    assert config.release.name == name and config.release.size == base
+    assert config.release.base_model == f"Qwen/Qwen3.5-{base}"
+    assert config.train.output_dir == f"outputs/{name}"
+    assert config.merge.output_dir == f"weights/{name}-bf16"
+    assert config.merge.adapter_dir.startswith(config.train.output_dir)
+    # Training length from the data, never above 16K; longer samples are dropped.
+    assert config.data.max_length_auto and config.data.max_length_cap == 16384
+    assert config.train.offload_activations and config.train.vram_cap_gib == 15.3
+    # Just over the 16K probe's 14.03 GiB peak: a model left resident blocks the start.
+    assert 14.03 < config.train.offload_min_free_vram_gib <= 14.5
+
+
+# Every config of both packages, by model folder. Outputs are relative to the model folder.
+EVERY_CONFIG = [
+    ("emperor", "configs/emperor-4b.toml"),
+    ("emperor", "configs/emperor-lite-2b.toml"),
+    ("emperor", "configs/sft.toml"),
+    ("emperor", "configs/sft-r2.toml"),
+    ("consul", "../consul/configs/consul-4b.toml"),
+    ("consul", "../consul/configs/consul-lite-2b.toml"),
+    ("consul", "../consul/configs/sft.toml"),
+]
+
+
+def test_no_two_configs_write_to_the_same_place():
+    configs = [(folder, load_config(ROOT / path)) for folder, path in EVERY_CONFIG]
+    names = [c.release.name for _, c in configs]
+    assert len(set(names)) == len(names)
+    for attribute in ("train", "merge"):
+        places = [(folder, getattr(c, attribute).output_dir) for folder, c in configs]
+        assert len(set(places)) == len(places), attribute
+    # The CLIs default to configs/sft.toml: it must not share the new 4B configs' names.
+    for folder, path in (("emperor", "configs/sft.toml"), ("consul", "../consul/configs/sft.toml")):
+        assert load_config(ROOT / path).release.name.endswith("-8k"), folder
+
+
+def test_the_four_models_have_distinct_aliases_and_text():
+    models = [load_config(ROOT / p) for _, p in EVERY_CONFIG if "sft" not in p]
+    assert len(models) == 4
+    assert len({c.release.eval_alias for c in models}) == 4
+    assert len({c.release.summary for c in models}) == 4
+
+
+@pytest.mark.parametrize("size", ["2B", "4B"])
+def test_the_kv_layout_matches_the_base_config(size):
+    from emperor.release import card
+
+    base = Path(f"F:/AI-Models/Qwen/Qwen3.5-{size}")
+    if not (base / "config.json").is_file():
+        pytest.skip(f"no local base at {base}")
+    name = "emperor-4b" if size == "4B" else "emperor-lite-2b"
+    release = load_config(ROOT / "configs" / f"{name}.toml").release
+    assert card.config_arch(release) == card.read_arch(base)
+
+
+def test_vram_cap_is_clamped_to_the_free_vram():
+    from emperor.train.sft import vram_fraction
+
+    gib = 2**30
+    total = 16 * gib
+    # A fixed cap is clamped to the VRAM free now, less 0.2 GiB.
+    assert vram_fraction(15.6 * gib, total, cap_gib=15.3) == pytest.approx(15.3 / 16)
+    assert vram_fraction(10 * gib, total, cap_gib=15.3) == pytest.approx(9.8 / 16)
+    assert vram_fraction(14.2 * gib, total, cap_gib=15.3) == pytest.approx(14.0 / 16)
+    assert vram_fraction(4 * gib, total, cap_gib=20.0) == pytest.approx(3.8 / 16)
+    assert vram_fraction(12.5 * gib, total) == pytest.approx(12 / 16)  # free less 0.5 GiB
+    assert vram_fraction(0, total) == 0.1
+
+
+def test_training_checks_free_vram_then_caps_it_from_the_config(monkeypatch):
+    import inspect
+
+    from emperor.train import sft
+
+    calls = []
+    monkeypatch.setattr(sft, "require_free_vram", lambda gib: calls.append(("min", gib)))
+    monkeypatch.setattr(sft, "cap_vram", lambda gib: calls.append(("cap", gib)) or gib)
+    config = load_config(ROOT / "configs" / "emperor-4b.toml")
+    assert sft.prepare_vram(config) == 15.3
+    assert calls == [("min", 14.1), ("cap", 15.3)]
+    calls.clear()
+    plain = parse_config({"train": {"vram_cap_gib": 12.0}})  # no offload: the model's floor
+    sft.prepare_vram(plain)
+    assert calls == [("min", plain.model.min_free_vram_gib), ("cap", 12.0)]
+    # train() sets the VRAM up through prepare_vram, before loading anything.
+    source = inspect.getsource(sft.train)
+    assert "prepare_vram(config)" in source
+    assert source.index("prepare_vram(config)") < source.index("from_pretrained")
+
+
+def test_vram_settings_and_length_keys_are_validated():
+    assert parse_config({"data": {"max_length_quantile": 0.99}}).data.max_length_quantile == 0.99
+    with pytest.raises(ConfigError, match="not supported"):
+        parse_config({"data": {"quantile_bits": 4}})
+    with pytest.raises(ConfigError, match="vram_cap_gib"):
+        parse_config({"train": {"vram_cap_gib": -1}})
+    with pytest.raises(ConfigError, match="minimum free VRAM"):
+        parse_config({"train": {"offload_min_free_vram_gib": -1}})
+    with pytest.raises(ConfigError, match="max_length_quantile"):
+        parse_config({"data": {"max_length_quantile": 0}})
+    with pytest.raises(ConfigError, match="KV layout"):
+        parse_config({"release": {"kv_heads": 0}})
