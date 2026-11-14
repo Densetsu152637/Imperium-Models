@@ -36,6 +36,9 @@ log = logging.getLogger("emperor.stages")
 PAUSED = 75
 OOM_MARKER = "OutOfMemoryError"
 MAX_INTERRUPTIONS = 3
+# Exit codes of `train fit` that are results, not interruptions: 2 a config error, 3 a refusal
+# with a reason (no adapter to continue, no trainable samples).
+CLEAR_FAILURE_CODES = (2, 3)
 
 
 def add_arguments(p) -> None:
@@ -343,7 +346,8 @@ def main(args, config: SftConfig) -> int:
             text = (
                 log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
             )
-            if code != 0 and "Traceback" not in text and interruptions < MAX_INTERRUPTIONS:
+            failed_clearly = code in CLEAR_FAILURE_CODES or "Traceback" in text
+            if code != 0 and not failed_clearly and interruptions < MAX_INTERRUPTIONS:
                 interruptions += 1
                 log.warning("stage %d was interrupted (exit code %s); starting it again", cap, code)
                 continue
@@ -372,7 +376,10 @@ def main(args, config: SftConfig) -> int:
         previous = cap
     state.save(state_path)
     (run_dir / "STAGES.md").write_text(summary(state), encoding="utf-8")
-    rel_run = run_dir.resolve().relative_to(root).as_posix()
+    try:
+        rel_run = run_dir.resolve().relative_to(root).as_posix()
+    except ValueError:  # a run dir outside the root: name it absolutely
+        rel_run = run_dir.resolve().as_posix()
     final = final_config(raw, state.last_adapter(), args.suffix, rel_run)
     (run_dir / "final.toml").write_text(to_toml(final), encoding="utf-8")
     print(
