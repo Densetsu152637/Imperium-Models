@@ -81,12 +81,68 @@ def take(rows: list[dict], count: int, seed: int, balance_key: str | None = None
     return out
 
 
+MODELS = ("emperor", "consul")
+
+
+def user_text(row: dict) -> str:
+    return "\n".join(
+        m.get("content") or ""
+        for m in row.get("messages") or []
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    )
+
+
+def rejection(row: dict, model: str, heldout) -> str | None:
+    """Why a row cannot enter this model's mix: not a chat sample ending in an assistant turn,
+    made for the other model (`meta.for_model`), or overlapping a held-out eval task."""
+    messages = row.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return "no_messages"
+    if messages[-1].get("role") != "assistant":
+        return "not_answered"
+    target = (row.get("meta") or {}).get("for_model")
+    if target and target != model:
+        return f"for_{target}"
+    if heldout is not None and heldout.leaks(user_text(row)):
+        return "heldout_overlap"
+    return None
+
+
+def screen(
+    buckets: dict[str, list[dict]], model: str, heldout
+) -> tuple[dict[str, list[dict]], dict[str, dict[str, int]]]:
+    """Each bucket without the rows that cannot enter the mix, and the counts of why."""
+    kept: dict[str, list[dict]] = {}
+    rejected: dict[str, dict[str, int]] = {}
+    for name, rows in buckets.items():
+        kept[name] = []
+        for row in rows:
+            why = rejection(row, model, heldout)
+            if why:
+                rejected.setdefault(name, {})
+                rejected[name][why] = rejected[name].get(why, 0) + 1
+            else:
+                kept[name].append(row)
+    return kept, rejected
+
+
 def mix(
     buckets: dict[str, list[dict]],
     seed: int = 1337,
     shares: dict[str, float] = TARGET_SHARES,
+    *,
+    model: str = "emperor",
+    heldout="bundled",
 ) -> tuple[list[dict], dict]:
-    """The mixed samples (shuffled deterministically) and a report."""
+    """The mixed samples for `model` (shuffled deterministically) and a report. `heldout` is a
+    `HeldoutIndex` (default: the bundled eval tasks) or None to skip the overlap check."""
+    if model not in MODELS:
+        raise ValueError(f"unknown model {model}")
+    if heldout == "bundled":
+        from emperor.data.prompts import HeldoutIndex
+
+        heldout = HeldoutIndex.bundled()
+    buckets, rejected = screen(buckets, model, heldout)
     counts = plan_counts({k: len(v) for k, v in buckets.items()}, shares)
     chosen: list[dict] = []
     seen: set[str] = set()
@@ -110,9 +166,31 @@ def mix(
         by_licence[meta.get("licence", "?")] = by_licence.get(meta.get("licence", "?"), 0) + 1
         generator = meta.get("generator") or meta.get("teacher") or "?"
         by_generator[generator] = by_generator.get(generator, 0) + 1
+    grafts: dict[str, dict] = {}
+    for row in chosen:
+        meta = row.get("meta") or {}
+        if not meta.get("revision"):
+            continue  # not an open-data graft
+        entry = grafts.setdefault(
+            meta["subset"],
+            {
+                "dataset": meta["source"],
+                "subset": meta["subset"],
+                "revision": meta["revision"],
+                "licence": meta["licence"],
+                "generators": set(),
+                "samples": 0,
+            },
+        )
+        entry["generators"].add(meta["generator"])
+        entry["samples"] += 1
     report = {
+        "model": model,
+        "grafts": [{**g, "generators": sorted(g["generators"])} for _, g in sorted(grafts.items())],
         "seed": seed,
         "total": len(chosen),
+        "rejected": rejected,
+        "heldout_checked": heldout is not None,
         "buckets": counts,
         "by_source": dict(sorted(by_source.items())),
         "by_licence": dict(sorted(by_licence.items())),

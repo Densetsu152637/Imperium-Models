@@ -12,12 +12,13 @@ import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
-RESOLVE = "https://huggingface.co/datasets/{dataset}/resolve/main/{file}"
+RESOLVE = "https://huggingface.co/datasets/{dataset}/resolve/{revision}/{file}"
 USER_AGENT = "imperium-models-graft/1"
 
 
-def file_url(dataset: str, file: str) -> str:
-    return RESOLVE.format(dataset=dataset, file=file)
+def file_url(dataset: str, file: str, revision: str = "main") -> str:
+    """The file at a pinned dataset revision (a commit SHA)."""
+    return RESOLVE.format(dataset=dataset, revision=revision, file=file)
 
 
 def _request(url: str, headers: dict | None = None):

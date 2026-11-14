@@ -4,20 +4,24 @@ A training sample is `{"id", "task_class", "tools", "messages", "meta"}`. Messag
 OpenAI-style (`system`/`user`/`assistant`/`tool`), the assistant's thinking is in
 `reasoning_content`, tool-call arguments are JSON text, and `tools` holds full OpenAI function
 schemas (our own samples name Emperor's tools instead). `meta` records the source, licence,
-generator and URL of every sample.
+generator, upstream source and pinned dataset revision of every sample.
 
-A sample is dropped, with the reason counted, when its generator is blocked or unknown, when the
-first assistant turn after the last user message has no reasoning (a thinking base would learn
-to act without thinking), or when its thinking is longer than the cap.
+A sample is dropped, with the reason counted, when its generator is not on the allow-list, when
+its upstream question source is not allowed, when it fails the schema checks (tool calls name
+offered tools with object arguments and unique ids, every call is answered, no secrets in any
+text), when the first assistant turn after the last user message has no reasoning (a thinking
+base would learn to act without thinking), or when its thinking is longer than the cap.
 """
 
 import hashlib
 import json
 import re
 
-from emperor.graft.sources import Source, blocked
+from emperor.data.schema import secret_hits
+from emperor.graft.sources import Source, allowed
 
-BLOCKED = "blocked_generator"
+BLOCKED = "generator_not_allowed"
+UPSTREAM = "upstream_not_allowed"
 NO_REASONING = "no_reasoning"
 LONG_THINKING = "thinking_over_cap"
 MALFORMED = "malformed"
@@ -103,12 +107,81 @@ def max_thinking_tokens(messages: list[dict]) -> int:
     )
 
 
+def schema_problems(sample: dict) -> list[str]:
+    """Tool-call and secret checks for a grafted sample (its tools are its own schemas)."""
+    problems: list[str] = []
+    offered = {t["function"]["name"] for t in sample.get("tools") or []}
+    seen: set[str] = set()
+    pending: list[str] = []
+    for message in sample["messages"]:
+        role = message["role"]
+        texts = [message.get("content") or ""]
+        if role == "assistant":
+            texts.append(message.get("reasoning_content") or "")
+            if pending:
+                problems.append("unanswered_tool_call")
+            pending = []
+            for call in message.get("tool_calls") or []:
+                function = call["function"]
+                if function["name"] not in offered:
+                    problems.append("tool_not_offered")
+                try:
+                    arguments = json.loads(function["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    arguments = None
+                if not isinstance(arguments, dict):
+                    problems.append("arguments_not_an_object")
+                else:
+                    texts += list(_leaf_strings(arguments))
+                if call["id"] in seen:
+                    problems.append("duplicate_call_id")
+                seen.add(call["id"])
+                pending.append(call["id"])
+        elif role == "tool":
+            if message.get("tool_call_id") not in pending:
+                problems.append("tool_result_without_call")
+            else:
+                pending.remove(message["tool_call_id"])
+        if role != "tool" and any(secret_hits(text) for text in texts if text):
+            problems.append(f"secret_in_{role}")
+    if pending:
+        problems.append("unanswered_tool_call")
+    return sorted(set(problems))
+
+
+def _leaf_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _leaf_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _leaf_strings(item)
+
+
+def _meta(source: Source, generator: str, record: dict) -> dict:
+    meta = {
+        "source": source.dataset,
+        "revision": source.revision,
+        "subset": source.key,
+        "licence": source.licence,
+        "generator": generator,
+        "url": source.url,
+        "judged": False,  # grafts are filtered, not judged
+    }
+    upstream = source.upstream_of(record)
+    if upstream:
+        meta["upstream_source"] = upstream
+    return meta
+
+
 def convert_nemotron(
     record: dict, source: Source, max_thinking: int
 ) -> tuple[dict | None, str | None]:
     """A Nemotron agentic record -> (sample, None) or (None, why it was dropped)."""
     generator = source.generator_of(record)
-    if blocked(generator):
+    if not allowed(generator):
         return None, BLOCKED
     try:
         call_ids: list[str] = []
@@ -149,19 +222,17 @@ def convert_nemotron(
         return None, NO_REASONING
     if max_thinking_tokens(messages) > max_thinking:
         return None, LONG_THINKING
-    return {
+    sample = {
         "id": sample_id(source, record, messages),
         "task_class": f"graft/{source.key}",
         "tools": tools,
         "messages": messages,
-        "meta": {
-            "source": source.dataset,
-            "subset": source.key,
-            "licence": source.licence,
-            "generator": generator,
-            "url": source.url,
-        },
-    }, None
+        "meta": _meta(source, generator, record),
+    }
+    problems = schema_problems(sample)
+    if problems:
+        return None, f"schema:{problems[0]}"
+    return sample, None
 
 
 def convert_openthoughts(
@@ -169,8 +240,11 @@ def convert_openthoughts(
 ) -> tuple[dict | None, str | None]:
     """An OpenThoughts3 row (`conversations` of from/value, the answer holding `<think>`)."""
     generator = source.generator_of(record)
-    if blocked(generator):
+    if not allowed(generator):
         return None, BLOCKED
+    upstream = source.upstream_of(record)
+    if source.upstream_allow and upstream not in source.upstream_allow:
+        return None, UPSTREAM
     turns = record.get("conversations") or []
     if len(turns) != 2 or turns[0].get("from") not in ("human", "user"):
         return None, MALFORMED
@@ -184,21 +258,22 @@ def convert_openthoughts(
         {"role": "user", "content": turns[0]["value"].strip()},
         {"role": "assistant", "content": answer, "reasoning_content": reasoning},
     ]
-    return {
+    meta = _meta(source, generator, record)
+    meta["domain"] = record.get("domain")
+    if upstream in source.upstream_allow:
+        meta["question_licence"] = source.upstream_allow[upstream].licence
+        meta["question_author"] = source.upstream_allow[upstream].author
+    sample = {
         "id": sample_id(source, {"uuid": turns[0]["value"]}, messages),
         "task_class": f"graft/{source.key}/{record.get('domain') or 'unknown'}",
         "tools": [],
         "messages": messages,
-        "meta": {
-            "source": source.dataset,
-            "subset": source.key,
-            "licence": source.licence,
-            "generator": generator,
-            "url": source.url,
-            "domain": record.get("domain"),
-            "upstream_source": record.get("source"),
-        },
-    }, None
+        "meta": meta,
+    }
+    problems = schema_problems(sample)
+    if problems:
+        return None, f"schema:{problems[0]}"
+    return sample, None
 
 
 CONVERTERS = {"nemotron": convert_nemotron, "openthoughts": convert_openthoughts}
