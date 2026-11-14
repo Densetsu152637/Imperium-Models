@@ -33,19 +33,138 @@ def find_llama_server(explicit: str | Path | None = None) -> Path | None:
     return find_llama_tool("llama-server", explicit, "EMPEROR_LLAMA_SERVER")
 
 
-class OwnProcesses:
-    """Every process the pipeline launched; the idle gate subtracts these from GPU load."""
+def process_parents() -> dict[int, int]:
+    """Every running process's parent, by PID; {} where this cannot be read."""
+    if os.name == "nt":
+        return _windows_parents()
+    parents = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            parents[int(stat.parent.name)] = int(fields[1])
+        except (OSError, IndexError, ValueError):
+            continue
+    return parents
 
-    def __init__(self) -> None:
-        self._procs: dict[int, subprocess.Popen] = {}
+
+def _windows_parents() -> dict[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel = ctypes.windll.kernel32
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snapshot = kernel.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, wintypes.HANDLE(-1).value):
+        return {}
+    parents: dict[int, int] = {}
+    entry = Entry()
+    entry.dwSize = ctypes.sizeof(Entry)
+    try:
+        ok = kernel.Process32First(snapshot, ctypes.byref(entry))
+        while ok:
+            parents[entry.th32ProcessID] = entry.th32ParentProcessID
+            ok = kernel.Process32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return parents
+
+
+def process_created(pid: int) -> int | None:
+    """A process's creation time (comparable between processes on this machine), or None
+    when the process cannot be opened or has exited."""
+    if os.name == "nt":
+        return _windows_created(pid)
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19])  # starttime, in clock ticks since boot
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _windows_created(pid: int) -> int | None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.windll.kernel32
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        created = times[0]
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def with_descendants(roots, parents: dict[int, int], created=process_created) -> tuple[int, ...]:
+    """`roots` and every process descended from them.
+
+    Windows keeps a dead parent's PID in its children's records, so a reused PID could adopt a
+    foreign process tree. An edge counts only when both processes can be opened and the child
+    was created no earlier than the parent (`created` gives creation times)."""
+    found = set(roots)
+    children: dict[int, list[int]] = {}
+    for pid, parent in parents.items():
+        if pid != parent:
+            children.setdefault(parent, []).append(pid)
+    times: dict[int, int | None] = {}
+
+    def time_of(pid: int) -> int | None:
+        if pid not in times:
+            times[pid] = created(pid)
+        return times[pid]
+
+    def real_edge(parent: int, child: int) -> bool:
+        parent_time, child_time = time_of(parent), time_of(child)
+        return parent_time is not None and child_time is not None and child_time >= parent_time
+
+    stack = list(found)
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, []):
+            if child not in found and real_edge(parent, child):
+                found.add(child)
+                stack.append(child)
+    return tuple(sorted(found))
+
+
+class OwnProcesses:
+    """Every process the pipeline launched, and their descendants; the idle gate subtracts
+    these from GPU load. Descendants matter on Windows, where a virtual environment's
+    python.exe is a launcher that runs the real interpreter as its child."""
 
     def add(self, proc: subprocess.Popen) -> None:
         self._procs[proc.pid] = proc
 
+    def __init__(self, parents=process_parents, created=process_created) -> None:
+        self._procs: dict[int, subprocess.Popen] = {}
+        self._parents = parents
+        self._created = created
+
     def pids(self) -> tuple[int, ...]:
         alive = {pid: p for pid, p in self._procs.items() if p.poll() is None}
         self._procs = alive
-        return tuple(alive)
+        if not alive:
+            return ()
+        return with_descendants(alive, self._parents(), self._created)
 
     def terminate_all(self, grace: float = 20.0) -> None:
         """Stop every still-running child we started, by PID, and nothing else."""
