@@ -14,6 +14,7 @@ train = "emperor.train.cli:main"
 pipeline = "emperor.dispatch:pipeline_main"
 hosted = "emperor.dispatch:hosted_main"
 release = "emperor.release.cli:main"
+graft = "emperor.graft.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.8"]
@@ -22,6 +23,8 @@ data = ["httpx>=0.27"]
 # Hosted teacher, simulator and judge (`uv run --group data --group hosted hosted ...`): API
 # keys come from the OS credential store through keyring.
 hosted = ["keyring>=25"]
+# Reading the Parquet shards of open datasets for grafting (`uv run --group graft graft fetch`).
+graft = ["pyarrow>=17"]
 # Uploading to the Hugging Face Hub (`uv run --group publish release publish --confirm ...`).
 publish = ["huggingface_hub>=0.30"]
 # bf16 LoRA fine-tuning and merging. The torch wheel comes from the CUDA 12.8 index because

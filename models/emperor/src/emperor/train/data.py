@@ -242,9 +242,12 @@ def encode_sample(
 
 
 def _tool_definitions(sample: dict) -> list[dict] | None:
-    """The tool definitions the sample was written against; None for chat-only samples."""
+    """The tool definitions the sample was written against; None for chat-only samples.
+    Our own samples name Emperor's tools; grafted samples carry full OpenAI schemas."""
     if not sample.get("tools"):
         return None
+    if all(isinstance(tool, dict) for tool in sample["tools"]):
+        return sample["tools"]
     from emperor.eval.contract import openai_tools
 
     return openai_tools(sample["tools"])

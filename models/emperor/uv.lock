@@ -322,6 +322,9 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
+graft = [
+    { name = "pyarrow" },
+]
 hosted = [
     { name = "keyring" },
 ]
@@ -351,6 +354,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.8" },
 ]
+graft = [{ name = "pyarrow", specifier = ">=17" }]
 hosted = [{ name = "keyring", specifier = ">=25" }]
 publish = [{ name = "huggingface-hub", specifier = ">=0.30" }]
 train = [
