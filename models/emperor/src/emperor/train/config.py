@@ -74,6 +74,12 @@ class TrainConfig:
     # with a clear error when the VRAM is not free.
     offload_activations: bool = False
     offload_min_free_vram_gib: float = 10.0  # weights, LoRA, optimiser and one layer's work
+    # The VRAM PyTorch may allocate, in GiB. 0: what is free when training starts, less a
+    # margin. A fixed cap near the card's size (e.g. 15.3 of 16) lets long traces fit when
+    # other apps yield their VRAM; set the min-free check above to 0 so it does not refuse to
+    # start while they still hold some. Overflow past the cap raises out-of-memory at once
+    # instead of spilling into shared system memory.
+    vram_cap_gib: float = 0.0
     save_steps: int = 50
     save_total_limit: int = 3
     eval_steps: int = 50
@@ -93,8 +99,16 @@ class ReleaseConfig:
     """What the release tooling (GGUF export, model card, publish) needs to name and describe
     the model. Only the name has to differ between models that share this package."""
 
-    name: str = "emperor-4b"  # weights/<name>-gguf/, <name>-<TYPE>.gguf, the card title
+    name: str = "emperor-4b"  # weights/<name>-gguf/, <name>-<TYPE>.gguf
     title: str = "Emperor"
+    size: str = "4B"  # shown after the title in the card heading
+    # The card's base model and the memory estimates for it. The KV layout is used only when the
+    # merged weights have no config.json to read it from.
+    base_model: str = "Qwen/Qwen3.5-4B"  # the Hugging Face id the card names
+    params_billions: float = 4.02  # language-model parameters, for size estimates
+    kv_layers: int = 8  # layers with a KV cache (Qwen3.5: the full-attention layers only)
+    kv_heads: int = 4
+    head_dim: int = 256
     summary: str = (
         "Emperor is an open-weight root agent for Imperium: it plans, writes compact briefs "
         "and delegates the work to subagents through tool calls."
@@ -160,7 +174,8 @@ _FORBIDDEN = ("4bit", "8bit", "qlora", "quant", "bnb", "load_in")
 def _section(cls, raw: dict, name: str):
     known = {f.name for f in fields(cls)}
     for key in raw:
-        if any(word in key.lower() for word in _FORBIDDEN):
+        # Known keys pass ("max_length_quantile" is not about quantisation).
+        if key not in known and any(word in key.lower() for word in _FORBIDDEN):
             raise ConfigError(
                 f"[{name}] {key}: quantised training is not supported; Emperor trains bf16 LoRA "
                 "on full-precision weights and quantises only after training"
@@ -196,6 +211,17 @@ def parse_config(raw: dict) -> SftConfig:
     name = config.release.name
     if not name or any(c in name for c in ("/", "\\", " ", ":", "*", "?", '"', "<", ">", "|")):
         raise ConfigError("[release] name must be a plain file name")
+    if config.train.vram_cap_gib < 0:
+        raise ConfigError("[train] vram_cap_gib must be 0 (free VRAM) or a size in GiB")
+    if config.model.min_free_vram_gib < 0 or config.train.offload_min_free_vram_gib < 0:
+        raise ConfigError("[model]/[train] minimum free VRAM must not be negative (0: no check)")
+    if config.data.max_length_auto and config.data.max_length_cap < 256:
+        raise ConfigError("[data] max_length_cap must be at least 256")
+    if not 0 < config.data.max_length_quantile <= 1:
+        raise ConfigError("[data] max_length_quantile must be in (0, 1]")
+    r = config.release
+    if r.params_billions <= 0 or min(r.kv_layers, r.kv_heads, r.head_dim) < 1:
+        raise ConfigError("[release] params_billions and the KV layout must be positive")
     if not config.release.gguf_types:
         raise ConfigError("[release] gguf_types must list at least one type")
     return config

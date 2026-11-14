@@ -12,7 +12,6 @@ from pathlib import Path
 from emperor.export.gguf import gguf_dir_for
 from emperor.train.config import SftConfig
 
-BASE_MODEL = "Qwen/Qwen3.5-4B"
 # Typical bits per weight of llama.cpp types, used only when the file is not there to measure.
 BITS_PER_WEIGHT = {
     "bf16": 16.0,
@@ -22,11 +21,17 @@ BITS_PER_WEIGHT = {
     "Q5_K_M": 5.7,
     "Q4_K_M": 4.9,
 }
-DEFAULT_PARAMS = 4.02e9
-# Qwen3.5-4B: layers with a KV cache (8 full-attention layers; the 24 Gated DeltaNet layers keep
-# a fixed-size state), KV heads, head size. Overridden by the model's own config.json when present.
-DEFAULT_ARCH = {"num_hidden_layers": 8, "num_key_value_heads": 4, "head_dim": 256}
 GIB = 2**30
+
+
+def config_arch(release) -> dict:
+    """The KV layout the release config gives for its base (`[release]` kv_layers, kv_heads,
+    head_dim); the model's own config.json overrides it when the merged weights exist."""
+    return {
+        "num_hidden_layers": release.kv_layers,
+        "num_key_value_heads": release.kv_heads,
+        "head_dim": release.head_dim,
+    }
 
 
 def yaml_scalar(value) -> str:
@@ -49,9 +54,9 @@ def front_matter(fields: dict) -> str:
     return "\n".join(lines)
 
 
-def kv_cache_gib(tokens: int, arch: dict | None = None) -> float:
+def kv_cache_gib(tokens: int, arch: dict) -> float:
     """f16 KV cache: 2 (K and V) x KV-cache layers x KV heads x head size x 2 bytes, per token."""
-    a = {**DEFAULT_ARCH, **(arch or {})}
+    a = arch
     per_token = 2 * a["num_hidden_layers"] * a["num_key_value_heads"] * a["head_dim"] * 2
     return tokens * per_token / GIB
 
@@ -71,7 +76,7 @@ def read_arch(weights: Path) -> dict | None:
     return arch
 
 
-def weights_gib(kind: str, file_bytes: int | None = None, params: float = DEFAULT_PARAMS) -> float:
+def weights_gib(kind: str, params: float, file_bytes: int | None = None) -> float:
     if file_bytes:
         return file_bytes / GIB
     return params * BITS_PER_WEIGHT.get(kind, 16.0) / 8 / GIB
@@ -161,7 +166,7 @@ def datasheet(release, report: dict | None) -> str:
 def recipe(config: SftConfig, train_result: dict | None) -> str:
     t, lo, d = config.train, config.lora, config.data
     lines = [
-        f"- Base: `{BASE_MODEL}`, bf16 weights (never quantised during training).",
+        f"- Base: `{config.release.base_model}`, bf16 weights (never quantised during training).",
         "- Method: supervised fine-tuning with a bf16 LoRA adapter (no QLoRA, no 4/8-bit), "
         "merged into the base afterwards; loss on assistant tokens only, including the "
         "teacher's reasoning in each turn's thinking block (samples without it are skipped).",
@@ -189,13 +194,15 @@ def memory_notes(release, files: list[dict], arch: dict | None) -> str:
     else:
         kinds = [("bf16", None)] + [(t, None) for t in release.gguf_types]
     ctx = release.context_tokens
+    arch = {**config_arch(release), **(arch or {})}
+    params = release.params_billions * 1e9
     kv = kv_cache_gib(ctx, arch)
     rows = [
         f"| Weights | Size (GiB) | f16 KV cache at {ctx} tokens (GiB) | Total (GiB) |",
         "| ------- | ---------- | ---------------------------------- | ----------- |",
     ]
     for kind, size in kinds:
-        w = weights_gib(kind, size)
+        w = weights_gib(kind, params, size)
         rows.append(f"| {kind} | {w:.1f} | {kv:.1f} | {w + kv:.1f} |")
     steps = ", ".join(f"{t // 1024}K = {kv_cache_gib(t, arch):.1f} GiB" for t in (8192, 32768, ctx))
     return (
@@ -223,13 +230,13 @@ def render_card(inputs: CardInputs, kind: str) -> str:
     gguf = kind == "gguf"
     head = {
         "license": r.license,
-        "base_model": BASE_MODEL,
+        "base_model": r.base_model,
         "language": ["en"],
         "pipeline_tag": "text-generation",
         "library_name": "gguf" if gguf else "transformers",
         "tags": [*r.tags, *(["gguf"] if gguf else ["bf16"])],
     }
-    title = f"{r.title} 4B" + (" (GGUF)" if gguf else "")
+    title = f"{r.title} {r.size}".strip() + (" (GGUF)" if gguf else "")
     parts = [front_matter(head), "", f"# {title}", "", r.summary, ""]
     if gguf:
         files = inputs.gguf_files or []

@@ -27,6 +27,8 @@ PAUSED_EXIT_CODE = 75  # EX_TEMPFAIL: a checkpoint was saved and the run should 
 def require_free_vram(min_gib: float) -> None:
     """Stop before loading anything when another process holds the VRAM training needs. Layers
     offloaded to the CPU break LoRA's backward pass, so training only runs fully on the GPU."""
+    if min_gib <= 0:
+        return  # check off: other apps are expected to yield VRAM (see train.vram_cap_gib)
     import torch
 
     free_gib = torch.cuda.mem_get_info(0)[0] / 2**30
@@ -37,14 +39,22 @@ def require_free_vram(min_gib: float) -> None:
         )
 
 
-def cap_vram(margin_gib: float = 0.5) -> float:
-    """Cap PyTorch's allocator at the VRAM free now, less a margin. On Windows the driver
-    otherwise spills overflow into shared system memory and training crawls (hours per step)
-    instead of failing; with the cap, running out raises an out-of-memory error at once."""
+def vram_fraction(free: int, total: int, cap_gib: float = 0.0, margin_gib: float = 0.5) -> float:
+    """The share of the card PyTorch may allocate: `cap_gib` when set (at most the whole card),
+    otherwise the VRAM free now less a margin; never below a tenth."""
+    if cap_gib > 0:
+        return max(min(cap_gib * 2**30 / total, 1.0), 0.1)
+    return max(min((free - margin_gib * 2**30) / total, 1.0), 0.1)
+
+
+def cap_vram(cap_gib: float = 0.0, margin_gib: float = 0.5) -> float:
+    """Cap PyTorch's allocator (see `vram_fraction`); returns the cap in GiB. On Windows the
+    driver otherwise spills overflow into shared system memory and training crawls (hours per
+    step) instead of failing; with the cap, running out raises an out-of-memory error at once."""
     import torch
 
     free, total = torch.cuda.mem_get_info(0)
-    fraction = max(min((free - margin_gib * 2**30) / total, 1.0), 0.1)
+    fraction = vram_fraction(free, total, cap_gib, margin_gib)
     torch.cuda.set_per_process_memory_fraction(fraction, 0)
     return fraction * total / 2**30
 
@@ -205,7 +215,7 @@ def train(config: SftConfig, root: Path, pause_file: Path | None = None) -> int:
     require_free_vram(
         config.train.offload_min_free_vram_gib if offload else config.model.min_free_vram_gib
     )
-    log.info("VRAM cap for training: %.1f GiB", cap_vram())
+    log.info("VRAM cap for training: %.1f GiB", cap_vram(config.train.vram_cap_gib))
     use_fused_attention()
     shrink_logprob_tiles()
     base = Path(config.model.base)
