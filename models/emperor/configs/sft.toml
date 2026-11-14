@@ -1,6 +1,9 @@
 # Emperor supervised fine-tuning: bf16 LoRA on full-precision weights (no QLoRA, no 4/8-bit).
 # Paths are relative to the repository root unless absolute. The base is read-only.
 
+# The earlier single-model recipe (8K). Its names end in -8k so it never writes over the
+# outputs of configs/emperor-4b.toml.
+
 [model]
 base = "F:/AI-Models/Qwen/Qwen3.5-4B"
 attn_implementation = "sdpa"  # flash-attn has no Windows wheel
@@ -43,10 +46,10 @@ seed = 1337
 
 [merge]
 adapter_dir = "outputs/sft/adapter"
-output_dir = "weights/emperor-4b-bf16"
+output_dir = "weights/emperor-4b-8k-bf16"
 
 [release]
-name = "emperor-4b"  # weights/emperor-4b-gguf/, emperor-4b-<TYPE>.gguf
+name = "emperor-4b-8k"  # weights/emperor-4b-8k-gguf/, emperor-4b-8k-<TYPE>.gguf
 title = "Emperor"
 eval_alias = "emperor"
 gguf_types = ["Q8_0", "Q6_K", "Q4_K_M"]
