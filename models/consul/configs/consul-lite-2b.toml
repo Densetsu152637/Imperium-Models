@@ -8,18 +8,21 @@ attn_implementation = "sdpa"  # flash-attn has no Windows wheel
 [data]
 path = "data/hosted-1/final/final.jsonl"
 # The training length comes from the data: the longest sample, rounded up to 1,024 tokens, at
-# most 16,384. Longer samples are dropped, never truncated.
+# most 12,288 (all four models train at 12K first; longer samples are dropped here, never
+# truncated, and trained in later long-sample stages that raise the cap 1K at a time).
 max_length_auto = true
 max_length_quantile = 1.0
-max_length_cap = 16384
-max_length = 16384  # replaced by the measured length
+max_length_cap = 12288
+max_length = 12288  # replaced by the measured length
 val_fraction = 0.05
 split_seed = 1337
 
 [lora]
 r = 32
 alpha = 64
-dropout = 0.05
+# No LoRA dropout, as for Emperor 4B: PEFT's dropout copies each targeted layer's input, which
+# ran Emperor 4B out of memory on long traces.
+dropout = 0.0
 # Qwen3.5: full-attention layers (q/k/v/o), Gated DeltaNet layers (in_proj_qkv, in_proj_z,
 # out_proj; the per-head in_proj_a/in_proj_b gates stay frozen) and every MLP.
 target_modules = [
