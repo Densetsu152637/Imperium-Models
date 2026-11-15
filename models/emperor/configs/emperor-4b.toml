@@ -17,6 +17,16 @@ path = "data/hosted-1/final/final.jsonl"
 # - 14,336 with LoRA dropout 0.05: at optimiser step 2-3 (the dropout copy);
 # - 14,336 with dropout 0: at optimiser step 68 (the fp32 input cast of the fp32 adapters).
 # Revisit with bf16 adapters (autocast_adapter_dtype=False) or more VRAM.
+# Long-sample stages (`train stages`, 2026-11-15; each a fresh process, 1:1 short replay, half
+# the learning rate), over the 303 train samples above 12,288 tokens:
+# - cap 13,312: 121 long + 121 replay, done, peak 13.16 GiB, train loss 0.724;
+# - cap 14,336: 87 long + 87 replay, done, peak 13.47 GiB, train loss 0.742;
+# - cap 15,360: 71 long + 71 replay, out of memory twice (a 258 MiB request, 1.74 GiB
+#   fragmented): the caps stop here. 208 of the 303 long samples recovered.
+# Eval of the stage adapter (emperor-4b-long) against the 12K-only one, held-out suite at 32K:
+# task_success 0.545 (0.818), routing 0.455 (0.636), brief 0.841 (0.732), clarify 0.667 (0.333),
+# plan 1.48 (1.40), the rest equal. Task success and routing fell, so the 12K-only adapter is
+# kept as Emperor 4B; the stage adapter's weights stay under weights/emperor-4b-long-*.
 max_length_auto = true
 max_length_quantile = 1.0
 max_length_cap = 12288
