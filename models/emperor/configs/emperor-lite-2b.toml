@@ -13,6 +13,16 @@ path = "data/hosted-1/final/final.jsonl"
 # The training length comes from the data: the longest sample, rounded up to 1,024 tokens, at
 # most 12,288 (all four models train at 12K first; longer samples are dropped here, never
 # truncated, and trained in later long-sample stages that raise the cap 1K at a time).
+# Long-sample stages (2026-11-15). Each ran in a fresh process with 1:1 short replay and half
+# the learning rate. All passed, covering the 303 train samples over 12,288 tokens:
+# caps 13,312 / 14,336 / 15,360 / 16,384 / 17,408 / 19,456, with peak VRAM from 6.78 to 8.05 GiB
+# (the 18,432 band was empty).
+# Eval of the stage adapter (emperor-lite-2b-long) on the held-out suite at 32K, with the
+# 12K-only adapter's scores in brackets:
+# task_success 0.545 (0.455), brief 1.000 (0.976), plan 1.42 (1.07), and the rest equal,
+# including routing 0.636.
+# Task success rose and routing held, so the stage adapter is Emperor Lite. Its weights are
+# under weights/emperor-lite-2b-long-*; the 12K-only weights are kept as weights/emperor-lite-2b-*.
 max_length_auto = true
 max_length_quantile = 1.0
 max_length_cap = 12288
