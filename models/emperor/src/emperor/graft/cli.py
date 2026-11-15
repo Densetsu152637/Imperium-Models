@@ -206,11 +206,14 @@ class FitCheck:
             config.data.max_length_cap if config.data.max_length_auto else (config.data.max_length)
         )
         self.tokenizer = AutoTokenizer.from_pretrained(config.model.base)
+        self.template_kwargs = config.model.template_kwargs()
         self._encode = encode_sample
 
     def __call__(self, sample: dict) -> str | None:
         try:
-            row, reason = self._encode(sample, self.tokenizer, self.length)
+            row, reason = self._encode(
+                sample, self.tokenizer, self.length, template_kwargs=self.template_kwargs
+            )
         except Exception as error:  # a template that cannot render it
             return f"fit:{type(error).__name__}"
         return None if row is not None else f"fit:{reason}"

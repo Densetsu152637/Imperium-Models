@@ -208,18 +208,26 @@ def pick_max_length(
 
 
 def encode_sample(
-    sample: dict, tokenizer, max_length: int, *, thinking: bool | None = None
+    sample: dict,
+    tokenizer,
+    max_length: int,
+    *,
+    thinking: bool | None = None,
+    template_kwargs: dict | None = None,
 ) -> tuple[dict | None, str | None]:
     """Tokenise one sample: (row, None), or (None, why it is skipped). Never truncated.
 
     `thinking` says whether the base is a thinking model; None asks the chat template.
+    `template_kwargs` go to every template render (`ModelConfig.template_kwargs()`, e.g.
+    `enable_thinking`), so the sample renders as the model is served.
     """
     tools = _tool_definitions(sample)
     messages = chat_messages(sample)
+    extra = dict(template_kwargs or {})
 
     def render(msgs, add_generation_prompt):
         return tokenizer.apply_chat_template(
-            msgs, tools=tools, tokenize=False, add_generation_prompt=add_generation_prompt
+            msgs, tools=tools, tokenize=False, add_generation_prompt=add_generation_prompt, **extra
         )
 
     if thinking is None:

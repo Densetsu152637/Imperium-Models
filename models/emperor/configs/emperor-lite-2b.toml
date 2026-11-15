@@ -4,6 +4,9 @@
 [model]
 base = "F:/AI-Models/Qwen/Qwen3.5-2B"
 attn_implementation = "sdpa"  # flash-attn has no Windows wheel
+# Qwen3.5-2B's template thinks only when asked (the 4B thinks by default): the reasoning data
+# is rendered, trained and served (llama-server --chat-template-kwargs) with thinking on.
+enable_thinking = true
 
 [data]
 path = "data/hosted-1/final/final.jsonl"

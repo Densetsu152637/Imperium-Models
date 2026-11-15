@@ -638,6 +638,12 @@ class Pipeline:
             "--output", str(report),
         ]  # fmt: skip
 
+    def eval_server_args(self) -> list[str]:
+        """llama-server options for eval: the training config's chat-template options, so the
+        model is served as it was trained (Qwen3.5-2B thinks only with `enable_thinking`)."""
+        kwargs = self.sft.model.template_kwargs()
+        return ["--chat-template-kwargs", json.dumps(kwargs)] if kwargs else []
+
     def phase_eval(self) -> dict:
         gguf = self.eval_gguf()
         if gguf is None:
@@ -656,7 +662,9 @@ class Pipeline:
                     return {"stopped": True}
             return {"stopped": False, "exit_code": run.poll()}
 
-        result = self._server_phase("eval", gguf, self.s.eval_port, context, work)
+        result = self._server_phase(
+            "eval", gguf, self.s.eval_port, context, work, extra_args=self.eval_server_args()
+        )
         if result["status"] == "done" and report.exists():
             data = json.loads(report.read_text(encoding="utf-8"))
             result["metrics"] = {

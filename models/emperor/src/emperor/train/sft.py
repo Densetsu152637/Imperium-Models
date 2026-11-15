@@ -178,11 +178,13 @@ def last_checkpoint(output_dir: Path) -> Path | None:
     return max(candidates, key=lambda p: int(p.name.split("-")[-1]), default=None)
 
 
-def base_thinks(tokenizer) -> bool:
-    """Whether the base is a thinking model, judged by its chat template."""
+def base_thinks(tokenizer, template_kwargs: dict | None = None) -> bool:
+    """Whether the base is a thinking model, judged by its chat template rendered with the
+    config's template options (Qwen3.5-2B thinks only with `enable_thinking`)."""
+    extra = dict(template_kwargs or {})
     return renders_thinking(
         lambda msgs, add_generation_prompt: tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=add_generation_prompt
+            msgs, tokenize=False, add_generation_prompt=add_generation_prompt, **extra
         )
     )
 
@@ -191,11 +193,18 @@ def prepare_datasets(config: SftConfig, tokenizer, root: Path):
     paths = [_resolve(p, root) for p in (config.data.path, *config.data.extra_paths)]
     records = load_combined(paths)
     train, val = split_records(records, config.data.val_fraction, config.data.split_seed)
-    thinking = base_thinks(tokenizer)
+    template_kwargs = config.model.template_kwargs()
+    thinking = base_thinks(tokenizer, template_kwargs)
     if config.data.max_length_auto:
         lengths = []
         for sample in records:
-            row, _ = encode_sample(sample, tokenizer, config.data.max_length_cap, thinking=thinking)
+            row, _ = encode_sample(
+                sample,
+                tokenizer,
+                config.data.max_length_cap,
+                thinking=thinking,
+                template_kwargs=template_kwargs,
+            )
             if row is not None:
                 lengths.append(len(row["input_ids"]))
         config.data.max_length = pick_max_length(
@@ -218,7 +227,11 @@ def prepare_datasets(config: SftConfig, tokenizer, root: Path):
         rows, skipped = [], {}
         for sample in items:
             row, reason = encode_sample(
-                sample, tokenizer, config.data.max_length, thinking=thinking
+                sample,
+                tokenizer,
+                config.data.max_length,
+                thinking=thinking,
+                template_kwargs=template_kwargs,
             )
             if row is None:
                 skipped[reason] = skipped.get(reason, 0) + 1
