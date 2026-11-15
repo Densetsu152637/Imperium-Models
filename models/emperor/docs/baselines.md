@@ -19,6 +19,14 @@ baseline for the trained models. Consul's held-out baselines are still to come (
   `convert_hf_to_gguf.py`. They were served by Imperium's llama.cpp b12180 `llama-server`
   (`--jinja`, the model's own chat template) with a 32,768-token context, on the RTX 5080.
   One model ran at a time.
+- **Thinking was on for both Qwen models.** Qwen3.5-2B's chat template thinks only with
+  `enable_thinking` (the 4B thinks by default), but this `llama-server` build defaults to
+  `--reasoning auto`, which turns it on: with no template options the 2B's generation prompt
+  ends in `<think>\n` and its replies carry `reasoning_content` (checked 2026-11-15). The 2B
+  was re-run with `--chat-template-kwargs '{"enable_thinking": true}'`, behind the pipeline's
+  idle gate, and its report came out identical to the first one apart from the timestamp
+  (greedy decoding), so the 2B column stands. The re-run is kept in
+  `models/emperor/runs/baselines-20261115-thinking/`.
 - The harness was `uv run eval` (replay backend, `--suite heldout`, `--context-tier 32k`) with
   the default 16,384 completion tokens per reply. That is 15 tasks with scripted subagent
   replies, scored by heuristics, with no judge model and no hosted calls.
