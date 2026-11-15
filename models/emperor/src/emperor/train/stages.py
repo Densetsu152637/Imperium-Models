@@ -220,9 +220,10 @@ def measure_lengths(config: SftConfig, records: list[dict]) -> dict[str, int]:
     from emperor.train.data import encode_sample
 
     tokenizer = AutoTokenizer.from_pretrained(config.model.base)
+    template_kwargs = config.model.template_kwargs()
     lengths = {}
     for record in records:
-        row, _ = encode_sample(record, tokenizer, 1 << 20)
+        row, _ = encode_sample(record, tokenizer, 1 << 20, template_kwargs=template_kwargs)
         lengths[record["id"]] = len(row["input_ids"]) if row else 0
     return lengths
 

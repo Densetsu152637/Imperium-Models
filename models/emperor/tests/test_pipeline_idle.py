@@ -366,3 +366,37 @@ def test_process_created_reads_this_process():
     if now is not None:
         parent = process_created(os.getppid())
         assert parent is None or parent <= now
+
+
+def test_eval_serves_the_model_with_the_training_template_options(tmp_path, monkeypatch):
+    import json
+
+    from emperor.pipeline.processes import OwnProcesses
+    from emperor.pipeline.run import Pipeline, Settings
+
+    root = Path(__file__).resolve().parent.parent
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"")
+    calls = []
+
+    def fake_server_phase(
+        name, gguf, port, context, work, parallel=None, extra_args=None, vram_margin_mib=1536
+    ):
+        calls.append(extra_args)
+        return {"status": "failed"}
+
+    for config, expected in (
+        ("configs/emperor-lite-2b.toml", ["--chat-template-kwargs", '{"enable_thinking": true}']),
+        ("configs/sft.toml", []),  # no option: the template's own default
+    ):
+        run_dir = tmp_path / config.replace("/", "-")
+        run_dir.mkdir()
+        settings = Settings(
+            root=root, run_dir=run_dir, data_dir=tmp_path, train_config=Path(config), eval_gguf=gguf
+        )
+        pipeline = Pipeline(settings, None, OwnProcesses())
+        monkeypatch.setattr(pipeline, "_server_phase", fake_server_phase)
+        pipeline.phase_eval()
+        assert calls[-1] == expected
+        if expected:
+            assert json.loads(expected[1]) == {"enable_thinking": True}

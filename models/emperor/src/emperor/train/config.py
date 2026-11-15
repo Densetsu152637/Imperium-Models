@@ -18,6 +18,15 @@ class ModelConfig:
     base: str = "F:/AI-Models/Qwen/Qwen3.5-4B"
     attn_implementation: str = "sdpa"
     min_free_vram_gib: float = 13.5  # Qwen3.5 peaks at 13.0 GiB at 8192 tokens, plus CUDA context
+    # The chat template's `enable_thinking` option, used wherever the base's template renders a
+    # sample (training data, length measurement) and passed to llama-server at eval. Qwen3.5-4B
+    # thinks by default; Qwen3.5-2B thinks only with `enable_thinking = true`, so a reasoning
+    # dataset on the 2B needs it set. Unset: the template's own default.
+    enable_thinking: bool | None = None
+
+    def template_kwargs(self) -> dict:
+        """Extra `apply_chat_template` (and llama-server `--chat-template-kwargs`) options."""
+        return {} if self.enable_thinking is None else {"enable_thinking": self.enable_thinking}
 
 
 @dataclass
@@ -202,6 +211,10 @@ def parse_config(raw: dict) -> SftConfig:
         if name not in sections:
             raise ConfigError(f"unknown section [{name}]")
     config = SftConfig(**{n: _section(c, raw.get(n, {}), n) for n, c in sections.items()})
+    if config.model.enable_thinking is not None and not isinstance(
+        config.model.enable_thinking, bool
+    ):
+        raise ConfigError("[model] enable_thinking must be true or false")
     if config.data.max_length < 256:
         raise ConfigError("[data] max_length must be at least 256")
     if not 0 <= config.data.val_fraction < 0.5:

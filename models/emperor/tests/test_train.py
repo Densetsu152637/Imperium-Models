@@ -499,3 +499,101 @@ def test_logprob_tiles_are_small(monkeypatch):
     from emperor.train.sft import shrink_logprob_tiles
 
     assert inspect.signature(shrink_logprob_tiles).parameters["tokens"].default == 256
+
+
+def opt_in_thinking_render(messages, add_generation_prompt, enable_thinking=None):
+    """Qwen3.5-2B's template: the 4B's, except that its generation prompt opens a reasoning
+    block only with `enable_thinking=True` (otherwise it closes an empty one)."""
+    text = thinking_render(messages, add_generation_prompt=False)
+    if add_generation_prompt:
+        opener = "<think>\n" if enable_thinking is True else "<think>\n\n</think>\n\n"
+        text += "<|im_start|>assistant\n" + opener
+    return text
+
+
+class KwargsTokenizer(CharTokenizer):
+    """A CharTokenizer whose template takes options, recording each render's options."""
+
+    def __init__(self, render):
+        super().__init__(render)
+        self.seen: list[dict] = []
+
+    def apply_chat_template(
+        self, messages, tools=None, tokenize=False, add_generation_prompt=False, **kwargs
+    ):
+        self.seen.append(kwargs)
+        return self.render(messages, add_generation_prompt, **kwargs)
+
+
+def reasoning_sample():
+    sample = make_sample()
+    for message in sample["messages"]:
+        if message["role"] == "assistant":
+            message["reasoning_content"] = "I should delegate this."
+    return sample
+
+
+def test_an_opt_in_thinking_template_needs_enable_thinking():
+    from emperor.train.data import TemplateError
+    from emperor.train.sft import base_thinks
+
+    tokenizer = KwargsTokenizer(opt_in_thinking_render)
+    # Without the option the 2B looks like a non-thinking base, and its reasoning turns do not
+    # follow its generation prompt: the failure Emperor Lite's first training run hit.
+    assert not base_thinks(tokenizer)
+    with pytest.raises(TemplateError, match="prefix-consistent at message 2"):
+        encode_sample(reasoning_sample(), tokenizer, 100_000)
+
+    kwargs = {"enable_thinking": True}
+    assert base_thinks(tokenizer, kwargs)
+    tokenizer.seen.clear()
+    row, reason = encode_sample(reasoning_sample(), tokenizer, 100_000, template_kwargs=kwargs)
+    assert reason is None
+    labelled = "".join(chr(t) for t in row["labels"] if t != IGNORE)
+    assert labelled.count("I should delegate this.\n</think>") == 3
+    assert tokenizer.seen and all(seen == kwargs for seen in tokenizer.seen)
+    # The same as a template that thinks by default.
+    assert row == encode_sample(reasoning_sample(), CharTokenizer(thinking_render), 100_000)[0]
+
+
+def test_enable_thinking_is_optional_and_validated():
+    assert parse_config({}).model.enable_thinking is None
+    assert parse_config({}).model.template_kwargs() == {}
+    on = parse_config({"model": {"enable_thinking": True}}).model
+    assert on.template_kwargs() == {"enable_thinking": True}
+    off = parse_config({"model": {"enable_thinking": False}}).model
+    assert off.template_kwargs() == {"enable_thinking": False}
+    with pytest.raises(ConfigError, match="enable_thinking"):
+        parse_config({"model": {"enable_thinking": "yes"}})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "configs/emperor-4b.toml",
+        "configs/emperor-lite-2b.toml",
+        "../consul/configs/consul-4b.toml",
+        "../consul/configs/consul-lite-2b.toml",
+    ],
+)
+def test_the_reasoning_models_render_with_thinking_on(path):
+    # Qwen3.5-2B thinks only when asked; the 4B's rendering is the same with the option set.
+    assert load_config(ROOT / path).model.enable_thinking is True
+
+
+def test_stage_lengths_render_with_the_config_template_options(monkeypatch):
+    import sys
+    import types
+
+    from emperor.train import stages
+
+    tokenizer = KwargsTokenizer(opt_in_thinking_render)
+    fake = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda base: tokenizer)
+    )
+    monkeypatch.setitem(sys.modules, "transformers", fake)
+    config = parse_config({"model": {"enable_thinking": True}})
+    sample = reasoning_sample()
+    lengths = stages.measure_lengths(config, [sample])
+    assert lengths[sample["id"]] > 0
+    assert all(seen == {"enable_thinking": True} for seen in tokenizer.seen)
