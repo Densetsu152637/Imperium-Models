@@ -49,8 +49,9 @@ def replay_file(task: Task) -> dict:
     A recording with a `match` word answers a subagent whose brief contains it; one without
     answers any task subagent. As in the replay backend, a brief that matches no word falls back
     to a recording: the unmatched ones first, then the matched ones in order. Unlike it, the
-    harness does not use a recording up, so two briefs with the same word get the same report. `delegate_chunks` recordings answer chunk 1, 2, ... in order,
-    and the merge agent gets their reports joined.
+    harness does not use a recording up, so two briefs with the same word get the same report.
+    `delegate_chunks` recordings answer chunk 1, 2, ... in order, and the merge agent gets their
+    reports joined.
     """
     matched, unmatched, chunks = [], [], []
     for reply in task.replies:
