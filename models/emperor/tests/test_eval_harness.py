@@ -121,9 +121,7 @@ def test_replay_file_maps_match_words_roles_and_chunks():
     assert replies[2] == {"role": "task", "report": "httpx notes", "ok": True}
     assert replies[3]["role"] == "chunk" and replies[3]["chunk"] == 1
     assert replies[4]["chunk"] == 2
-    assert replies[5] == {"role": "reduce", "report": "chunk one
-
-chunk two", "ok": True}
+    assert replies[5] == {"role": "reduce", "report": "chunk one\n\nchunk two", "ok": True}
 
 
 def test_a_matched_recording_also_answers_a_brief_without_its_word():
