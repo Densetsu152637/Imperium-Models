@@ -187,17 +187,18 @@ def test_the_judge_never_sees_the_teachers_reasoning(sample):
 
 def test_the_judge_prompt_and_rubric_match_main():
     """The judge's rubric is what the thresholds were set against: teacher-only guidance
-    (TEACHER_NOTES) must not reach it. Hashes of main's judge prompts (emperor 95a0bfd)."""
+    (TEACHER_NOTES) must not reach it. Hashes of the judge prompts with the root prompt
+    vendored from Imperium-AI bdc237a; a re-vendor changes them (older data used older ones)."""
     import hashlib
 
     from emperor.data.generate import teacher_system
     from emperor.data.style import TEACHER_NOTES, judge_system
 
     expected = {
-        None: "1fad76b23e6f4a3c",
-        "quick_answer": "d0a86f51c1b478c5",
-        "clarify": "39da27437fad666f",
-        "coding": "1fad76b23e6f4a3c",
+        None: "fb0283058bc7ad1d",
+        "quick_answer": "b6d33c825c3ea595",
+        "clarify": "43ca6c65cc767254",
+        "coding": "fb0283058bc7ad1d",
     }
     for task_class, digest in expected.items():
         text = judge_system(task_class)

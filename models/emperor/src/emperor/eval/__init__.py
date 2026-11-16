@@ -1,1 +1,1 @@
-"""Evaluation harness: replays held-out tasks through imperiumd and scores them."""
+"""Evaluation: runs held-out tasks through Imperium's agent harness and scores them."""

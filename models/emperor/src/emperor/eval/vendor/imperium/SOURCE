@@ -1,4 +1,4 @@
 repository: https://github.com/Densetsu152637/Imperium-AI
-branch: feat/task-class-routing
-commit: 4b40b3b392dac45c8f328f8e7072afc2091ffa0b
+branch: experimental
+commit: bdc237a96bea7d4a0e02f26c6ad1989cc480b2d7
 paths: crates/imperium-protocol/schemas/tools, crates/imperium-protocol/schemas/prompts

@@ -1,9 +1,16 @@
 """Command line for the evaluation harness (plan stage 2b).
 
 `--dry-run` replays every task with a scripted fake model that plays the task's reference
-turns, so it needs no model server and still emits every metric. Without it, the `replay`
-backend drives a model behind an OpenAI-compatible endpoint (e.g. a llama.cpp server) and
-answers its tool calls from the task's recorded subagent replies: deterministic and free.
+turns, so it needs no model server and still emits every metric. Without it, the model behind an
+OpenAI-compatible endpoint (e.g. a llama.cpp server) is the root agent, and subagents are
+answered from the task's recordings: deterministic and free.
+
+- `harness` (default): each task runs through Imperium's own agent loop, root prompt and tool
+  schemas with `imperium run --headless --json`. Scores that are compared or published come
+  from this backend. `--variant` and `--flag` pick a harness variant for A/B runs.
+- `replay`: this package's own loop with the vendored prompt and tool schemas; no Imperium
+  needed. Kept for tests and for comparing against older reports.
+
 Only `--suite e2e` spends money, and it refuses to run unless an API ceiling is set.
 """
 
@@ -13,7 +20,7 @@ import os
 import sys
 from pathlib import Path
 
-from emperor.eval.imperiumd import BackendUnavailable, ImperiumdBackend
+from emperor.eval.harness import BackendUnavailable, HarnessBackend, HarnessConfig
 from emperor.eval.metrics import METRICS as METRIC_DEFS
 from emperor.eval.models import DEFAULT_MAX_TOKENS, OpenAICompatModel, ScriptedModel
 from emperor.eval.report import CeilingExceeded, CostMeter, run_suite
@@ -37,6 +44,14 @@ CONTEXT_TIERS = {
     "256k": 262_144,
 }
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
+
+
+def default_imperium() -> str:
+    """`IMPERIUM_BIN`, else the Windows install's `imperium.exe` when present, else `imperium`."""
+    if os.environ.get("IMPERIUM_BIN"):
+        return os.environ["IMPERIUM_BIN"]
+    installed = Path(os.environ.get("LOCALAPPDATA", "")) / "Imperium" / "imperium.exe"
+    return str(installed) if os.environ.get("LOCALAPPDATA") and installed.exists() else "imperium"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -72,10 +87,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        choices=["replay", "imperiumd"],
-        default="replay",
-        help="replay: OpenAI-compatible endpoint plus recorded replies (default); "
-        "imperiumd: through the daemon (not implemented yet)",
+        choices=["harness", "replay"],
+        default="harness",
+        help="harness: through Imperium's agent loop with `imperium run --headless` (default); "
+        "replay: this package's own loop with the vendored prompt",
+    )
+    parser.add_argument(
+        "--imperium",
+        default=default_imperium(),
+        help="the imperium binary for the harness backend (default: IMPERIUM_BIN, the installed "
+        "imperium.exe, or `imperium` on PATH)",
+    )
+    parser.add_argument("--variant", help="harness variant: a name or a TOML path")
+    parser.add_argument("--flag", action="append", default=[], help="harness flag k=v (repeatable)")
+    parser.add_argument(
+        "--thinking",
+        choices=["on", "off"],
+        help="the harness's thinking passthrough (the 2B models need on)",
+    )
+    parser.add_argument(
+        "--remote-model",
+        action="store_true",
+        help="the root model is not on this machine (the harness's `--local` is left off)",
     )
     parser.add_argument(
         "--base-url",
@@ -99,9 +132,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="most USD a run may spend on hosted models (default 0, or EMPEROR_EVAL_API_CEILING); "
         "--suite e2e refuses to run while it is 0",
     )
-    parser.add_argument(
-        "--imperium-data", type=Path, help="Imperium data directory (imperiumd backend)"
-    )
     parser.add_argument("--output", type=Path, help="write the report here instead of stdout")
     return parser
 
@@ -122,27 +152,37 @@ def main(argv: list[str] | None = None) -> int:
             "--suite e2e uses real hosted subagents and spends money; set --api-ceiling "
             "(or EMPEROR_EVAL_API_CEILING) to the most it may spend"
         )
-    if spends_money and args.backend != "imperiumd":
-        return _fail("--suite e2e needs real subagents: use --backend imperiumd")
+    if spends_money:
+        return _fail("--suite e2e needs real subagents, which the eval does not run yet")
 
     try:
         tasks = load_tasks(args.tasks, args.suite) if args.tasks else load_suite(args.suite)
     except (TaskError, OSError) as error:
         return _fail(f"cannot load tasks: {error}")
 
+    harness = None
+    backend = "replay" if args.dry_run else args.backend
+
+    def model_for(task):
+        return ScriptedModel(task.reference)
+
     if args.dry_run:
-
-        def model_for(task):
-            return ScriptedModel(task.reference)
-
-    elif args.backend == "imperiumd":
-        backend = ImperiumdBackend(args.imperium_data, args.model or "", context_tokens)
-        try:
-            for task in tasks:
-                backend.run_task(task)
-        except BackendUnavailable as error:
-            return _fail(str(error))
-        return _fail("the imperiumd backend produced no report")
+        pass
+    elif args.backend == "harness":
+        if not args.model:
+            return _fail("--model is required without --dry-run")
+        harness = HarnessBackend(
+            HarnessConfig(
+                binary=[args.imperium],
+                base_url=args.base_url,
+                model_id=args.model.split(":", 1)[-1],
+                context_tokens=context_tokens,
+                variant=args.variant,
+                flags=args.flag,
+                thinking=args.thinking,
+                local=not args.remote_model,
+            )
+        )
     else:
         if not args.model:
             return _fail("--model is required without --dry-run")
@@ -162,12 +202,13 @@ def main(argv: list[str] | None = None) -> int:
             tier=args.context_tier,
             context_tokens=context_tokens,
             metrics=metrics,
-            backend=args.backend,
+            backend=backend,
             dry_run=args.dry_run,
             goals=SUITES[args.suite],
             meter=CostMeter(args.api_ceiling),
+            harness=harness,
         )
-    except CeilingExceeded as error:
+    except (CeilingExceeded, BackendUnavailable) as error:
         return _fail(str(error))
 
     text = json.dumps(report, indent=2, ensure_ascii=False)

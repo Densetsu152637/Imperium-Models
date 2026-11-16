@@ -49,7 +49,7 @@ class Transcript:
 
 
 class ReplayEnvironment:
-    """Answers tool calls from a task's recordings, standing in for imperiumd and subagents."""
+    """Answers tool calls from a task's recordings, for the replay backend."""
 
     def __init__(self, task: Task):
         self.task = task

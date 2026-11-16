@@ -237,17 +237,30 @@ uv run eval --model llamacpp:emperor --dry-run
 # A model behind any OpenAI-compatible endpoint (a llama.cpp or vLLM server).
 uv run eval --model llamacpp:emperor --base-url http://127.0.0.1:8080/v1 --context-tier 64k
 
+# The same model under a harness variant (A/B a harness change).
+uv run eval --model llamacpp:emperor --variant path/to/lean.toml --flag max_steps=30
+
 # Retrieval at the tier's full length (G6), and a custom task set.
 uv run eval --model llamacpp:emperor --suite longctx --context-tier 128k
 uv run eval --model llamacpp:emperor --tasks path/to/tasks/ --output results/run.json
 ```
 
-The `replay` backend (default) answers every tool call from the task's recordings: subagent
-reports, the user's answers, and web results. Runs are deterministic and cost nothing as long
-as the endpoint is local. `EMPEROR_EVAL_BASE_URL` sets the default endpoint and
-`EMPEROR_EVAL_API_KEY`, if set, is sent as a bearer token (never written to the report). The
-`imperiumd` backend, which drives the daemon over its JSON-RPC WebSocket, is a stub: see the
-TODO in `src/emperor/eval/imperiumd.py`.
+The `harness` backend (default) runs every task through Imperium's own agent loop with
+`imperium run --headless --json` (Imperium-AI docs/03, "Running evals through the harness"): the
+engine's root prompt, tool schemas and loop, with the model as the root agent. Subagents are
+answered from the task's recordings (`--subagent-replay`), so runs are deterministic and cost
+nothing as long as the endpoint is local. The binary is `--imperium`, else `IMPERIUM_BIN`, else
+the installed `%LOCALAPPDATA%/Imperium/imperium.exe`, else `imperium` on PATH; it needs
+Imperium-AI bdc237a or later. `--variant <name|path>` and `--flag k=v` pick a harness variant,
+so the same model can be compared across harness changes; the report keeps each run's
+`prompt_hash` and the variant. Inside the harness, `ask_user` gets the recommended answers and
+web tools are off, so a task's `user_answers` and `web` are not used. Scores that are compared
+or published come from this backend.
+
+The `replay` backend runs this package's own loop with the vendored prompt and tool schemas and
+answers every tool call from the task's recordings: subagent reports, the user's answers, and
+web results. It needs no Imperium. `EMPEROR_EVAL_BASE_URL` sets the default endpoint and
+`EMPEROR_EVAL_API_KEY`, if set, is sent as a bearer token (never written to the report).
 
 **Spending.** Only `--suite e2e` uses real hosted subagents. It refuses to run unless
 `--api-ceiling USD` (or `EMPEROR_EVAL_API_CEILING`) is above 0, the default, and stops a run that

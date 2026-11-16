@@ -52,10 +52,10 @@ def test_e2e_refuses_without_an_api_ceiling(capsys, monkeypatch):
     assert "api-ceiling" in err
 
 
-def test_e2e_with_a_ceiling_still_needs_the_daemon(capsys):
+def test_e2e_with_a_ceiling_still_needs_real_subagents(capsys):
     code, _, err = run(capsys, "--suite", "e2e", "--model", "x", "--api-ceiling", "5")
     assert code == 2
-    assert "imperiumd" in err
+    assert "real subagents" in err
 
 
 def test_e2e_dry_run_is_free(capsys):
@@ -65,10 +65,11 @@ def test_e2e_dry_run_is_free(capsys):
     assert report["metrics"]["task_success"]["score"] == 1.0
 
 
-def test_imperiumd_backend_is_a_clear_stub(capsys):
-    code, _, err = run(capsys, "--backend", "imperiumd", "--model", "x")
+def test_harness_backend_without_imperium_is_a_clear_error(tmp_path, capsys):
+    missing = str(tmp_path / "no-imperium.exe")
+    code, _, err = run(capsys, "--model", "x", "--imperium", missing)
     assert code == 2
-    assert "not implemented" in err
+    assert "cannot run" in err
 
 
 def test_model_required_without_dry_run(capsys):
