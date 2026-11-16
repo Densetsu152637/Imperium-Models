@@ -41,8 +41,8 @@ stages out. Record each stage's outcome in the plan when it is done.
 | llama.cpp runtime | Imperium's pinned build (`runtimes/llama-cpp.env` in Imperium-AI) |
 
 Still missing: the Hugging Face organisation (create it on the website; `Imperium.AI` is a
-placeholder name), and the eval harness's `imperiumd` backend, which the `e2e` suite (G3) and
-teacher traces through real Imperium sessions need.
+placeholder name), and real (not recorded) subagents in the eval's harness backend, which the
+`e2e` suite (G3) and teacher traces through real Imperium sessions need.
 
 ## One-time setup
 
@@ -71,8 +71,8 @@ teacher traces through real Imperium sessions need.
      --output eval/results/<name>-128k-longctx.json
    ```
 
-3. Measure the frontier reference for G3 once the `imperiumd` backend exists, with
-   `--suite e2e --backend imperiumd --api-ceiling <USD>`. This is evaluation only.
+3. Measure the frontier reference for G3 once the harness backend runs real subagents, with
+   `--suite e2e --api-ceiling <USD>`. This is evaluation only.
 4. Commit a table of every candidate × metric (`eval/results/README.md`), pick the base, set
    the final numeric targets for G1–G4, G10 and G11, and record both in the plan with reasons.
 

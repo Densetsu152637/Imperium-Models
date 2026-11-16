@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from emperor.eval.contract import contract_source
+from emperor.eval.harness import HarnessBackend
 from emperor.eval.metrics import METRICS, TaskScore
 from emperor.eval.models import ChatModel
 from emperor.eval.runner import Transcript, run_task
@@ -62,17 +63,35 @@ def run_suite(
     dry_run: bool,
     goals: str,
     meter: CostMeter,
+    harness: HarnessBackend | None = None,
 ) -> dict:
+    """Run every task and score it. With `harness`, each task runs through Imperium's agent
+    loop (`imperium run --headless`) and `model_for` is not used."""
     results: dict[str, list[tuple[Task, TaskScore]]] = {name: [] for name in metrics}
     entries = []
+    runs = []
     for task in tasks:
-        transcript = run_task(task, model_for(task), context_tokens)
-        meter.add(0.0)  # replay calls no hosted model; the imperiumd backend adds ledger cost
+        if harness is not None:
+            run = harness.run_task(task)
+            transcript = run.transcript
+            runs.append(run)
+        else:
+            transcript = run_task(task, model_for(task), context_tokens)
+        meter.add(0.0)  # recorded subagents and a local root model cost nothing
         scores = {name: METRICS[name].scorer(task, transcript) for name in metrics}
         for name, score in scores.items():
             if score is not None:
                 results[name].append((task, score))
-        entries.append(_task_entry(task, transcript, scores))
+        entry = _task_entry(task, transcript, scores)
+        if harness is not None:
+            entry["harness"] = {
+                "prompt_hash": run.prompt_hash,
+                "replay_unused": run.replay_unused,
+                "permission_requests": run.permission_requests,
+                "questions_asked": run.questions_asked,
+                "compactions": run.compactions,
+            }
+        entries.append(entry)
 
     metric_entries = {}
     for name in metrics:
@@ -95,6 +114,14 @@ def run_suite(
         }
 
     source = contract_source()
+    report_harness = None
+    if harness is not None:
+        first = next((r for r in runs if r.engine), None)
+        report_harness = {
+            "engine": first.engine if first else {},
+            "variant": first.variant if first else {},
+            "prompt_hashes": sorted({r.prompt_hash for r in runs if r.prompt_hash}),
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "model": model,
@@ -118,6 +145,7 @@ def run_suite(
         "overflows": sum(e["overflowed"] for e in entries),
         "metrics": metric_entries,
         "tasks": entries,
+        "harness": report_harness,
     }
 
 
@@ -187,7 +215,7 @@ def report_schema() -> dict:
             "schema_version": {"type": "integer", "enum": [SCHEMA_VERSION]},
             "model": {"type": ["string", "null"]},
             "suite": {"type": "string"},
-            "backend": {"type": "string", "enum": ["replay", "imperiumd"]},
+            "backend": {"type": "string", "enum": ["replay", "harness"]},
             "dry_run": {"type": "boolean"},
             "context_tier": {"type": "string"},
             "context_tokens": {"type": "integer"},
@@ -210,5 +238,6 @@ def report_schema() -> dict:
             "overflows": {"type": "integer"},
             "metrics": {"type": "object", "properties": {name: metric for name in METRICS}},
             "tasks": {"type": "array", "items": task},
+            "harness": {"type": ["object", "null"]},
         },
     }

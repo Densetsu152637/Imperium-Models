@@ -1,7 +1,6 @@
 import pytest
 
 from emperor.eval.contract import validate
-from emperor.eval.imperiumd import BackendUnavailable, discover
 from emperor.eval.models import ScriptedModel
 from emperor.eval.report import CeilingExceeded, CostMeter, report_schema, run_suite
 from emperor.eval.tasks import load_suite, task_from_dict
@@ -56,10 +55,3 @@ def test_cost_meter_enforces_the_ceiling():
     CostMeter(0.0).add(0.0)  # free work is always allowed
     with pytest.raises(CeilingExceeded):
         CostMeter(0.0).add(0.01)
-
-
-def test_imperiumd_discovery(tmp_path):
-    with pytest.raises(BackendUnavailable):
-        discover(tmp_path)
-    (tmp_path / "daemon.json").write_text('{"url": "ws://127.0.0.1:1/rpc"}', encoding="utf-8")
-    assert discover(tmp_path)["url"] == "ws://127.0.0.1:1/rpc"

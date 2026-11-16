@@ -170,7 +170,10 @@ def test_cli_replay_through_a_server(fake_server, capsys, tmp_path):
     tasks = tmp_path / "one.json"
     task = {"id": "t", "prompt": "418?", "expect": {"routing": {"mode": "answer"}}}
     tasks.write_text(json.dumps(task), encoding="utf-8")
-    code = main(["--model", "llamacpp:emperor", "--base-url", server.url, "--tasks", str(tasks)])
+    code = main(
+        ["--model", "llamacpp:emperor", "--backend", "replay", "--base-url", server.url]
+        + ["--tasks", str(tasks)]
+    )
     report = json.loads(capsys.readouterr().out)
     assert code == 0
     assert report["dry_run"] is False and report["backend"] == "replay"
