@@ -118,9 +118,20 @@ def test_replay_file_maps_match_words_roles_and_chunks():
     replies = replay_file(task)["replies"]
     assert replies[0] == {"brief_contains": "httpx", "report": "httpx notes", "ok": True}
     assert replies[1] == {"role": "task", "report": "any", "ok": True}
-    assert replies[2]["role"] == "chunk" and replies[2]["chunk"] == 1
-    assert replies[3]["chunk"] == 2
-    assert replies[4] == {"role": "reduce", "report": "chunk one\n\nchunk two", "ok": True}
+    assert replies[2] == {"role": "task", "report": "httpx notes", "ok": True}
+    assert replies[3]["role"] == "chunk" and replies[3]["chunk"] == 1
+    assert replies[4]["chunk"] == 2
+    assert replies[5] == {"role": "reduce", "report": "chunk one
+
+chunk two", "ok": True}
+
+
+def test_a_matched_recording_also_answers_a_brief_without_its_word():
+    task = task_from_dict(
+        {"id": "t", "prompt": "p", "replies": [{"report": "renamed", "match": ["inventory"]}]},
+        "heldout",
+    )
+    assert replay_file(task)["replies"][-1] == {"role": "task", "report": "renamed", "ok": True}
 
 
 def test_every_bundled_task_converts_to_a_replay_file():
