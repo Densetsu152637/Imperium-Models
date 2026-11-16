@@ -46,9 +46,10 @@ class HarnessConfig:
 def replay_file(task: Task) -> dict:
     """The task's recordings in the harness's replay format.
 
-    A recording with a `match` word answers the first subagent whose brief contains it; one
-    without answers any task subagent. The harness does not use a recording up, so the order is
-    matched first, then unmatched. `delegate_chunks` recordings answer chunk 1, 2, ... in order,
+    A recording with a `match` word answers a subagent whose brief contains it; one without
+    answers any task subagent. As in the replay backend, a brief that matches no word falls back
+    to a recording: the unmatched ones first, then the matched ones in order. Unlike it, the
+    harness does not use a recording up, so two briefs with the same word get the same report. `delegate_chunks` recordings answer chunk 1, 2, ... in order,
     and the merge agent gets their reports joined.
     """
     matched, unmatched, chunks = [], [], []
@@ -63,7 +64,8 @@ def replay_file(task: Task) -> dict:
             matched.append({"brief_contains": words[0], "report": reply["report"], "ok": True})
         else:
             unmatched.append({"role": "task", "report": reply["report"], "ok": True})
-    replies = matched + unmatched
+    fallback = [{"role": "task", "report": r["report"], "ok": True} for r in matched]
+    replies = matched + unmatched + fallback
     for number, report in enumerate(chunks, start=1):
         replies.append({"role": "chunk", "chunk": number, "report": report, "ok": True})
     if chunks:
