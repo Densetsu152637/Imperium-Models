@@ -1,0 +1,3 @@
+usage: run.py [-h] --arm {plain,rag} [--out OUT] [--per-cat PER_CAT]
+              [--ids IDS]
+run.py: error: argument --arm: invalid choice: 'harness' (choose from plain, rag)
