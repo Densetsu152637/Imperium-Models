@@ -14,7 +14,8 @@ from collections import Counter
 HERE = pathlib.Path(__file__).parent
 RES = HERE / (sys.argv[1] if len(sys.argv) > 1 else "results")
 TITLE = sys.argv[2] if len(sys.argv) > 2 else "Guided harness pilot: results"
-ARMS = ["plain", "rag", "harness", "harness_note", "harness_refined"]
+ARMS = ["plain", "rag", "harness", "harness_note", "harness_full", "harness_note_full", "harness_refined",
+        "harness_refined_v4"]
 
 
 def load(arm):

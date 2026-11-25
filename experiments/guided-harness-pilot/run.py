@@ -26,6 +26,9 @@ try:
     ARMS["harness"] = imperium_backend.run_imperium
     ARMS["harness_note"] = imperium_backend.run_imperium_note
     ARMS["harness_refined"] = imperium_backend.run_imperium_refined
+    ARMS["harness_full"] = imperium_backend.run_imperium_full
+    ARMS["harness_note_full"] = imperium_backend.run_imperium_note_full
+    ARMS["harness_refined_v4"] = imperium_backend.run_imperium_refined_v4
 except ImportError:
     pass
 

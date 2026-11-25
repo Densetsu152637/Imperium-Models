@@ -46,18 +46,17 @@ def _compact_trace(transcript):
     return out
 
 
-def run_imperium(task, bm25, meter, note=False, variant=None):
+def run_imperium(task, bm25, meter, note=False, variant=None, permission="default"):
     ws = _scratch / task["id"]
     kb_files.write(ws, suite_cfg.KB)
     prompt = f"{INSTRUCTION}{NOTE if note else ''}\n\nQuestion: {task['question']}"
     cmd = [IMPERIUM, "run", "--headless", "--json", "--root-model", ENDPOINT, "--model-id", MODEL_ID,
            "--workspace", str(ws), "--task", prompt] + FLAGS
+    if permission != "default":
+        # `full` lets the agent run commands (python3 for arithmetic) in its scratch workspace copy; the engine's
+        # safety floor still stops destructive commands. In `default`, commands ask and are denied headless.
+        cmd[cmd.index("--permission-mode") + 1] = permission
     if variant:
-        # the refined arm lets the agent run commands (python3 for arithmetic) in its scratch workspace copy;
-        # the engine's safety floor still stops destructive commands. Other arms stay at `default`, where
-        # commands are denied because nobody can answer the prompt.
-        cmd = [x for x in cmd]
-        cmd[cmd.index("--permission-mode") + 1] = "full"
         cmd += ["--config-home", str(HERE), "--variant", variant]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT_S + 60)
@@ -92,4 +91,17 @@ def run_imperium_note(task, bm25, meter):
 
 def run_imperium_refined(task, bm25, meter):
     """Imperium with the refined harness variant (config/harness-variants/<name>.toml); neutral task prompt."""
-    return run_imperium(task, bm25, meter, variant=os.environ.get("HARNESS_VARIANT", "refined"))
+    return run_imperium(task, bm25, meter, variant=os.environ.get("HARNESS_VARIANT", "refined"), permission="full")
+
+
+def run_imperium_full(task, bm25, meter):
+    """Stock Imperium, commands allowed (permission mode full)."""
+    return run_imperium(task, bm25, meter, permission="full")
+
+
+def run_imperium_note_full(task, bm25, meter):
+    return run_imperium(task, bm25, meter, note=True, permission="full")
+
+
+def run_imperium_refined_v4(task, bm25, meter):
+    return run_imperium(task, bm25, meter, variant="refined_v4", permission="full")
