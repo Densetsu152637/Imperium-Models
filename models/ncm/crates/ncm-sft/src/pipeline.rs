@@ -395,8 +395,10 @@ pub fn policy_for(
     archive: &Path,
     model: Model,
     extra_generators: &[String],
+    denied_generators: &[String],
 ) -> Result<Policy, SftError> {
     let mut policy = Policy::token_era(pilots_to_skip(&archive.join(model.name()).join("data"))?);
     policy.allowed_generators.extend(extra_generators.iter().cloned());
+    policy.allowed_generators.retain(|g| !denied_generators.contains(g));
     Ok(policy)
 }

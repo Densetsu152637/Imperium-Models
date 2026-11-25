@@ -29,22 +29,26 @@ enum Command {
         out: PathBuf,
         #[arg(long, value_enum, default_value = "all")]
         model: Which,
-        /// Also accept records from this generator (default: only deepseek-v4-pro). For
-        /// measuring what the open-data grafts would add; they are other generators' output.
+        /// Also accept records from this generator (the built-in list is every generator the
+        /// token-era pipeline accepted).
         #[arg(long = "allow-generator")]
         allow_generator: Vec<String>,
+        /// Refuse records from this generator, e.g. `--deny-generator QwQ-32B`.
+        #[arg(long = "deny-generator")]
+        deny_generator: Vec<String>,
     },
 }
 
 fn main() -> ExitCode {
-    let Command::Build { archive, out, model, allow_generator } = Cli::parse().command;
+    let Command::Build { archive, out, model, allow_generator, deny_generator } =
+        Cli::parse().command;
     let models = match model {
         Which::Emperor => vec![Model::Emperor],
         Which::Consul => vec![Model::Consul],
         Which::All => vec![Model::Emperor, Model::Consul],
     };
     for model in models {
-        let result = policy_for(&archive, model, &allow_generator)
+        let result = policy_for(&archive, model, &allow_generator, &deny_generator)
             .and_then(|policy| build(&archive, &out, model, &policy));
         match result {
             Ok(stats) => {

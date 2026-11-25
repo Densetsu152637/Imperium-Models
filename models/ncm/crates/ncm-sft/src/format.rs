@@ -66,10 +66,10 @@ fn push_turn(text: &mut String, role: &str, body: &str) -> (usize, usize) {
 
 fn assistant_body(message: &Message) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if message.has_reasoning() {
-        let reasoning = message.reasoning.as_deref().unwrap_or_default().trim();
-        parts.push(format!("{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}"));
-    }
+    // Every assistant turn opens with a think block, empty when there is no reasoning, so the
+    // model learns to choose between thinking and closing the block at once.
+    let reasoning = message.reasoning.as_deref().unwrap_or_default().trim();
+    parts.push(format!("{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}"));
     let content = message.content.trim();
     if !content.is_empty() {
         parts.push(content.to_owned());
@@ -147,11 +147,11 @@ mod tests {
             out.text,
             "<|im_start|>system\nYou are Emperor.\n<|im_end|>\n\
              <|im_start|>user\nHello\n<|im_end|>\n\
-             <|im_start|>assistant\nHi.\n<|im_end|>\n"
+             <|im_start|>assistant\n<think>\n\n</think>\nHi.\n<|im_end|>\n"
         );
         assert_eq!(out.assistant_spans.len(), 1);
         let (start, end) = out.assistant_spans[0];
-        assert_eq!(&out.text[start..end], "Hi.\n<|im_end|>");
+        assert_eq!(&out.text[start..end], "<think>\n\n</think>\nHi.\n<|im_end|>");
     }
 
     #[test]
@@ -167,9 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn blank_reasoning_is_not_rendered() {
+    fn blank_reasoning_renders_an_empty_think_block() {
         let messages = vec![Message::new(Role::User, "x"), Message::assistant("y", Some("  \n"))];
-        assert!(!render(&messages, &[]).text.contains("<think>"));
+        assert!(render(&messages, &[]).text.contains("<think>\n\n</think>\ny\n<|im_end|>"));
     }
 
     #[test]
@@ -193,7 +193,7 @@ mod tests {
              <tool_call>\n{\"name\":\"web_search\",\"arguments\":{\"query\":\"rust\"}}\n</tool_call>\n\
              <|im_end|>\n\
              <|im_start|>tool\n<tool_response>\nresult text\n</tool_response>\n<|im_end|>\n\
-             <|im_start|>assistant\nDone.\n<|im_end|>\n"
+             <|im_start|>assistant\n<think>\n\n</think>\nDone.\n<|im_end|>\n"
         );
         assert_eq!(out.assistant_spans.len(), 2);
     }
@@ -210,7 +210,7 @@ mod tests {
         ];
         let out = render(&messages, &[]);
         assert!(out.text.contains(
-            "Working.\n<tool_call>\n{\"name\":\"a\",\"arguments\":{}}\n</tool_call>\n\
+            "<think>\n\n</think>\nWorking.\n<tool_call>\n{\"name\":\"a\",\"arguments\":{}}\n</tool_call>\n\
              <tool_call>\n{\"name\":\"b\",\"arguments\":{}}\n</tool_call>\n<|im_end|>"
         ));
     }

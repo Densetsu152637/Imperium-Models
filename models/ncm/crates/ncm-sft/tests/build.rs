@@ -98,7 +98,7 @@ fn emperor_build_counts_and_outputs() {
     let source = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     archive(source.path());
-    let policy = policy_for(source.path(), Model::Emperor, &[]).unwrap();
+    let policy = policy_for(source.path(), Model::Emperor, &[], &[]).unwrap();
     let stats = build(source.path(), out.path(), Model::Emperor, &policy).unwrap();
 
     let hosted = &stats.files["emperor/data/hosted-1/final/final.jsonl"];
@@ -108,12 +108,12 @@ fn emperor_build_counts_and_outputs() {
 
     let mix = &stats.files["emperor/data/mix-emperor-v2/final.jsonl"];
     assert_eq!(mix.excluded["duplicate_id"], 1);
-    assert_eq!(mix.excluded["other_generator:QwQ-32B"], 1);
+    assert_eq!(mix.accepted, 1);
     let local = &stats.files["emperor/data/final/final.jsonl"];
-    assert_eq!(local.excluded["other_generator:gpt-oss-20b"], 1);
+    assert_eq!(local.accepted, 1);
 
-    assert_eq!(stats.totals.accepted, 2);
-    assert_eq!(stats.totals.train + stats.totals.val, 2);
+    assert_eq!(stats.totals.accepted, 4);
+    assert_eq!(stats.totals.train + stats.totals.val, 4);
     assert_eq!(stats.judged_not_accepted, 1);
     assert_eq!(
         stats.not_training_data["emperor/data/hosted-1/rejects/rejects-00001.jsonl"].reasons["too_long"],
@@ -142,7 +142,7 @@ fn emperor_build_counts_and_outputs() {
 fn the_build_is_deterministic() {
     let source = tempfile::tempdir().unwrap();
     archive(source.path());
-    let policy = policy_for(source.path(), Model::Emperor, &[]).unwrap();
+    let policy = policy_for(source.path(), Model::Emperor, &[], &[]).unwrap();
     let one = tempfile::tempdir().unwrap();
     let two = tempfile::tempdir().unwrap();
     build(source.path(), one.path(), Model::Emperor, &policy).unwrap();
@@ -155,11 +155,15 @@ fn the_build_is_deterministic() {
 }
 
 #[test]
-fn an_allowed_extra_generator_admits_grafts() {
+fn a_denied_generator_is_excluded() {
     let source = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     archive(source.path());
-    let policy = policy_for(source.path(), Model::Emperor, &["QwQ-32B".to_owned()]).unwrap();
+    let policy = policy_for(source.path(), Model::Emperor, &[], &["QwQ-32B".to_owned()]).unwrap();
     let stats = build(source.path(), out.path(), Model::Emperor, &policy).unwrap();
-    assert_eq!(stats.accepted_by_generator["QwQ-32B"], 1);
+    assert!(!stats.accepted_by_generator.contains_key("QwQ-32B"));
+    assert_eq!(
+        stats.files["emperor/data/mix-emperor-v2/final.jsonl"].excluded["other_generator:QwQ-32B"],
+        1
+    );
 }

@@ -37,11 +37,21 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The token-era teacher (DeepSeek V4 Pro) and judge (Kimi K3.1 Pro).
+    /// The generators and judges the token-era pipeline accepted data from: the hosted teacher
+    /// and judge (DeepSeek V4 Pro, Kimi K3.1 Pro), the first local round (gpt-oss-20b, judged by
+    /// itself) and the open-data grafts' generators. Claude/Anthropic output is always refused.
     pub fn token_era(excluded_pilots: HashSet<String>) -> Policy {
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect();
         Policy {
-            allowed_generators: vec!["deepseek-v4-pro".into()],
-            allowed_judges: vec!["kimi-k3.1-pro".into()],
+            allowed_generators: names(&[
+                "deepseek-v4-pro",
+                "gpt-oss-20b",
+                "DeepSeek-v3.2",
+                "GLM-4.6",
+                "QwQ-32B",
+                "Qwen3-235B-A22B-Thinking-2507+Qwen3-235B-A22B-Instruct-2507",
+            ]),
+            allowed_judges: names(&["kimi-k3.1-pro", "gpt-oss-20b"]),
             excluded_pilots,
         }
     }
@@ -365,10 +375,10 @@ mod tests {
         let mut raw = record(
             json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]),
         );
-        raw["meta"]["teacher"] = json!("gpt-oss-20b");
+        raw["meta"]["teacher"] = json!("some-other-model");
         assert_eq!(
             convert(&raw, &policy()).err(),
-            Some(Rejection::Excluded("other_generator:gpt-oss-20b".into()))
+            Some(Rejection::Excluded("other_generator:some-other-model".into()))
         );
         let mut raw = record(
             json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]),

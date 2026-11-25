@@ -29,9 +29,9 @@ The definitions are Imperium's tool contract (`crates/ncm-sft/tools/`). Qwen's `
 
 ## Assistant turn
 
-Parts appear in this order, joined by a newline, each only when present:
+Parts appear in this order, joined by a newline (the think block is always present, the rest only when present):
 
-1. `<think>\n{reasoning}\n</think>`: the teacher's reasoning for this turn. A turn without reasoning has no think block (the teacher often acts on a tool result without thinking again). Earlier turns keep their reasoning in the history.
+1. `<think>\n{reasoning}\n</think>`: always present, so every assistant turn starts with `<think>` and the model learns to choose between thinking and closing the block at once. A turn without reasoning (the teacher often acts on a tool result without thinking again) gets an empty block, `<think>\n\n</think>`. Earlier turns keep their reasoning in the history.
 2. The visible text.
 3. One `<tool_call>\n{json}\n</tool_call>` block per call, in order. The JSON is `{"name": ..., "arguments": {...}}` with the arguments as an object, keys in the teacher's order.
 
