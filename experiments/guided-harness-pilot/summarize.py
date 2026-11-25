@@ -6,7 +6,7 @@ import sys
 
 HERE = pathlib.Path(__file__).parent
 RES = HERE / (sys.argv[1] if len(sys.argv) > 1 else "results")
-ARMS = ["plain", "rag", "harness"]
+ARMS = ["plain", "rag", "harness", "harness_note"]
 CATS = ["single_hop", "multi_hop", "compare_aggregate", "arithmetic", "logic", "unanswerable", "kb_override",
         "compute", "general_knowledge"]
 
@@ -37,15 +37,15 @@ for a in ARMS:
     if not rows:
         continue
     entry = {"overall": agg(rows), "by_category": {c: agg([r for r in rows if r["category"] == c]) for c in CATS}}
-    if a == "harness":
-        esc = [r for r in rows if r.get("escalated")]
-        entry["escalation_rate"] = round(len(esc) / len(rows), 4)
-        entry["escalated"] = agg(esc)
-        entry["fast_path"] = agg([r for r in rows if r.get("escalated") is False])
-        entry["escalation_rate_by_category"] = {
-            c: round(sum(1 for r in rows if r["category"] == c and r.get("escalated")) /
-                     max(1, sum(1 for r in rows if r["category"] == c)), 3) for c in CATS}
-        entry["abstain_final_rate"] = round(sum(1 for r in rows if r.get("abstained")) / len(rows), 4)
+    if a.startswith("harness"):
+        from collections import Counter
+        entry["exit_reasons"] = dict(Counter(str(r.get("exit_reason")) for r in rows))
+        entry["exit_codes"] = dict(Counter(str(r.get("exit_code")) for r in rows))
+        entry["mean_tool_calls"] = round(st.mean(r.get("tool_calls") or 0 for r in rows), 2)
+        entry["mean_tool_calls_by_category"] = {
+            c: round(st.mean((r.get("tool_calls") or 0) for r in rows if r["category"] == c), 2) for c in CATS}
+        entry["failed_tool_calls_total"] = sum(r.get("failed_tool_calls") or 0 for r in rows)
+        entry["max_wall_time_s"] = max(r["wall_time_s"] for r in rows)
     summary["arms"][a] = entry
 json.dump(summary, open(RES / "summary.json", "w"), indent=2)
 
@@ -61,11 +61,9 @@ for a in arms:
              f"{o['mean_completion_tokens']} | {o['errors']} |")
 if "harness" in summary["arms"]:
     h = summary["arms"]["harness"]
-    L += ["", f"Harness escalation rate: {h['escalation_rate']:.1%}; final abstain rate: {h['abstain_final_rate']:.1%}."]
-    for k, name in (("fast_path", "Fast path only"), ("escalated", "Escalated to step loop")):
-        if h[k]:
-            L.append(f"- {name}: {h[k]['correct']}/{h[k]['n']} correct, mean {h[k]['mean_time_s']} s, "
-                     f"mean {h[k]['mean_calls']} calls.")
+    L += ["", f"Harness (Imperium agent loop): exit reasons {h['exit_reasons']}; exit codes {h['exit_codes']}; "
+          f"mean tool calls per item {h['mean_tool_calls']}; failed tool calls {h['failed_tool_calls_total']}; "
+          f"slowest item {h['max_wall_time_s']} s."]
 L += ["", "## Accuracy by category", "", "| Category | " + " | ".join(arms) + " |",
       "|---|" + "---|" * len(arms)]
 for c in CATS:
@@ -83,8 +81,9 @@ L += ["", "## Mean model calls per item by category", "", "| Category | " + " | 
 for c in CATS:
     L.append(f"| {c} | " + " | ".join(str(summary['arms'][a]['by_category'][c]['mean_calls']) for a in arms) + " |")
 if "harness" in summary["arms"]:
-    L += ["", "## Harness escalation rate by category", "", "| Category | Escalated |", "|---|---|"]
+    L += ["", "## Harness mean tool calls per item by category", "", "| Category | Tool calls |", "|---|---|"]
     for c in CATS:
-        L.append(f"| {c} | {summary['arms']['harness']['escalation_rate_by_category'][c]:.0%} |")
-open(RES / "summary.md", "w", encoding="utf-8").write("\n".join(L) + "\n")
-print("\n".join(L))
+        L.append(f"| {c} | {summary['arms']['harness']['mean_tool_calls_by_category'][c]} |")
+out = chr(10).join(L) + chr(10)
+open(RES / "summary.md", "w", encoding="utf-8").write(out)
+print(out)

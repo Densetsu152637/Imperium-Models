@@ -1,7 +1,6 @@
 # Guided harness pilot
 
-A small pilot that measures Qwen3.5-4B (bf16 GGUF, thinking off) with and without the guided
-reasoning harness (to be run through Imperium's agent loop) proposed in `Imperium-Research/docs/human-reasoning-models/harness-proposal.md`. The write-up with
+A small pilot that measures Qwen3.5-4B (bf16 GGUF, thinking off) with and without Imperium's agent loop (a baseline for the guided reasoning harness proposed in `Imperium-Research/docs/human-reasoning-models/harness-proposal.md`. The write-up with
 results is `Imperium-Research/docs/human-reasoning-models/experiments/guided-harness-pilot.md`.
 
 The suite (135 items, 9 categories, fictional-world knowledge base) was authored by Claude. It is evaluation data,
@@ -13,7 +12,7 @@ not training data. Scoring is deterministic; there is no LLM judge.
 |---|---|
 | `plain` | One call, question only, greedy. |
 | `rag` | One call, question plus top-5 BM25 passages, greedy. |
-| `harness` | Not run yet. Planned backend: Imperium's own agent loop via `imperium run --headless` against a per-run copy of the KB as plain files. See below. |
+| `harness` | Imperium's own agent loop via `imperium run --headless`; KB as markdown files in a per-item scratch workspace copy (`kb_files.py`, `imperium_backend.py`). `harness_note` is the same with one extra prompt sentence (real-world, arithmetic and logic questions need no workspace), for wording parity with `rag`. |
 
 ## Layout
 
@@ -21,6 +20,7 @@ not training data. Scoring is deterministic; there is no LLM judge.
 - `validate_suite.py` checks ids, support ids, and that unanswerable items are truly absent from the knowledge base.
 - `scoring.py`, `test_scorer.py`: deterministic scorer and its self-test.
 - `bm25.py`, `llm.py`, `arms.py`: retrieval, server client, arms `plain` and `rag`.
+- `kb_files.py`, `imperium_backend.py`: knowledge base as files and the Imperium headless backend.
 - `run.py`: runs one arm, appends one record per item to `results/<arm>.jsonl` (resumable).
 - `summarize.py`: writes `results/summary.json` and `results/summary.md`.
 
@@ -43,6 +43,7 @@ Every request also sets `chat_template_kwargs {"enable_thinking": false}`. Then 
 python run.py --arm plain
 python run.py --arm rag
 python run.py --arm harness
+python run.py --arm harness_note
 python summarize.py
 ```
 
@@ -60,6 +61,4 @@ fills `model_calls`, `prompt_tokens` and `completion_tokens` from the `llm.Meter
 arm, create `imperium_backend.py` exposing `run_imperium(task, bm25, meter)`; `run.py` registers it as `harness`
 when the module imports.
 
-Status: as of the first run, `imperium.exe run --headless --print-prompt` is refused by the running daemon with
-error -32005 ("evaluation sessions are for the imperium command on this machine, not for phones, mods or the
-API"), so the backend has not been written or run.
+Requires the Imperium daemon's local pipe (`daemon.socket = true`; Imperium-AI PR #273). Flags used: `--local --thinking off --context-tokens 16384 --timeout-s 300 --flag max_steps=20 --permission-mode default`. Run `python run.py --arm harness` and `--arm harness_note` after starting the same llama-server.

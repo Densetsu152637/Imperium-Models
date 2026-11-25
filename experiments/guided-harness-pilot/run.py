@@ -21,6 +21,7 @@ ARMS = {"plain": arms.run_plain, "rag": arms.run_rag}
 try:
     import imperium_backend
     ARMS["harness"] = imperium_backend.run_imperium
+    ARMS["harness_note"] = imperium_backend.run_imperium_note
 except ImportError:
     pass
 
@@ -69,6 +70,10 @@ def main():
                            steps=r.get("steps"), abstained=r.get("abstained"), stop_reason=r.get("stop_reason"),
                            escalation_reason=r.get("escalation_reason"), samples=r.get("samples"),
                            retrieved=r.get("retrieved"), trace=r.get("trace"), output=r.get("output"))
+                for k in ("exit_code", "exit_reason", "tool_calls", "failed_tool_calls", "imperium_wall_ms",
+                          "prompt_hash", "cached_tokens", "runtime_error", "endpoint_errors", "stderr"):
+                    if k in r:
+                        rec[k] = r[k]
                 if parsed is None:
                     rec["error"] = "no_final_answer_line"
             except Exception as e:  # an erroring item counts as wrong and is recorded
