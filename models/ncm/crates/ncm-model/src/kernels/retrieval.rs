@@ -4,15 +4,24 @@
 //! 1. [`ret_prep_kernel`]: QK-norms, partial RoPE, the absorbed query `q_nope W_uk^T` (with the
 //!    softmax scale folded in), and the new position's cache entry (latent, RoPE key, indexer
 //!    key) written in place.
-//! 2. [`ret_index_kernel`] and [`ret_topk_kernel`] (sparse only): indexer scores and block
-//!    maxima of every candidate block, then the top-k blocks, on the device.
+//! 2. [`ret_index_kernel`] and [`ret_topk_kernel`]: indexer scores and block maxima of every
+//!    candidate block, then the top-k blocks, on the device (both do nothing on dense steps).
 //! 3. [`ret_attend_kernel`]: split attention over chunks of the visible positions (the selected
 //!    blocks and the local window, or the whole context), partial softmax per chunk.
 //! 4. [`ret_combine_kernel`]: merges the chunks, applies the value up-projection and the output
 //!    gate.
 //!
+//! The position comes from a device tensor and every grid is sized for the largest step, so the
+//! same launches serve every position and can be captured into a CUDA graph; which blocks are
+//! candidates, whether the step is sparse and which slots are visible are decided on the device.
 //! Inputs are read through their strides (cubecl pitches rows); scratch and outputs are
 //! contiguous. Arithmetic is f32 throughout.
+
+/// Candidate blocks of a query at `pos`: those starting at least `local` positions before it.
+#[cube]
+fn candidate_blocks(pos: usize, #[comptime] block: usize, #[comptime] local: usize) -> usize {
+    select(pos >= local, (pos - local) / block + 1, 0usize)
+}
 
 use burn_cubecl::cubecl;
 use cubecl::prelude::*;
@@ -117,8 +126,8 @@ pub(crate) fn ret_prep_kernel<F: Float>(
     q_rope: &mut Tensor<f32>,
     kv: &mut Tensor<F>,
     keys: &mut Tensor<F>,
+    position: &Tensor<i32>,
     batch: usize,
-    pos: usize,
     scale: f32,
     eps: f32,
     inv_qd: f32,
@@ -135,6 +144,7 @@ pub(crate) fn ret_prep_kernel<F: Float>(
 ) {
     let cube_id = CUBE_POS;
     let tid = UNIT_POS as usize;
+    let pos = usize::cast_from(position[0]);
     let qd = dn + dr;
     let mut red = Shared::<[f32]>::new_slice(CUBE);
     let mut xs = Shared::<[f32]>::new_slice(qd);
@@ -242,16 +252,22 @@ pub(crate) fn ret_index_kernel<F: Float>(
     p: &Tensor<F>,
     keys: &Tensor<F>,
     scores: &mut Tensor<f32>,
+    position: &Tensor<i32>,
     blocks: usize,
     w_scale: f32,
     #[comptime] index_heads: usize,
     #[comptime] index_dim: usize,
     #[comptime] q_offset: usize,
     #[comptime] block: usize,
+    #[comptime] local: usize,
     #[define(F)] _dtype: ElemType,
 ) {
     let b = CUBE_POS / blocks;
     let blk = CUBE_POS % blocks;
+    // Uniform over the cube: blocks past the candidates are left alone.
+    if blk >= candidate_blocks(usize::cast_from(position[0]), block, local) {
+        terminate!();
+    }
     let tid = UNIT_POS as usize;
     let mut q = Shared::<[f32]>::new_slice(index_heads * index_dim);
     let mut w = Shared::<[f32]>::new_slice(index_heads);
@@ -291,22 +307,30 @@ pub(crate) fn ret_index_kernel<F: Float>(
     }
 }
 
-/// One cube per batch row: `picked[b, r]` is the block of rank `r < k` by score (ties to the
-/// lower block).
+/// One cube per batch row: `picked[b, r]` is the candidate block of rank `r < k` by score (ties
+/// to the lower block). Nothing to pick on a dense step (at most `k` candidates). `scores` has
+/// `blocks` columns, of which the first `n` are this step's candidates.
 #[cube(launch_unchecked)]
 pub(crate) fn ret_topk_kernel(
     scores: &Tensor<f32>,
     picked: &mut Tensor<u32>,
+    position: &Tensor<i32>,
     blocks: usize,
     k: usize,
+    #[comptime] block: usize,
+    #[comptime] local: usize,
 ) {
     let b = CUBE_POS;
     let row = b * blocks;
+    let n = candidate_blocks(usize::cast_from(position[0]), block, local);
+    if n <= k {
+        terminate!();
+    }
     let mut e = UNIT_POS as usize;
-    while e < blocks {
+    while e < n {
         let v = scores[row + e];
         let mut rank = 0usize;
-        for o in 0..blocks {
+        for o in 0..n {
             let w = scores[row + o];
             if w > v || (w == v && o < e) {
                 rank += 1;
@@ -319,7 +343,8 @@ pub(crate) fn ret_topk_kernel(
     }
 }
 
-/// One cube per (batch row, chunk of `CHUNK` visible slots). Slot `u` of the sparse layout is
+/// One cube per (batch row, chunk of `CHUNK` slots). A step is sparse when it has more than `k`
+/// candidate blocks (never in `dense` mode); then slot `u` is
 /// position `picked[u / block] * block + u % block` for `u < k * block` (visible when at most
 /// `pos - local`) and window position `pos + 1 - local + (u - k * block)` after that; in the
 /// dense layout slot `u` is position `u`. Writes the chunk's running max, sum of exponentials
@@ -334,20 +359,25 @@ pub(crate) fn ret_attend_kernel<F: Float>(
     part_max: &mut Tensor<f32>,
     part_sum: &mut Tensor<f32>,
     part_acc: &mut Tensor<f32>,
-    slots: usize,
+    position: &Tensor<i32>,
     chunks: usize,
-    pos: usize,
     k: usize,
     #[comptime] heads: usize,
     #[comptime] dr: usize,
     #[comptime] latent: usize,
     #[comptime] block: usize,
     #[comptime] local: usize,
-    #[comptime] sparse: bool,
+    #[comptime] dense: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let b = CUBE_POS / chunks;
     let chunk = CUBE_POS % chunks;
+    let pos = usize::cast_from(position[0]);
+    let mut sparse = candidate_blocks(pos, block, local) > k;
+    if dense {
+        sparse = false;
+    }
+    let slots = select(sparse, k * block + local, pos + 1);
     let tid = UNIT_POS as usize;
     let mut ql = Shared::<[f32]>::new_slice(heads * latent);
     let mut qr = Shared::<[f32]>::new_slice(heads * dr);

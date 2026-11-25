@@ -95,6 +95,9 @@ pub struct NcmCache {
     pub dec_self: Vec<KvCache>,
     /// Tokens consumed by the encoder so far.
     pub tokens: usize,
+    /// One-concept backbone steps as a replayed CUDA graph (v2 backbones on CUDA).
+    #[cfg(feature = "cuda")]
+    pub backbone_graph: crate::layers::GraphedStack,
 }
 
 impl NcmCache {
@@ -110,6 +113,11 @@ impl NcmCache {
         self.backbone.iter_mut().chain(&mut self.encoder).for_each(LayerCache::reset);
         self.cross.iter_mut().chain(&mut self.dec_self).for_each(KvCache::reset);
         self.tokens = 0;
+        // Resetting replaces the DeltaNet state buffers the graph was recorded against.
+        #[cfg(feature = "cuda")]
+        {
+            self.backbone_graph = Default::default();
+        }
     }
 }
 
@@ -311,6 +319,8 @@ impl NcmLm {
                 })
                 .collect(),
             tokens: 0,
+            #[cfg(feature = "cuda")]
+            backbone_graph: Default::default(),
         }
     }
 
@@ -328,6 +338,9 @@ impl NcmLm {
             kv_cache.write(keys, values);
         }
         let concepts = self.pool.forward(states.reshape([b, t / k, k * self.local_dim]));
+        #[cfg(feature = "cuda")]
+        let h = cache.backbone_graph.forward(&self.backbone, concepts, &mut cache.backbone);
+        #[cfg(not(feature = "cuda"))]
         let h = self.backbone.forward(concepts, Some(&mut cache.backbone));
         cache.tokens += t;
         self.cond_proj.forward(h.narrow(1, t / k - 1, 1))
@@ -490,7 +503,10 @@ impl GraphedDecoder {
     ) -> Tensor<2, Int> {
         let device = cond.device();
         let ring_full = cache.cross.iter().all(|c| c.len() >= c.capacity());
-        if matches!(self.state, GraphState::Untried) && ring_full && crate::fused::active(&device) {
+        if matches!(self.state, GraphState::Untried)
+            && ring_full
+            && crate::fused::graphs_active(&device)
+        {
             self.state = match model.capture_decoder(&cond, cache) {
                 Ok(graph) => GraphState::Ready(Box::new(graph)),
                 Err(e) => GraphState::Failed(e),

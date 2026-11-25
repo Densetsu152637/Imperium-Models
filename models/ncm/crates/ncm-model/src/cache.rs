@@ -228,6 +228,8 @@ pub fn layer_cache_bytes(
 }
 
 /// The decode cache of one layer of a stack, by its sequence mixer.
+// One per layer, a few dozen at most: the size gap between variants is not worth boxing for.
+#[allow(clippy::large_enum_variant)]
 pub enum LayerCache {
     Kv(KvCache),
     Delta(DeltaCache),
@@ -262,6 +264,17 @@ impl LayerCache {
             Self::Kv(c) => c.nbytes(),
             Self::Delta(c) => c.nbytes(),
             Self::Latent(c) => c.nbytes(),
+        }
+    }
+
+    /// Advances the position of a DeltaNet or retrieval cache by `t` after a replayed graph
+    /// did the step's writes.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn advance(&mut self, t: usize) {
+        match self {
+            Self::Delta(c) => c.advance(t),
+            Self::Latent(c) => c.advance(t),
+            Self::Kv(_) => unreachable!("attention caches are not replayed"),
         }
     }
 

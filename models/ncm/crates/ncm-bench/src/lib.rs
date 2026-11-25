@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
-use ncm_model::fused::{argmax_last, kernels_built, set_fused_kernels};
+use ncm_model::fused::{argmax_last, kernels_built, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
 use ncm_model::{
     Config, Design, NcmLm, TokenLm, cache_bytes, cache_bytes_with, ncm_250m_of, tiny_ncm,
@@ -107,6 +107,10 @@ pub struct Cli {
     /// `--features cuda` build uses by default).
     #[arg(long)]
     pub reference_kernels: bool,
+    /// Run the fused kernels eagerly instead of replaying the NCM decoder and v2 backbone steps
+    /// as captured CUDA graphs.
+    #[arg(long)]
+    pub no_cuda_graphs: bool,
 }
 
 pub fn verdict(ratio: f64) -> &'static str {
@@ -381,6 +385,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     }
     set_fused_attention(cli.fused_attention);
     set_fused_kernels(!cli.reference_kernels);
+    set_cuda_graphs(!cli.no_cuda_graphs);
     let itemsize = match dtype {
         DtypeChoice::Bf16 => 2,
         DtypeChoice::F32 => 4,
@@ -436,6 +441,10 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         "tiny": cli.tiny,
         "fused_attention": cli.fused_attention,
         "fused_kernels": cli.device == DeviceChoice::Cuda && kernels_built() && !cli.reference_kernels,
+        "cuda_graphs": cli.device == DeviceChoice::Cuda
+            && kernels_built()
+            && !cli.reference_kernels
+            && !cli.no_cuda_graphs,
         "results": results,
         "ratios": ratios,
         "ncm_v2_over_fallback": design_ratios,

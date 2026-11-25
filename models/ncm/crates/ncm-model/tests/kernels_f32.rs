@@ -34,7 +34,7 @@ fn argmax_matches_burn_f32() {
 }
 
 #[test]
-fn graphed_decoder_matches_eager_f32() {
+fn graphed_decode_matches_eager_f32() {
     let (device, _lock) = setup(DTYPE);
-    graphed_decoder_matches(&device);
+    graphed_decode_matches(&device);
 }

@@ -14,7 +14,7 @@ pub(crate) const CUBE: usize = 256;
 /// `dst[.., at + i, ..] = src[.., i, ..]` along axis `axis` (any rank, both strided): one unit
 /// per element of `src` (`count` of them).
 #[cube(launch_unchecked)]
-pub(crate) fn assign_kernel<F: Float>(
+pub(crate) fn assign_kernel<F: Numeric>(
     dst: &mut Tensor<F>,
     src: &Tensor<F>,
     count: usize,

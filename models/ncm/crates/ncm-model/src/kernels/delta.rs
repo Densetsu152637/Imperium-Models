@@ -35,23 +35,21 @@ fn conv_silu<F: Float>(
 }
 
 /// `proj` `[B, T, 4 H hd + 2 H]` (q, k, v, gate, decay logits a, write logits b), `conv_w`
-/// `[width, 3 H hd]`, `conv_in` `[B, width - 1, 3 H hd]`, `state_in` `[B, H, hd, hd]`, `a_log`,
-/// `dt_bias` `[H]`, `norm_w` `[hd]`. Writes `out` `[B, T, H hd]` (normed and gated read-out,
-/// before the output projection) and the carried `conv_out` and `state_out`. Inputs may be
-/// strided (cubecl pitches rows); the outputs must be contiguous.
+/// `[width, 3 H hd]`, `a_log`, `dt_bias` `[H]`, `norm_w` `[hd]` (all read through their strides).
+/// Writes `out` `[B, T, H hd]` (normed and gated read-out, before the output projection) and
+/// updates the contiguous cache `conv` `[B, width - 1, 3 H hd]` and `state` `[B, H, hd, hd]` in
+/// place.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delta_step_kernel<F: Float>(
     proj: &Tensor<F>,
     conv_w: &Tensor<F>,
-    conv_in: &Tensor<F>,
-    state_in: &Tensor<F>,
     a_log: &Tensor<F>,
     dt_bias: &Tensor<F>,
     norm_w: &Tensor<F>,
     out: &mut Tensor<F>,
-    conv_out: &mut Tensor<F>,
-    state_out: &mut Tensor<F>,
+    conv: &mut Tensor<F>,
+    state: &mut Tensor<F>,
     steps: usize,
     q_scale: f32,
     inv_hd: f32,
@@ -71,22 +69,9 @@ pub(crate) fn delta_step_kernel<F: Float>(
     let mut k_sh = Shared::<[f32]>::new_slice(hd);
     let mut o_sh = Shared::<[f32]>::new_slice(hd);
 
-    // Carry the state column and the convolution history into the outputs, then update there.
     let s_base = bh * hd * hd;
-    let s_in = b * state_in.stride(0) + h * state_in.stride(1) + j * state_in.stride(3);
-    for i in 0..hd {
-        state_out[s_base + i * hd + j] = state_in[s_in + i * state_in.stride(2)];
-    }
     let c_base = b * (width - 1) * channels;
     let cq = h * hd + j;
-    let (cs0, cs1, cs2) = (conv_in.stride(0), conv_in.stride(1), conv_in.stride(2));
-    for w in 0..width - 1 {
-        let at = c_base + w * channels + cq;
-        let from = b * cs0 + w * cs1 + cq * cs2;
-        conv_out[at] = conv_in[from];
-        conv_out[at + hk] = conv_in[from + hk * cs2];
-        conv_out[at + 2 * hk] = conv_in[from + 2 * hk * cs2];
-    }
     let rate = f32::cast_from(a_log[h * a_log.stride(0)]).exp();
     let bias = f32::cast_from(dt_bias[h * dt_bias.stride(0)]);
     let gamma = f32::cast_from(norm_w[j * norm_w.stride(0)]);
@@ -94,11 +79,11 @@ pub(crate) fn delta_step_kernel<F: Float>(
     for t in 0..steps {
         let row = b * proj.stride(0) + t * proj.stride(1);
         let pc = proj.stride(2);
-        let q = conv_silu::<F>(proj[row + cq * pc], conv_w, conv_out, c_base, channels, cq, width);
+        let q = conv_silu::<F>(proj[row + cq * pc], conv_w, conv, c_base, channels, cq, width);
         let k = conv_silu::<F>(
             proj[row + (hk + cq) * pc],
             conv_w,
-            conv_out,
+            conv,
             c_base,
             channels,
             hk + cq,
@@ -107,7 +92,7 @@ pub(crate) fn delta_step_kernel<F: Float>(
         let v = conv_silu::<F>(
             proj[row + (2 * hk + cq) * pc],
             conv_w,
-            conv_out,
+            conv,
             c_base,
             channels,
             2 * hk + cq,
@@ -139,7 +124,7 @@ pub(crate) fn delta_step_kernel<F: Float>(
         let mut ks = 0.0f32;
         let mut qs = 0.0f32;
         for i in 0..hd {
-            let s = f32::cast_from(state_out[s_base + i * hd + j]);
+            let s = f32::cast_from(state[s_base + i * hd + j]);
             ks += k_sh[i] * s;
             qs += q_sh[i] * s;
         }
@@ -149,8 +134,8 @@ pub(crate) fn delta_step_kernel<F: Float>(
         let ku = kn * u;
         for i in 0..hd {
             let at = s_base + i * hd + j;
-            let s = f32::cast_from(state_out[at]);
-            state_out[at] = F::cast_from(decay * s + k_sh[i] * ku);
+            let s = f32::cast_from(state[at]);
+            state[at] = F::cast_from(decay * s + k_sh[i] * ku);
         }
 
         o_sh[j] = o;

@@ -10,6 +10,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use burn::tensor::{Device, Int, Tensor};
 
 static FUSED_KERNELS: AtomicBool = AtomicBool::new(true);
+#[cfg(feature = "cuda")]
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+static CUDA_GRAPHS: AtomicBool = AtomicBool::new(true);
+
+/// Allow (the default) or forbid replaying decode steps as captured CUDA graphs
+/// ([`crate::ncm::GraphedDecoder`], [`crate::layers::GraphedStack`]); without them the same
+/// fused kernels run eagerly. Process-wide; a graph already captured keeps replaying.
+pub fn set_cuda_graphs(on: bool) {
+    CUDA_GRAPHS.store(on, Ordering::Relaxed);
+}
+
+/// Whether decode steps on `device` may be captured into CUDA graphs now.
+pub fn graphs_active(device: &Device) -> bool {
+    CUDA_GRAPHS.load(Ordering::Relaxed) && active(device)
+}
+
+/// Marks a CUDA graph capture under way: layers then leave out the host-to-device refreshes
+/// (positions) that the graph driver issues before each replay instead.
+#[cfg(feature = "cuda")]
+pub(crate) fn set_capturing(on: bool) {
+    CAPTURING.store(on, Ordering::Relaxed);
+}
+
+/// Whether a CUDA graph capture is under way.
+#[cfg(feature = "cuda")]
+pub(crate) fn capturing() -> bool {
+    CAPTURING.load(Ordering::Relaxed)
+}
 
 /// Allow (the default) or forbid the fused kernels. Process-wide; affects calls made after it.
 pub fn set_fused_kernels(on: bool) {

@@ -35,7 +35,7 @@ fn argmax_matches_burn_bf16() {
 }
 
 #[test]
-fn graphed_decoder_matches_eager_bf16() {
+fn graphed_decode_matches_eager_bf16() {
     let (device, _lock) = setup(DTYPE);
-    graphed_decoder_matches(&device);
+    graphed_decode_matches(&device);
 }

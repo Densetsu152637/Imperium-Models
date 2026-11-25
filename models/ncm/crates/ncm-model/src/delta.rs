@@ -195,6 +195,36 @@ impl DeltaCache {
         self.length == 0
     }
 
+    /// Advances the position by `t` (a replayed graph updated the state).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn advance(&mut self, t: usize) {
+        self.length += t;
+    }
+
+    /// Copies of the state and convolution history, to put back with [`Self::restore`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn snapshot(&self) -> (Tensor<4>, Tensor<3>, usize) {
+        let copy4 = |t: &Tensor<4>| {
+            let c = Tensor::<4>::zeros(t.dims(), &t.device());
+            crate::kernels::assign_into(&c, t.clone(), 0, 0);
+            c
+        };
+        let copy3 = |t: &Tensor<3>| {
+            let c = Tensor::<3>::zeros(t.dims(), &t.device());
+            crate::kernels::assign_into(&c, t.clone(), 0, 0);
+            c
+        };
+        (copy4(&self.state), copy3(&self.conv), self.length)
+    }
+
+    /// Writes a [`Self::snapshot`] back into the state's own buffers.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn restore(&mut self, snapshot: (Tensor<4>, Tensor<3>, usize)) {
+        crate::kernels::assign_into(&self.state, snapshot.0, 0, 0);
+        crate::kernels::assign_into(&self.conv, snapshot.1, 0, 0);
+        self.length = snapshot.2;
+    }
+
     pub fn reset(&mut self) {
         let device = self.state.device();
         self.state = Tensor::zeros(self.state.dims(), &device);
@@ -376,19 +406,21 @@ impl GatedDeltaNet {
     #[cfg(feature = "cuda")]
     fn forward_fused(&self, x: Tensor<3>, cache: &mut DeltaCache) -> Tensor<3> {
         let t = x.dims()[1];
-        let (out, conv, state) = crate::kernels::delta_step(
+        // The kernel updates the cache in place, so it must own packed buffers (a reference
+        // prefill leaves views and pitched rows); after the first step this is a no-op.
+        cache.state = crate::kernels::packed(cache.state.clone());
+        cache.conv = crate::kernels::packed(cache.conv.clone());
+        let out = crate::kernels::delta_step(
             self.proj.forward(x),
             self.conv.val(),
-            cache.conv.clone(),
-            cache.state.clone(),
+            &cache.conv,
+            &cache.state,
             self.a_log.val(),
             self.dt_bias.val(),
             self.norm.gamma.val(),
             self.heads,
             self.norm.epsilon,
         );
-        cache.state = state;
-        cache.conv = conv;
         cache.length += t;
         self.o.forward(out)
     }

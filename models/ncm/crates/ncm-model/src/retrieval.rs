@@ -64,6 +64,9 @@ impl RetrievalSpec {
 pub struct LatentCache {
     kv: Option<Tensor<3>>,
     keys: Option<Tensor<3>>,
+    /// The next position on the device (`[1]`, i32), read by the fused decode kernels.
+    #[cfg(feature = "cuda")]
+    position: Tensor<1, Int>,
     capacity: usize,
     length: usize,
     itemsize: usize,
@@ -74,12 +77,41 @@ impl LatentCache {
         let kv = Tensor::<3>::zeros([batch, capacity, width], device);
         let itemsize = kv.dtype().size();
         let keys = Tensor::<3>::zeros([batch, capacity, index_dim], device);
-        Self { kv: Some(kv), keys: Some(keys), capacity, length: 0, itemsize }
+        Self {
+            kv: Some(kv),
+            keys: Some(keys),
+            #[cfg(feature = "cuda")]
+            position: Tensor::<1, Int>::zeros([1], device).cast(burn::tensor::IntDType::I32),
+            capacity,
+            length: 0,
+            itemsize,
+        }
     }
 
     /// Next absolute position.
     pub fn len(&self) -> usize {
         self.length
+    }
+
+    /// Copies the next position into the device buffer the fused kernels read.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn refresh_position(&self) {
+        let device = self.position.device();
+        let pos = burn::tensor::TensorData::new(vec![self.length as i32], [1]);
+        let pos = Tensor::<1, Int>::from_data(pos, &device).cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(&self.position, pos, 0, 0);
+    }
+
+    /// Advances the position by `t` without writing (a replayed graph wrote the entries).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn advance(&mut self, t: usize) {
+        self.length += t;
+    }
+
+    /// Moves the position back to `len` (entries past it are overwritten when written again).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rewind(&mut self, len: usize) {
+        self.length = len;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -211,19 +243,20 @@ impl SparseRetrieval {
         };
         let norms =
             [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
-        let (out, kv, keys) = crate::kernels::retrieval_decode(
+        if !crate::fused::capturing() {
+            cache.refresh_position();
+        }
+        let out = crate::kernels::retrieval_decode(
             self.proj.forward(x),
             norms,
             rope.tables(),
             self.uk.weight.val(),
             self.uv.weight.val(),
-            cache.kv.take().expect("cache"),
-            cache.keys.take().expect("cache"),
-            pos,
+            cache.kv.as_ref().expect("cache"),
+            cache.keys.as_ref().expect("cache"),
+            &cache.position,
             dims,
         );
-        cache.kv = Some(kv);
-        cache.keys = Some(keys);
         cache.length += 1;
         self.o.forward(out)
     }

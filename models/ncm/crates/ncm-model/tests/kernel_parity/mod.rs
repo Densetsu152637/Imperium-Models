@@ -16,7 +16,7 @@ use std::sync::{Mutex, MutexGuard};
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, Distribution, FloatDType, Int, Tensor, TensorData};
 use ncm_model::delta::{DeltaCache, DeltaSpec, GatedDeltaNet};
-use ncm_model::fused::{active, argmax_last, set_fused_kernels};
+use ncm_model::fused::{active, argmax_last, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::Rope;
 use ncm_model::ncm::GraphedDecoder;
 use ncm_model::retrieval::{LatentCache, RetrievalSpec, SparseRetrieval};
@@ -40,31 +40,53 @@ pub fn argmax_matches(device: &Device) {
     assert_eq!(ints(argmax_last(flat)), vec![0, 0]);
 }
 
-/// The decoder graph produces the same tokens and conditions as the eager decoder, concept
-/// after concept, for both NCM designs (tiny configs; the 8-token encoder window fills during
-/// the prompt, so the graph is captured on the first concept).
-pub fn graphed_decoder_matches(device: &Device) {
+/// Greedy NCM decode of `concepts` concepts after a 64-token prompt, through the decoder and
+/// backbone graphs when `graphs` is on: the tokens and conditions of every concept.
+fn ncm_decode(
+    model: &NcmLm,
+    graphs: bool,
+    concepts: usize,
+    device: &Device,
+) -> (Vec<Vec<i64>>, Vec<Vec<f32>>) {
+    set_cuda_graphs(graphs);
+    let prompt = Tensor::<2, Int>::from_data(
+        TensorData::new((0..64).map(|i: i32| i * 37 % 256).collect::<Vec<_>>(), [1, 64]),
+        device,
+    );
+    let mut cache = model.make_cache(64 + 4 * concepts + 4, 1, device);
+    let mut cond = model.prefill(prompt, &mut cache, 16);
+    let mut decoder = GraphedDecoder::default();
+    let (mut tokens, mut conds) = (Vec::new(), Vec::new());
+    for _ in 0..concepts {
+        let next = decoder.decode(model, cond, &mut cache);
+        tokens.push(ints(next.clone()));
+        cond = model.append_tokens(next, &mut cache);
+        conds.push(values(cond.clone()));
+    }
+    set_cuda_graphs(true);
+    if graphs {
+        assert!(decoder.is_captured(), "decoder not captured: {:?}", decoder.failure());
+        let backbone = &cache.backbone_graph;
+        let v2 = cache.backbone.iter().all(|c| !matches!(c, ncm_model::LayerCache::Kv(_)));
+        assert_eq!(backbone.is_captured(), v2, "backbone graph: {:?}", backbone.failure());
+    }
+    (tokens, conds)
+}
+
+/// The decoder graph (both designs) and the backbone graph (v2) give the same tokens and
+/// conditions as the same kernels run eagerly, concept after concept. Tiny configs: the 8-token
+/// encoder window fills during the prompt, so both graphs are captured on the first concept, and
+/// the v2 backbone's retrieval (blocks of 2, top 2, window 4) turns sparse within the run.
+pub fn graphed_decode_matches(device: &Device) {
     for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
         device.seed(9);
         let model = NcmLm::new(&cfg, device);
-        let prompt = Tensor::<2, Int>::from_data(
-            TensorData::new((0..64).map(|i: i32| i * 37 % 256).collect::<Vec<_>>(), [1, 64]),
-            device,
-        );
-        let mut eager = model.make_cache(64 + 40, 1, device);
-        let mut graphed_cache = model.make_cache(64 + 40, 1, device);
-        let mut cond_e = model.prefill(prompt.clone(), &mut eager, 16);
-        let mut cond_g = model.prefill(prompt, &mut graphed_cache, 16);
-        let mut graphed = GraphedDecoder::default();
-        for concept in 0..10 {
-            let (tokens_e, _) = model.decode_concept(cond_e, &mut eager, None, false);
-            let tokens_g = graphed.decode(&model, cond_g, &mut graphed_cache);
-            assert!(graphed.is_captured(), "not captured: {:?}", graphed.failure());
-            assert_eq!(ints(tokens_g.clone()), ints(tokens_e.clone()), "concept {concept}");
-            cond_e = model.append_tokens(tokens_e, &mut eager);
-            cond_g = model.append_tokens(tokens_g, &mut graphed_cache);
-            let (ce, cg) = (values(cond_e.clone()), values(cond_g.clone()));
-            assert!(rel_error(&cg, &ce) <= 1e-5, "concept {concept}: conditions differ");
+        let (tokens_e, conds_e) = ncm_decode(&model, false, 12, device);
+        let (tokens_g, conds_g) = ncm_decode(&model, true, 12, device);
+        for (concept, (te, tg)) in tokens_e.iter().zip(&tokens_g).enumerate() {
+            assert_eq!(tg, te, "concept {concept}: tokens differ");
+            let err = rel_error(&conds_g[concept], &conds_e[concept]);
+            assert!(err <= 1e-5, "concept {concept}: conditions differ by {err:.2e}");
         }
     }
 }

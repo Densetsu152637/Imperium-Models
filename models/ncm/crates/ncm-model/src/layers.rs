@@ -596,14 +596,25 @@ impl Stack {
         }
     }
 
-    pub fn forward(&self, x: Tensor<3>, mut caches: Option<&mut [LayerCache]>) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>, caches: Option<&mut [LayerCache]>) -> Tensor<3> {
         let t = x.dims()[1];
         let device = x.device();
         let start = caches.as_ref().map_or(0, |c| c[0].len());
         let ropes = self.ropes(start, t, &device);
+        self.forward_with(x, start, &ropes, caches)
+    }
+
+    /// [`Self::forward`] with the RoPE tables given.
+    fn forward_with(
+        &self,
+        x: Tensor<3>,
+        start: usize,
+        ropes: &Ropes,
+        mut caches: Option<&mut [LayerCache]>,
+    ) -> Tensor<3> {
         let mut x = x;
         for (i, block) in self.blocks.iter().enumerate() {
-            x = block.forward(x, start, &ropes, caches.as_mut().map(|c| &mut c[i]));
+            x = block.forward(x, start, ropes, caches.as_mut().map(|c| &mut c[i]));
         }
         self.norm.forward(x)
     }
@@ -616,5 +627,166 @@ impl Stack {
         device: &Device,
     ) -> Vec<LayerCache> {
         self.blocks.iter().map(|b| b.make_cache(max_positions, batch, device)).collect()
+    }
+}
+
+/// One-token steps of a v2 stack (DeltaNet and retrieval layers only) as one captured CUDA
+/// graph per cache, replayed for every step.
+///
+/// With the fused kernels every launch of such a step is the same at every position: the
+/// DeltaNet kernel updates its state in place, and the retrieval kernels take the position from a
+/// device buffer and size their grids for the largest step. Before each replay the input, the
+/// RoPE tables of the position and the caches' position buffers are copied in; after it the
+/// caches' host positions advance. Stacks with attention layers, runs of more than one token,
+/// other devices or a failed capture run [`Stack::forward`] eagerly.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedStack {
+    state: StackGraphState,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+enum StackGraphState {
+    #[default]
+    Untried,
+    Failed(String),
+    Ready(Box<StackGraph>),
+}
+
+#[cfg(feature = "cuda")]
+struct StackGraph {
+    graph: burn::backend::BackendGraph<burn::backend::Dispatch>,
+    input: Tensor<3>,
+    rope: Rope,
+    output: Tensor<3>,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedStack {
+    /// `stack.forward(x, Some(caches))`, replayed from a graph when it can be. The returned
+    /// tensor is the graph's output buffer: use it before the next call, which overwrites it.
+    /// One `GraphedStack` serves one set of caches.
+    pub fn forward(&mut self, stack: &Stack, x: Tensor<3>, caches: &mut [LayerCache]) -> Tensor<3> {
+        use burn::backend::{Backend, Dispatch};
+        let device = x.device();
+        let eligible =
+            x.dims()[1] == 1 && stack.graphable() && crate::fused::graphs_active(&device);
+        if !eligible {
+            return stack.forward(x, Some(caches));
+        }
+        if matches!(self.state, StackGraphState::Untried) {
+            self.state = match stack.capture(&x, caches) {
+                Ok(graph) => StackGraphState::Ready(Box::new(graph)),
+                Err(e) => StackGraphState::Failed(e),
+            };
+        }
+        let StackGraphState::Ready(g) = &self.state else {
+            return stack.forward(x, Some(caches));
+        };
+        let start = caches[0].len();
+        crate::kernels::assign_into(&g.input, x, 0, 0);
+        let (cos, sin) = stack.retrieval_rope(start, &device).tables();
+        let (g_cos, g_sin) = g.rope.tables();
+        crate::kernels::assign_into(&g_cos, cos, 0, 0);
+        crate::kernels::assign_into(&g_sin, sin, 0, 0);
+        for cache in caches.iter() {
+            if let LayerCache::Latent(c) = cache {
+                c.refresh_position();
+            }
+        }
+        // Safety: the graph's buffers are held by `g`, the stack's weights and the caches, all
+        // alive across the replay, and everything runs on this thread's stream.
+        unsafe { Dispatch::graph_replay(device.as_dispatch(), &g.graph) }
+            .expect("stack graph replay");
+        for cache in caches.iter_mut() {
+            cache.advance(1);
+        }
+        g.output.clone()
+    }
+
+    /// Why the stack runs eagerly, if a capture was tried and failed.
+    pub fn failure(&self) -> Option<&str> {
+        match &self.state {
+            StackGraphState::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Whether the stack replays a captured graph.
+    pub fn is_captured(&self) -> bool {
+        matches!(self.state, StackGraphState::Ready(_))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Stack {
+    /// Whether every layer has a position-independent fused step (DeltaNet or retrieval).
+    fn graphable(&self) -> bool {
+        self.blocks.iter().all(|b| matches!(b.attn, Mixer::DeltaNet(_) | Mixer::Retrieval(_)))
+    }
+
+    /// The retrieval layers' RoPE tables for the one position `start`.
+    fn retrieval_rope(&self, start: usize, device: &Device) -> Rope {
+        let (base, scale) = (self.rope_base_full, self.rope_scale_full);
+        Rope::new(start, 1, self.retrieval_rope_dim, base, scale, device)
+    }
+
+    /// Warms up and records one step over fixed input buffers, leaving the caches as they were.
+    fn capture(&self, x: &Tensor<3>, caches: &mut [LayerCache]) -> Result<StackGraph, String> {
+        use burn::backend::{Backend, Dispatch};
+        let device = x.device();
+        let dispatch = device.as_dispatch();
+        let start = caches[0].len();
+        let input = Tensor::<3>::zeros(x.dims(), &device);
+        crate::kernels::assign_into(&input, x.clone(), 0, 0);
+        let (cos, sin) = self.retrieval_rope(start, &device).tables();
+        let buffer = |t: Tensor<4>| {
+            let b = Tensor::<4>::zeros(t.dims(), &device);
+            crate::kernels::assign_into(&b, t, 0, 0);
+            b
+        };
+        let rope = Rope::from_tables(buffer(cos), buffer(sin));
+        let ropes = Ropes { local: None, full: None, retrieval: Some(rope.clone()) };
+        // Warm-up runs are real steps: their writes are undone (DeltaNet states restored,
+        // retrieval positions rewound so the real step overwrites their entries).
+        let snapshot = |caches: &[LayerCache]| -> Vec<Option<(Tensor<4>, Tensor<3>, usize)>> {
+            caches
+                .iter()
+                .map(|c| match c {
+                    LayerCache::Delta(d) => Some(d.snapshot()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let restore = |caches: &mut [LayerCache],
+                       saved: &[Option<(Tensor<4>, Tensor<3>, usize)>]| {
+            for (cache, saved) in caches.iter_mut().zip(saved) {
+                match (cache, saved) {
+                    (LayerCache::Delta(d), Some(s)) => d.restore(s.clone()),
+                    (LayerCache::Latent(l), _) => l.rewind(start),
+                    _ => {}
+                }
+            }
+        };
+        let saved = snapshot(caches);
+        let err = |what: &str, e: burn::tensor::ExecutionError| format!("{what}: {e:?}");
+        Dispatch::graph_prepare(dispatch).map_err(|e| err("graph_prepare", e))?;
+        for _ in 0..2 {
+            let out = self.forward_with(input.clone(), start, &ropes, Some(caches));
+            Dispatch::sync(dispatch).map_err(|e| err("warm-up", e))?;
+            drop(out);
+            restore(caches, &saved);
+        }
+        Dispatch::sync(dispatch).map_err(|e| err("restore", e))?;
+        Dispatch::graph_start_capture(dispatch).map_err(|e| err("graph_start_capture", e))?;
+        crate::fused::set_capturing(true);
+        let output = self.forward_with(input.clone(), start, &ropes, Some(caches));
+        crate::fused::set_capturing(false);
+        let graph = Dispatch::graph_stop_capture(dispatch);
+        // The recording ran nothing on the device; only the host positions moved.
+        restore(caches, &saved);
+        let graph = graph.map_err(|e| err("graph_stop_capture", e))?;
+        Ok(StackGraph { graph, input, rope, output })
     }
 }
