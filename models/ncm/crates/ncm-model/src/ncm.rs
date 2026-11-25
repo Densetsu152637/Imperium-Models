@@ -12,14 +12,11 @@
 //! Concept 0 is context only: it has no earlier concept to condition on, so logits cover tokens
 //! k .. N - 1 (`logits[:, t - k]` predicts token t).
 
+#[cfg(feature = "cuda")]
+use burn::backend::{BackendGraph, Dispatch};
 use burn::module::{Module, Param};
 use burn::nn::{Embedding, EmbeddingConfig, RmsNorm};
 use burn::tensor::{Bool, Device, Int, Tensor};
-#[cfg(feature = "cuda")]
-use burn::{
-    backend::{Backend, BackendGraph, Dispatch},
-    tensor::ExecutionError,
-};
 
 use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
 use crate::config::{Design, NcmConfig};
@@ -100,7 +97,7 @@ pub struct NcmCache {
     pub dec_self: Vec<KvCache>,
     /// Tokens consumed by the encoder so far.
     pub tokens: usize,
-    /// One-concept backbone steps as a replayed CUDA graph (v2 backbones on CUDA).
+    /// One-concept backbone steps of [`NcmLm::append_tokens`] as a replayed CUDA graph (on CUDA).
     #[cfg(feature = "cuda")]
     pub backbone_graph: crate::layers::GraphedStack,
 }
@@ -660,8 +657,7 @@ impl GraphedDecoder {
         // Safety: every buffer the graph touched is held by `g` (its inputs and output), by the
         // model (weights) or by `cache` (the decoder caches), all of which outlive the replay,
         // and all work runs on this thread's stream.
-        unsafe { Dispatch::graph_replay(device.as_dispatch(), &g.graph) }
-            .expect("decoder graph replay");
+        unsafe { crate::graph::replay(&device, &g.graph, "decoder") };
         g.tokens.clone()
     }
 
@@ -688,7 +684,6 @@ impl NcmLm {
         cache: &mut NcmCache,
     ) -> Result<DecoderGraph, String> {
         let device = cond.device();
-        let dispatch = device.as_dispatch();
         let cond_buffer = Tensor::<3>::zeros(cond.dims(), &device);
         crate::kernels::assign_into(&cond_buffer, cond.clone(), 0, 0);
         let (cos, sin) = self.rope(cache.tokens, self.k, &device).tables();
@@ -699,25 +694,326 @@ impl NcmLm {
         let rope_q = Rope::from_tables(cos_buffer, sin_buffer);
         let rope_self = self.rope(0, self.k, &device);
         let run = |cache: &mut NcmCache| {
-            let mut pick = |_: usize, logits: &Tensor<3>| {
-                crate::fused::argmax_last(logits.clone()).reshape([logits.dims()[0], 1])
-            };
             let cond = cond_buffer.clone();
-            self.decode_with_ropes(cond, cache, &rope_self, &rope_q, false, &mut pick).0
+            self.decode_with_ropes(cond, cache, &rope_self, &rope_q, false, &mut greedy).0
         };
-        let err = |what: &str, e: ExecutionError| format!("{what}: {e:?}");
-        Dispatch::graph_prepare(dispatch).map_err(|e| err("graph_prepare", e))?;
-        // Warm-up runs compile every kernel and fill the memory pool with every buffer the
-        // capture will take, so nothing allocates mid-capture.
-        for _ in 0..3 {
-            let out = run(cache);
-            Dispatch::sync(dispatch).map_err(|e| err("warm-up", e))?;
-            drop(out);
-        }
-        Dispatch::graph_start_capture(dispatch).map_err(|e| err("graph_start_capture", e))?;
-        let tokens = run(cache);
-        let graph =
-            Dispatch::graph_stop_capture(dispatch).map_err(|e| err("graph_stop_capture", e))?;
+        // The decoder's self caches restart every concept: nothing to undo.
+        let (graph, tokens) = crate::graph::record(&device, cache, 3, run, |_| {})?;
         Ok(DecoderGraph { graph, cond: cond_buffer, rope_q, _rope_self: rope_self, tokens })
+    }
+}
+
+/// The greedy pick of [`NcmLm::decode_with_ropes`] on the device.
+#[cfg(feature = "cuda")]
+fn greedy(_: usize, logits: &Tensor<3>) -> Tensor<2, Int> {
+    crate::fused::argmax_last(logits.clone()).reshape([logits.dims()[0], 1])
+}
+
+/// A whole NCM concept step as one captured CUDA graph per cache, replayed for every concept:
+/// [`NcmLm::append_tokens`] of the concept just written (encoder over its k tokens, the
+/// cross-attention keys, concept pooling, the backbone step) and then the greedy decoder pass of
+/// the next concept, with no host work or sync in between. Captured once the cross-attention
+/// ring is full; the encoder's sliding-window rings and the backbone's caches are written and
+/// masked through device cursors ([`crate::graph`]). Before each replay the written tokens, the
+/// RoPE tables of the new positions and the cache positions are copied in; after it the host
+/// positions advance. Both designs.
+///
+/// On other devices, with the fused kernels or graphs off, before the ring fills, or if the
+/// capture fails, [`GraphedStep::step`] runs `append_tokens` and then [`GraphedDecoder`]. One
+/// `GraphedStep` serves one cache; make a new one after [`NcmCache::reset`].
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedStep {
+    state: StepState,
+    decoder: GraphedDecoder,
+}
+
+/// [`NcmLm::append_tokens`] of one concept as a captured CUDA graph, like [`GraphedStep`]
+/// without the decoder pass: for callers that write the next concept another way (the
+/// self-speculative draft and verify passes, [`crate::Speculator`]).
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedAppend {
+    state: StepState,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+enum StepState {
+    #[default]
+    Untried,
+    Failed(String),
+    Ready(Box<StepGraph>),
+}
+
+/// What a step graph leaves in its output buffers.
+#[cfg(feature = "cuda")]
+enum StepOut {
+    /// The next concept's condition `[B, 1, d]`.
+    Cond(Tensor<3>),
+    /// The next concept's greedy tokens `[B, k]`.
+    Tokens(Tensor<2, Int>),
+}
+
+#[cfg(feature = "cuda")]
+struct StepGraph {
+    graph: BackendGraph<Dispatch>,
+    out: StepOut,
+    inputs: StepInputs,
+}
+
+/// The fixed inputs of a step graph.
+#[cfg(feature = "cuda")]
+struct StepInputs {
+    /// The written concept `[B, k]` (i32), copied in before each replay.
+    tokens: Tensor<2, Int>,
+    cursors: crate::graph::CursorSet,
+    staging: crate::graph::Staging,
+    encoder: crate::layers::StackStep,
+    backbone: crate::layers::StackStep,
+    /// Each decoder layer's cross-attention ring, in `cursors`.
+    cross: Vec<usize>,
+    /// RoPE tables of the written concept's positions (the cross-attention keys), and where
+    /// they are staged.
+    rope_k: (Rope, (usize, usize)),
+    /// The decoder pass: RoPE tables of the next concept's positions, and where staged.
+    rope_q: Option<(Rope, (usize, usize))>,
+    /// RoPE tables of a concept's own positions (0..k) for the decoder pass.
+    rope_self: Rope,
+    /// `cache.tokens` after the last replay: a smaller count means the cache was reset.
+    seen: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedStep {
+    /// Appends `tokens` `[B, k]` (the concept just written) and greedily writes the next
+    /// concept, like `model.decode_concept(model.append_tokens(tokens, cache), cache, None,
+    /// false)`. The returned tensor is the graph's output buffer: read it (or pass it back in)
+    /// before the next call, which overwrites it.
+    pub fn step(
+        &mut self,
+        model: &NcmLm,
+        tokens: Tensor<2, Int>,
+        cache: &mut NcmCache,
+    ) -> Tensor<2, Int> {
+        match self.state.run(model, &tokens, cache, true) {
+            Some(StepOut::Tokens(t)) => t,
+            Some(StepOut::Cond(_)) => unreachable!("a decoding step graph writes tokens"),
+            None => {
+                let cond = model.append_tokens(tokens, cache);
+                self.decoder.decode(model, cond, cache)
+            }
+        }
+    }
+
+    /// Why the step runs eagerly, if a capture was tried and failed.
+    pub fn failure(&self) -> Option<&str> {
+        self.state.failure()
+    }
+
+    /// Whether the step replays a captured graph.
+    pub fn is_captured(&self) -> bool {
+        matches!(self.state, StepState::Ready(_))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedAppend {
+    /// `model.append_tokens(tokens, cache)` for one concept `[B, k]`, replayed from a graph
+    /// when it can be. The returned condition is the graph's output buffer: use it before the
+    /// next call, which overwrites it.
+    pub fn append(
+        &mut self,
+        model: &NcmLm,
+        tokens: Tensor<2, Int>,
+        cache: &mut NcmCache,
+    ) -> Tensor<3> {
+        match self.state.run(model, &tokens, cache, false) {
+            Some(StepOut::Cond(c)) => c,
+            Some(StepOut::Tokens(_)) => unreachable!("an append graph writes the condition"),
+            None => model.append_tokens(tokens, cache),
+        }
+    }
+
+    /// Why the append runs eagerly, if a capture was tried and failed.
+    pub fn failure(&self) -> Option<&str> {
+        self.state.failure()
+    }
+
+    /// Whether the append replays a captured graph.
+    pub fn is_captured(&self) -> bool {
+        matches!(self.state, StepState::Ready(_))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl StepState {
+    /// Replays the graph (capturing it first when it can be); None: the caller runs the step
+    /// eagerly.
+    fn run(
+        &mut self,
+        model: &NcmLm,
+        tokens: &Tensor<2, Int>,
+        cache: &mut NcmCache,
+        decode: bool,
+    ) -> Option<StepOut> {
+        let device = tokens.device();
+        if !crate::fused::graphs_active(&device) || tokens.dims()[1] != model.k {
+            return None;
+        }
+        let ring_full = cache.cross.iter().all(|c| c.window().is_some() && c.len() >= c.capacity());
+        if matches!(self, StepState::Untried) && ring_full {
+            *self = match model.capture_step(tokens, cache, decode) {
+                Ok(graph) => StepState::Ready(Box::new(graph)),
+                Err(e) => StepState::Failed(e),
+            };
+        }
+        let StepState::Ready(g) = self else { return None };
+        assert!(cache.tokens >= g.inputs.seen, "the cache was reset: step it with a new graph");
+        g.replay(model, tokens.clone(), cache);
+        Some(match &g.out {
+            StepOut::Cond(c) => StepOut::Cond(c.clone()),
+            StepOut::Tokens(t) => StepOut::Tokens(t.clone()),
+        })
+    }
+
+    fn failure(&self) -> Option<&str> {
+        match self {
+            StepState::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl StepGraph {
+    /// Copies in the written concept and every position-dependent input, replays, and moves
+    /// the host positions on.
+    fn replay(&mut self, model: &NcmLm, tokens: Tensor<2, Int>, cache: &mut NcmCache) {
+        let device = tokens.device();
+        let k = model.k;
+        let inputs = &mut self.inputs;
+        let tokens = tokens.cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(&inputs.tokens, tokens, 0, 0);
+        inputs.refresh(model, cache);
+        // Safety: every buffer the graph touched is held by `self` (inputs, outputs, RoPE
+        // tables, cursors), by the model (weights) or by `cache`, all alive across the replay,
+        // and all work runs on this thread's stream.
+        unsafe { crate::graph::replay(&device, &self.graph, "concept step") };
+        inputs.encoder.advance(&mut cache.encoder);
+        for c in &mut cache.cross {
+            c.advance(k);
+        }
+        inputs.backbone.advance(&mut cache.backbone);
+        cache.tokens += k;
+        inputs.seen = cache.tokens;
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl StepInputs {
+    /// Stages and uploads the RoPE tables and cache positions of the cache's current position.
+    fn refresh(&mut self, model: &NcmLm, cache: &NcmCache) {
+        let (k, base, scale) = (model.k, model.rope_base, model.rope_scale);
+        let (cursors, staging) = (&mut self.cursors, &mut self.staging);
+        self.encoder.refresh(&model.encoder, &cache.encoder, cursors, staging);
+        self.backbone.refresh(&model.backbone, &cache.backbone, cursors, staging);
+        for (&i, c) in self.cross.iter().zip(&cache.cross) {
+            cursors.sync(i, c);
+        }
+        cursors.refresh(staging);
+        let (rope_k, at) = &self.rope_k;
+        rope_k.stage(staging, *at, cache.tokens, base, scale);
+        if let Some((rope_q, at)) = &self.rope_q {
+            rope_q.stage(staging, *at, cache.tokens + k, base, scale);
+        }
+        staging.upload(&self.tokens.device());
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl NcmLm {
+    /// Warms up and records one concept step (with the decoder pass when `decode`) over fixed
+    /// input buffers, leaving the caches as they were.
+    fn capture_step(
+        &self,
+        tokens: &Tensor<2, Int>,
+        cache: &mut NcmCache,
+        decode: bool,
+    ) -> Result<StepGraph, String> {
+        use crate::graph::{CursorSet, restore_kv, save_kv, write_kv};
+        use crate::layers::StackStep;
+        let device = tokens.device();
+        let (k, d) = (self.k, self.local_dim);
+        let [b, _] = tokens.dims();
+        let input = Tensor::<2, Int>::zeros([b, k], &device).cast(burn::tensor::IntDType::I32);
+        let (mut cursors, mut staging) = (CursorSet::default(), Default::default());
+        let encoder = StackStep::new(&self.encoder, &cache.encoder, k, &mut cursors, &mut staging)?;
+        let cross = cache
+            .cross
+            .iter()
+            .map(|c| cursors.add(c, k, &mut staging))
+            .collect::<Result<Vec<_>, _>>()?;
+        let backbone =
+            StackStep::new(&self.backbone, &cache.backbone, 1, &mut cursors, &mut staging)?;
+        let mut rope = |start: usize| {
+            let rope = self.rope(start, k, &device).fixed();
+            let at = rope.add_to(&mut staging);
+            (rope, at)
+        };
+        let rope_k = rope(cache.tokens);
+        let rope_q = decode.then(|| rope(cache.tokens + k));
+        let mut inputs = StepInputs {
+            tokens: input,
+            cursors,
+            staging,
+            encoder,
+            backbone,
+            cross,
+            rope_k,
+            rope_q,
+            rope_self: self.rope(0, k, &device),
+            seen: cache.tokens,
+        };
+        let tokens = tokens.clone().cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(&inputs.tokens, tokens, 0, 0);
+        inputs.refresh(self, cache);
+        let saved = (
+            inputs.encoder.save(&cache.encoder),
+            cache.cross.iter().map(|c| save_kv(c, k)).collect::<Vec<_>>(),
+            inputs.backbone.save(&cache.backbone),
+        );
+        let g = &inputs;
+        let run = |cache: &mut NcmCache| {
+            g.staging.scatter();
+            let steps = g.cursors.steps();
+            let x = self.emb.forward(g.tokens.clone());
+            let states = g.encoder.run(&self.encoder, x, &mut cache.encoder, &steps);
+            let layers = self.dec_blocks.iter().zip(cache.cross.iter_mut()).zip(&g.cross);
+            for ((blk, ring), &i) in layers {
+                let (keys, values) = blk.cross.make_kv(states.clone(), &g.rope_k.0);
+                write_kv(ring, keys, values, &steps[i]);
+            }
+            let concept = self.pool.forward(states.reshape([b, 1, k * d]));
+            let h = g.backbone.run(&self.backbone, concept, &mut cache.backbone, &steps);
+            let cond = self.cond_proj.forward(h);
+            match &g.rope_q {
+                None => StepOut::Cond(cond),
+                Some((q, _)) => {
+                    let pass =
+                        self.decode_with_ropes(cond, cache, &g.rope_self, q, false, &mut greedy);
+                    StepOut::Tokens(pass.0)
+                }
+            }
+        };
+        let undo = |cache: &mut NcmCache| {
+            StackStep::restore(&mut cache.encoder, &saved.0);
+            for (ring, s) in cache.cross.iter_mut().zip(&saved.1) {
+                restore_kv(ring, s);
+            }
+            StackStep::restore(&mut cache.backbone, &saved.2);
+        };
+        let (graph, out) = crate::graph::record(&device, cache, 2, run, undo)?;
+        Ok(StepGraph { graph, out, inputs })
     }
 }

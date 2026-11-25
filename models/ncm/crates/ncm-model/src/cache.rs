@@ -114,6 +114,30 @@ impl KvCache {
         self.length = 0;
     }
 
+    /// The ring's window, or None for a plain growing cache.
+    pub fn window(&self) -> Option<usize> {
+        self.window
+    }
+
+    /// The key and value buffers `[B, KVH, capacity, D]` themselves (graphed steps write them
+    /// in place, [`crate::graph`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn buffers(&self) -> (&Tensor<4>, &Tensor<4>) {
+        (self.k.as_ref().expect("cache"), self.v.as_ref().expect("cache"))
+    }
+
+    /// Moves the position by `t` without writing (a graphed step wrote the entries).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn advance(&mut self, t: usize) {
+        self.length += t;
+    }
+
+    /// Moves the position back to `len` (entries past it are overwritten when written again).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rewind(&mut self, len: usize) {
+        self.length = len;
+    }
+
     fn held(&self) -> usize {
         self.length.min(self.capacity)
     }

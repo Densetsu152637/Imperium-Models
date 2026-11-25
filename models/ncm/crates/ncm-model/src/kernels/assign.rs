@@ -41,3 +41,35 @@ pub(crate) fn assign_kernel<F: Numeric>(
     }
     dst[to] = src[from];
 }
+
+/// [`assign_kernel`] at the offset held by the device tensor `at` (`[1]`, i32): the write lands
+/// where the host put the position before a replay, so one captured launch serves every step.
+#[cube(launch_unchecked)]
+pub(crate) fn assign_at_kernel<F: Numeric>(
+    dst: &mut Tensor<F>,
+    src: &Tensor<F>,
+    at: &Tensor<i32>,
+    count: usize,
+    axis: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let pos = ABSOLUTE_POS;
+    if pos >= count {
+        terminate!();
+    }
+    let offset = usize::cast_from(at[0]);
+    let mut rem = pos;
+    let mut from = 0usize;
+    let mut to = 0usize;
+    let mut d = src.rank();
+    while d > 0 {
+        d -= 1;
+        let n = src.shape(d);
+        let c = rem % n;
+        rem /= n;
+        from += c * src.stride(d);
+        let shift = select(d == axis, offset, 0usize);
+        to += (c + shift) * dst.stride(d);
+    }
+    dst[to] = src[from];
+}

@@ -14,6 +14,11 @@ const DTYPE: FloatDType = FloatDType::BF16;
 // is off by up to about 2.5e-2; the kernels keep f32 inside and store bf16 only in the caches.
 const TOL: f32 = 4e-2;
 
+// Conditions of the append graph against the eager append: the graph attends over a growing
+// cache's whole buffer with the tail masked where the eager path takes the filled part, which
+// may reorder a sum.
+const APPEND_TOL: f32 = 1e-5;
+
 #[test]
 fn delta_step_matches_reference_bf16() {
     let (device, _lock) = setup(DTYPE);
@@ -65,5 +70,34 @@ fn graphed_quantised_speculation_matches_eager_bf16() {
     let (device, _lock) = setup(DTYPE);
     for spec in quant_specs() {
         graphed_speculation_matches(&device, false, Some(spec));
+    }
+}
+
+#[test]
+fn graphed_step_matches_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_step_matches(&device, None);
+}
+
+#[test]
+fn graphed_quantised_step_matches_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    for spec in quant_specs() {
+        graphed_step_matches(&device, Some(spec));
+    }
+}
+
+#[test]
+fn graphed_append_matches_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_append_matches(&device, APPEND_TOL);
+}
+
+#[test]
+fn graphed_tok_step_matches_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_tok_matches(&device, None);
+    for spec in quant_specs() {
+        graphed_tok_matches(&device, Some(spec));
     }
 }

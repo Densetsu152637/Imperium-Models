@@ -19,6 +19,7 @@ use burn::tensor::{Bool, Device, Tensor, TensorData};
 use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
 use crate::config::{V2Config, is_full_layer};
 use crate::delta::{DeltaSpec, GatedDeltaNet};
+use crate::graph::KvStep;
 use crate::quant::QLinear as Linear;
 use crate::retrieval::{RetrievalSpec, SparseRetrieval};
 
@@ -95,20 +96,9 @@ impl Rope {
         scale: f64,
         device: &Device,
     ) -> Self {
-        let half = head_dim / 2;
-        let inv: Vec<f64> =
-            (0..half).map(|i| 1.0 / base.powf((2 * i) as f64 / head_dim as f64)).collect();
-        let mut cos = Vec::with_capacity(len * head_dim);
-        let mut sin = Vec::with_capacity(len * head_dim);
-        for pos in start..start + len {
-            for _ in 0..2 {
-                for f in &inv {
-                    let angle = pos as f64 / scale * f;
-                    cos.push(angle.cos() as f32);
-                    sin.push(angle.sin() as f32);
-                }
-            }
-        }
+        let mut cos = vec![0.0; len * head_dim];
+        let mut sin = vec![0.0; len * head_dim];
+        rope_values(start, head_dim, base, scale, &mut cos, &mut sin);
         let shape = [1, 1, len, head_dim];
         Self {
             cos: Tensor::from_data(TensorData::new(cos, shape), device),
@@ -130,12 +120,68 @@ impl Rope {
         Self { cos, sin, rot }
     }
 
+    /// A copy of these tables in buffers of its own, for a captured graph to read.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fixed(&self) -> Self {
+        let copy = |t: &Tensor<4>| {
+            let b = Tensor::<4>::zeros(t.dims(), &t.device());
+            crate::kernels::assign_into(&b, t.clone(), 0, 0);
+            b
+        };
+        Self { cos: copy(&self.cos), sin: copy(&self.sin), rot: self.rot.clone() }
+    }
+
+    /// Stages these tables (fixed buffers, [`Self::fixed`]) in `staging`: (cos, sin) offsets,
+    /// for [`Self::stage`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn add_to(&self, staging: &mut crate::graph::Staging) -> (usize, usize) {
+        (staging.add_floats(self.cos.clone()), staging.add_floats(self.sin.clone()))
+    }
+
+    /// Stages the tables of positions `start..` (as many rows as these tables have) at `at`
+    /// ([`Self::add_to`]); `base` and `scale` as for [`Self::new`].
+    #[cfg(feature = "cuda")]
+    pub(crate) fn stage(
+        &self,
+        staging: &mut crate::graph::Staging,
+        at: (usize, usize),
+        start: usize,
+        base: f64,
+        scale: f64,
+    ) {
+        let [_, _, len, dim] = self.cos.dims();
+        let mut cos = vec![0.0; len * dim];
+        rope_values(start, dim, base, scale, &mut cos, staging.floats(at.1, len * dim));
+        staging.floats(at.0, len * dim).copy_from_slice(&cos);
+    }
+
     /// Rows `start..start + len` of these tables.
     pub fn rows(&self, start: usize, len: usize) -> Self {
         Self {
             cos: self.cos.clone().narrow(2, start, len),
             sin: self.sin.clone().narrow(2, start, len),
             rot: self.rot.clone(),
+        }
+    }
+}
+
+/// The `cos` and `sin` tables of [`Rope::new`] for positions `start..start + cos.len() /
+/// head_dim`, written into `cos` and `sin` (row-major `[T, head_dim]`).
+pub(crate) fn rope_values(
+    start: usize,
+    head_dim: usize,
+    base: f64,
+    scale: f64,
+    cos: &mut [f32],
+    sin: &mut [f32],
+) {
+    let half = head_dim / 2;
+    for (row, (cos, sin)) in cos.chunks_mut(head_dim).zip(sin.chunks_mut(head_dim)).enumerate() {
+        let pos = (start + row) as f64 / scale;
+        for i in 0..half {
+            let angle = pos * (1.0 / base.powf((2 * i) as f64 / head_dim as f64));
+            let (c, s) = (angle.cos() as f32, angle.sin() as f32);
+            (cos[i], cos[i + half], sin[i], sin[i + half]) = (c, c, s, s);
         }
     }
 }
@@ -266,6 +312,34 @@ impl Attention {
             }
         };
         self.output(out, gate)
+    }
+
+    /// [`Self::forward`] with a cache inside a captured graph: the new keys and values land at
+    /// the step's device slot and the step's device mask hides what the eager path leaves out
+    /// ([`crate::graph`]). Runs of more than one token attend over the ring before the write
+    /// and their own keys, like [`KvCache::append`].
+    #[cfg(feature = "cuda")]
+    fn forward_step(
+        &self,
+        x: Tensor<3>,
+        rope: &Rope,
+        cache: &mut KvCache,
+        step: &KvStep,
+    ) -> Tensor<3> {
+        let t = x.dims()[1];
+        let (gate, q, k, v) = self.project(x, rope);
+        let (keys, values) = if t == 1 {
+            crate::graph::write_kv(cache, k, v, step);
+            let (ck, cv) = cache.buffers();
+            (ck.clone(), cv.clone())
+        } else {
+            let (ck, cv) = cache.buffers();
+            let keys = Tensor::cat(vec![ck.clone(), k.clone()], 2);
+            let values = Tensor::cat(vec![cv.clone(), v.clone()], 2);
+            crate::graph::write_kv(cache, k, v, step);
+            (keys, values)
+        };
+        self.output(attend(q, keys, values, Some(step.mask.clone())), gate)
     }
 
     /// Attention over `x` itself without a cache, with the given `[T, T]` mask (`true` hides a
@@ -482,20 +556,31 @@ impl Block {
         }
     }
 
+    /// `step`: the layer's cache position in a captured graph (attention layers only).
     fn mix(
         &self,
         x: Tensor<3>,
         start: usize,
         ropes: &Ropes,
         cache: Option<&mut LayerCache>,
+        step: Option<&KvStep>,
     ) -> Tensor<3> {
         fn table(rope: &Option<Rope>) -> &Rope {
             rope.as_ref().expect("the stack built this table")
         }
         match &self.attn {
             Mixer::Attention(attn) => {
-                let rope = if attn.window().is_some() { &ropes.local } else { &ropes.full };
-                attn.forward(x, table(rope), cache.map(LayerCache::kv))
+                let rope = table(if attn.window().is_some() { &ropes.local } else { &ropes.full });
+                match step {
+                    #[cfg(feature = "cuda")]
+                    Some(step) => {
+                        let cache = cache.expect("a graphed step has caches").kv();
+                        attn.forward_step(x, rope, cache, step)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    Some(step) => match *step {},
+                    None => attn.forward(x, rope, cache.map(LayerCache::kv)),
+                }
             }
             Mixer::DeltaNet(delta) => delta.forward(x, cache.map(LayerCache::delta)),
             Mixer::Retrieval(ret) => {
@@ -510,8 +595,9 @@ impl Block {
         start: usize,
         ropes: &Ropes,
         cache: Option<&mut LayerCache>,
+        step: Option<&KvStep>,
     ) -> Tensor<3> {
-        let x = x.clone() + self.mix(self.n1.forward(x), start, ropes, cache);
+        let x = x.clone() + self.mix(self.n1.forward(x), start, ropes, cache, step);
         x.clone() + self.mlp.forward(self.n2.forward(x))
     }
 
@@ -660,7 +746,9 @@ impl Stack {
         }
     }
 
-    fn ropes(&self, start: usize, t: usize, device: &Device) -> Ropes {
+    /// The (head dim, base, scale) of the RoPE tables each layer type needs: sliding
+    /// attention, full attention and retrieval, None for types the stack lacks.
+    fn rope_params(&self) -> [Option<(usize, f64, f64)>; 3] {
         let (mut local, mut full, mut retrieval) = (false, false, false);
         for block in &self.blocks {
             match &block.attn {
@@ -670,19 +758,22 @@ impl Stack {
                 Mixer::DeltaNet(_) => {}
             }
         }
-        let table = |on: bool, dim: usize, base: f64, scale: f64| {
-            on.then(|| Rope::new(start, t, dim, base, scale, device))
-        };
-        Ropes {
-            local: table(local, self.head_dim, self.rope_base, self.rope_scale),
-            full: table(full, self.head_dim, self.rope_base_full, self.rope_scale_full),
-            retrieval: table(
-                retrieval,
+        [
+            local.then_some((self.head_dim, self.rope_base, self.rope_scale)),
+            full.then_some((self.head_dim, self.rope_base_full, self.rope_scale_full)),
+            retrieval.then_some((
                 self.retrieval_rope_dim,
                 self.rope_base_full,
                 self.rope_scale_full,
-            ),
-        }
+            )),
+        ]
+    }
+
+    fn ropes(&self, start: usize, t: usize, device: &Device) -> Ropes {
+        let [local, full, retrieval] = self
+            .rope_params()
+            .map(|p| p.map(|(dim, base, scale)| Rope::new(start, t, dim, base, scale, device)));
+        Ropes { local, full, retrieval }
     }
 
     pub fn forward(&self, x: Tensor<3>, caches: Option<&mut [LayerCache]>) -> Tensor<3> {
@@ -690,20 +781,24 @@ impl Stack {
         let device = x.device();
         let start = caches.as_ref().map_or(0, |c| c[0].len());
         let ropes = self.ropes(start, t, &device);
-        self.forward_with(x, start, &ropes, caches)
+        self.forward_with(x, start, &ropes, caches, None)
     }
 
-    /// [`Self::forward`] with the RoPE tables given.
+    /// [`Self::forward`] with the RoPE tables given, and in a captured graph each attention
+    /// layer's cache position (`steps`, by layer).
     fn forward_with(
         &self,
         x: Tensor<3>,
         start: usize,
         ropes: &Ropes,
         mut caches: Option<&mut [LayerCache]>,
+        steps: Option<&[Option<KvStep>]>,
     ) -> Tensor<3> {
         let mut x = x;
         for (i, block) in self.blocks.iter().enumerate() {
-            x = block.forward(x, start, ropes, caches.as_mut().map(|c| &mut c[i]));
+            let cache = caches.as_mut().map(|c| &mut c[i]);
+            let step = steps.and_then(|s| s[i].as_ref());
+            x = block.forward(x, start, ropes, cache, step);
         }
         self.norm.forward(x)
     }
@@ -719,15 +814,161 @@ impl Stack {
     }
 }
 
-/// One-token steps of a v2 stack (DeltaNet and retrieval layers only) as one captured CUDA
-/// graph per cache, replayed for every step.
-///
-/// With the fused kernels every launch of such a step is the same at every position: the
-/// DeltaNet kernel updates its state in place, and the retrieval kernels take the position from a
-/// device buffer and size their grids for the largest step. Before each replay the input, the
-/// RoPE tables of the position and the caches' position buffers are copied in; after it the
-/// caches' host positions advance. Stacks with attention layers, runs of more than one token,
-/// other devices or a failed capture run [`Stack::forward`] eagerly.
+/// One stack's cached step over a fixed number of tokens inside a captured CUDA graph: the
+/// RoPE tables in buffers of their own and each attention layer's cursor
+/// ([`crate::graph::CursorSet`]). With the fused kernels every launch of such a step is the same
+/// at every position: DeltaNet layers update their state in place, retrieval layers (one-token
+/// steps only) take the position from a device buffer and size their grids for the largest
+/// step, and attention layers write and mask through their cursor. Before each replay
+/// [`Self::refresh`] stages the tables and positions ([`crate::graph::Staging`]); after it
+/// [`Self::advance`] moves the caches' host positions.
+#[cfg(feature = "cuda")]
+pub(crate) struct StackStep {
+    t: usize,
+    ropes: Ropes,
+    /// Where each of `ropes`' tables (local, full, retrieval) is staged: (cos, sin) offsets.
+    staged: [Option<(usize, usize)>; 3],
+    /// Each layer's cursor (attention layers).
+    cursors: Vec<Option<usize>>,
+    /// Each retrieval layer's staged position.
+    positions: Vec<Option<usize>>,
+}
+
+/// What a warm-up step changed in one layer's cache, to undo.
+#[cfg(feature = "cuda")]
+pub(crate) enum SavedLayer {
+    Kv(crate::graph::KvSaved),
+    Delta((Tensor<4>, Tensor<3>, usize)),
+    Latent(usize),
+}
+
+#[cfg(feature = "cuda")]
+impl StackStep {
+    /// Fixed inputs for runs of `t` tokens from the caches' current position, registering the
+    /// attention caches in `set`. Fails for steps a graph cannot replay.
+    pub(crate) fn new(
+        stack: &Stack,
+        caches: &[LayerCache],
+        t: usize,
+        set: &mut crate::graph::CursorSet,
+        staging: &mut crate::graph::Staging,
+    ) -> Result<Self, String> {
+        let device = stack.norm.gamma.device();
+        let (mut cursors, mut positions) = (Vec::new(), Vec::new());
+        for cache in caches {
+            cursors.push(match cache {
+                LayerCache::Kv(kv) => Some(set.add(kv, t, staging)?),
+                _ => None,
+            });
+            positions.push(match cache {
+                LayerCache::Latent(_) if t > 1 => {
+                    return Err(format!("retrieval layers step one token at a time, not {t}"));
+                }
+                LayerCache::Latent(c) => Some(staging.add_ints(c.position().clone())),
+                _ => None,
+            });
+        }
+        let ropes = stack.ropes(caches[0].len(), t, &device);
+        let mut staged = [None; 3];
+        let mut fixed = |i: usize, r: Option<Rope>| {
+            r.map(|r| {
+                let r = r.fixed();
+                staged[i] = Some(r.add_to(staging));
+                r
+            })
+        };
+        let ropes = Ropes {
+            local: fixed(0, ropes.local),
+            full: fixed(1, ropes.full),
+            retrieval: fixed(2, ropes.retrieval),
+        };
+        Ok(Self { t, ropes, staged, cursors, positions })
+    }
+
+    /// Before a replay (or the warm-ups): stages the RoPE tables of the caches' position and
+    /// the retrieval positions, and records the attention positions in `set` (which the caller
+    /// stages with [`crate::graph::CursorSet::refresh`] before uploading).
+    pub(crate) fn refresh(
+        &self,
+        stack: &Stack,
+        caches: &[LayerCache],
+        set: &mut crate::graph::CursorSet,
+        staging: &mut crate::graph::Staging,
+    ) {
+        let start = caches[0].len();
+        let ropes = [&self.ropes.local, &self.ropes.full, &self.ropes.retrieval];
+        for ((params, staged), rope) in stack.rope_params().iter().zip(&self.staged).zip(ropes) {
+            if let (Some((_, base, scale)), Some(at), Some(rope)) = (params, staged, rope) {
+                rope.stage(staging, *at, start, *base, *scale);
+            }
+        }
+        let layers = caches.iter().zip(&self.cursors).zip(&self.positions);
+        for ((cache, cursor), position) in layers {
+            match (cache, cursor, position) {
+                (LayerCache::Kv(kv), Some(i), _) => set.sync(*i, kv),
+                (LayerCache::Latent(c), _, Some(at)) => staging.ints(*at, 1)[0] = c.len() as i32,
+                _ => {}
+            }
+        }
+    }
+
+    /// The step itself (what the graph records): `x` `[B, t, d]` through the stack, with the
+    /// cursors' slots and masks `steps` ([`crate::graph::CursorSet::steps`]).
+    pub(crate) fn run(
+        &self,
+        stack: &Stack,
+        x: Tensor<3>,
+        caches: &mut [LayerCache],
+        steps: &[KvStep],
+    ) -> Tensor<3> {
+        let layer_steps: Vec<Option<KvStep>> =
+            self.cursors.iter().map(|c| c.map(|i| steps[i].clone())).collect();
+        let start = caches[0].len();
+        stack.forward_with(x, start, &self.ropes, Some(caches), Some(&layer_steps))
+    }
+
+    /// What a warm-up run changes, to put back with [`Self::restore`].
+    pub(crate) fn save(&self, caches: &[LayerCache]) -> Vec<SavedLayer> {
+        caches
+            .iter()
+            .map(|c| match c {
+                LayerCache::Kv(kv) => SavedLayer::Kv(crate::graph::save_kv(kv, self.t)),
+                LayerCache::Delta(d) => SavedLayer::Delta(d.snapshot()),
+                LayerCache::Latent(l) => SavedLayer::Latent(l.len()),
+            })
+            .collect()
+    }
+
+    /// Undoes a warm-up run: DeltaNet states restored, attention rings put back, positions
+    /// rewound (entries written past them are overwritten by the real step).
+    pub(crate) fn restore(caches: &mut [LayerCache], saved: &[SavedLayer]) {
+        for (cache, saved) in caches.iter_mut().zip(saved) {
+            match (cache, saved) {
+                (LayerCache::Kv(kv), SavedLayer::Kv(s)) => crate::graph::restore_kv(kv, s),
+                (LayerCache::Delta(d), SavedLayer::Delta(s)) => d.restore(s.clone()),
+                (LayerCache::Latent(l), SavedLayer::Latent(len)) => l.rewind(*len),
+                _ => unreachable!("saved from the same caches"),
+            }
+        }
+    }
+
+    /// After a replay: the caches' host positions move by the step's tokens.
+    pub(crate) fn advance(&self, caches: &mut [LayerCache]) {
+        for cache in caches {
+            match cache {
+                LayerCache::Kv(kv) => kv.advance(self.t),
+                other => other.advance(self.t),
+            }
+        }
+    }
+}
+
+/// One-token steps of a stack as one captured CUDA graph per cache, replayed for every step
+/// ([`StackStep`]): the v2 backbone (DeltaNet and retrieval layers) and the fallback backbone
+/// (attention layers, through device cursors). Before each replay the input, the RoPE tables of
+/// the position and the caches' positions are copied in; after it the caches' host positions
+/// advance. Runs of more than one token, other devices or a failed capture run
+/// [`Stack::forward`] eagerly.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub struct GraphedStack {
@@ -747,7 +988,9 @@ enum StackGraphState {
 struct StackGraph {
     graph: burn::backend::BackendGraph<burn::backend::Dispatch>,
     input: Tensor<3>,
-    rope: Rope,
+    step: StackStep,
+    cursors: crate::graph::CursorSet,
+    staging: crate::graph::Staging,
     output: Tensor<3>,
 }
 
@@ -757,11 +1000,8 @@ impl GraphedStack {
     /// tensor is the graph's output buffer: use it before the next call, which overwrites it.
     /// One `GraphedStack` serves one set of caches.
     pub fn forward(&mut self, stack: &Stack, x: Tensor<3>, caches: &mut [LayerCache]) -> Tensor<3> {
-        use burn::backend::{Backend, Dispatch};
         let device = x.device();
-        let eligible =
-            x.dims()[1] == 1 && stack.graphable() && crate::fused::graphs_active(&device);
-        if !eligible {
+        if x.dims()[1] != 1 || !crate::fused::graphs_active(&device) {
             return stack.forward(x, Some(caches));
         }
         if matches!(self.state, StackGraphState::Untried) {
@@ -770,27 +1010,17 @@ impl GraphedStack {
                 Err(e) => StackGraphState::Failed(e),
             };
         }
-        let StackGraphState::Ready(g) = &self.state else {
+        let StackGraphState::Ready(g) = &mut self.state else {
             return stack.forward(x, Some(caches));
         };
-        let start = caches[0].len();
         crate::kernels::assign_into(&g.input, x, 0, 0);
-        let (cos, sin) = stack.retrieval_rope(start, &device).tables();
-        let (g_cos, g_sin) = g.rope.tables();
-        crate::kernels::assign_into(&g_cos, cos, 0, 0);
-        crate::kernels::assign_into(&g_sin, sin, 0, 0);
-        for cache in caches.iter() {
-            if let LayerCache::Latent(c) = cache {
-                c.refresh_position();
-            }
-        }
+        g.step.refresh(stack, caches, &mut g.cursors, &mut g.staging);
+        g.cursors.refresh(&mut g.staging);
+        g.staging.upload(&device);
         // Safety: the graph's buffers are held by `g`, the stack's weights and the caches, all
         // alive across the replay, and everything runs on this thread's stream.
-        unsafe { Dispatch::graph_replay(device.as_dispatch(), &g.graph) }
-            .expect("stack graph replay");
-        for cache in caches.iter_mut() {
-            cache.advance(1);
-        }
+        unsafe { crate::graph::replay(&device, &g.graph, "stack") };
+        g.step.advance(caches);
         g.output.clone()
     }
 
@@ -810,72 +1040,23 @@ impl GraphedStack {
 
 #[cfg(feature = "cuda")]
 impl Stack {
-    /// Whether every layer has a position-independent fused step (DeltaNet or retrieval).
-    fn graphable(&self) -> bool {
-        self.blocks.iter().all(|b| matches!(b.attn, Mixer::DeltaNet(_) | Mixer::Retrieval(_)))
-    }
-
-    /// The retrieval layers' RoPE tables for the one position `start`.
-    fn retrieval_rope(&self, start: usize, device: &Device) -> Rope {
-        let (base, scale) = (self.rope_base_full, self.rope_scale_full);
-        Rope::new(start, 1, self.retrieval_rope_dim, base, scale, device)
-    }
-
     /// Warms up and records one step over fixed input buffers, leaving the caches as they were.
     fn capture(&self, x: &Tensor<3>, caches: &mut [LayerCache]) -> Result<StackGraph, String> {
-        use burn::backend::{Backend, Dispatch};
         let device = x.device();
-        let dispatch = device.as_dispatch();
-        let start = caches[0].len();
+        let (mut cursors, mut staging) = Default::default();
+        let step = StackStep::new(self, caches, 1, &mut cursors, &mut staging)?;
         let input = Tensor::<3>::zeros(x.dims(), &device);
         crate::kernels::assign_into(&input, x.clone(), 0, 0);
-        let (cos, sin) = self.retrieval_rope(start, &device).tables();
-        let buffer = |t: Tensor<4>| {
-            let b = Tensor::<4>::zeros(t.dims(), &device);
-            crate::kernels::assign_into(&b, t, 0, 0);
-            b
+        step.refresh(self, caches, &mut cursors, &mut staging);
+        cursors.refresh(&mut staging);
+        staging.upload(&device);
+        let saved = step.save(caches);
+        let run = |caches: &mut [LayerCache]| {
+            staging.scatter();
+            step.run(self, input.clone(), caches, &cursors.steps())
         };
-        let rope = Rope::from_tables(buffer(cos), buffer(sin));
-        let ropes = Ropes { local: None, full: None, retrieval: Some(rope.clone()) };
-        // Warm-up runs are real steps: their writes are undone (DeltaNet states restored,
-        // retrieval positions rewound so the real step overwrites their entries).
-        let snapshot = |caches: &[LayerCache]| -> Vec<Option<(Tensor<4>, Tensor<3>, usize)>> {
-            caches
-                .iter()
-                .map(|c| match c {
-                    LayerCache::Delta(d) => Some(d.snapshot()),
-                    _ => None,
-                })
-                .collect()
-        };
-        let restore = |caches: &mut [LayerCache],
-                       saved: &[Option<(Tensor<4>, Tensor<3>, usize)>]| {
-            for (cache, saved) in caches.iter_mut().zip(saved) {
-                match (cache, saved) {
-                    (LayerCache::Delta(d), Some(s)) => d.restore(s.clone()),
-                    (LayerCache::Latent(l), _) => l.rewind(start),
-                    _ => {}
-                }
-            }
-        };
-        let saved = snapshot(caches);
-        let err = |what: &str, e: burn::tensor::ExecutionError| format!("{what}: {e:?}");
-        Dispatch::graph_prepare(dispatch).map_err(|e| err("graph_prepare", e))?;
-        for _ in 0..2 {
-            let out = self.forward_with(input.clone(), start, &ropes, Some(caches));
-            Dispatch::sync(dispatch).map_err(|e| err("warm-up", e))?;
-            drop(out);
-            restore(caches, &saved);
-        }
-        Dispatch::sync(dispatch).map_err(|e| err("restore", e))?;
-        Dispatch::graph_start_capture(dispatch).map_err(|e| err("graph_start_capture", e))?;
-        crate::fused::set_capturing(true);
-        let output = self.forward_with(input.clone(), start, &ropes, Some(caches));
-        crate::fused::set_capturing(false);
-        let graph = Dispatch::graph_stop_capture(dispatch);
-        // The recording ran nothing on the device; only the host positions moved.
-        restore(caches, &saved);
-        let graph = graph.map_err(|e| err("graph_stop_capture", e))?;
-        Ok(StackGraph { graph, input, rope, output })
+        let undo = |caches: &mut [LayerCache]| StackStep::restore(caches, &saved);
+        let (graph, output) = crate::graph::record(&device, caches, 2, run, undo)?;
+        Ok(StackGraph { graph, input, step, cursors, staging, output })
     }
 }

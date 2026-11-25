@@ -2,7 +2,6 @@
 
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig};
-use burn::tensor::module::linear as linear_op;
 use burn::tensor::{Device, Int, Tensor};
 
 use crate::cache::LayerCache;
@@ -74,7 +73,8 @@ impl TokenLm {
     fn logits(&self, x: Tensor<3>) -> Tensor<3> {
         match &self.head {
             Some(head) => head.forward(x),
-            None => linear_op(x, self.emb.weight.val().transpose(), None),
+            // The NCM's head path too: the GEMV kernel on CUDA for decode steps.
+            None => crate::fused::linear_transposed(self.emb.weight.val(), x),
         }
     }
 
@@ -117,6 +117,126 @@ impl TokenLm {
     /// One decode step for tokens `[B, 1]`; returns logits `[B, 1, V]`.
     pub fn step(&self, token: Tensor<2, Int>, caches: &mut [LayerCache]) -> Tensor<3> {
         self.forward(token, Some(caches))
+    }
+}
+
+/// The token baseline's greedy decode step as one captured CUDA graph per cache, replayed for
+/// every token: embedding, the stack step ([`crate::layers::StackStep`]: DeltaNet and retrieval
+/// layers in v2, attention layers through device cursors in the fallback design), the logits and
+/// the argmax, the same work [`crate::ncm::GraphedStep`] captures for the NCM. Before each
+/// replay the input token, the RoPE tables of the position and the cache positions are copied
+/// in; after it the host positions advance. On other devices, with the fused kernels or graphs
+/// off, or if the capture fails, [`GraphedTok::step`] runs [`TokenLm::step`] and the argmax
+/// eagerly. One `GraphedTok` serves one set of caches.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedTok {
+    state: TokState,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+enum TokState {
+    #[default]
+    Untried,
+    Failed(String),
+    Ready(Box<TokGraph>),
+}
+
+#[cfg(feature = "cuda")]
+struct TokGraph {
+    graph: burn::backend::BackendGraph<burn::backend::Dispatch>,
+    /// The input token `[B, 1]` (i32), copied in before each replay.
+    input: Tensor<2, Int>,
+    step: crate::layers::StackStep,
+    cursors: crate::graph::CursorSet,
+    staging: crate::graph::Staging,
+    /// The greedy next token `[B, 1]`.
+    output: Tensor<2, Int>,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedTok {
+    /// The greedy token `[B, 1]` after `token` `[B, 1]`, like
+    /// `argmax_last(model.step(token, caches)).reshape([B, 1])`. The returned tensor is the
+    /// graph's output buffer: read it (or pass it back in) before the next call, which
+    /// overwrites it.
+    pub fn step(
+        &mut self,
+        model: &TokenLm,
+        token: Tensor<2, Int>,
+        caches: &mut [LayerCache],
+    ) -> Tensor<2, Int> {
+        let device = token.device();
+        let [b, t] = token.dims();
+        if t == 1 && crate::fused::graphs_active(&device) {
+            if matches!(self.state, TokState::Untried) {
+                self.state = match model.capture_step(&token, caches) {
+                    Ok(graph) => TokState::Ready(Box::new(graph)),
+                    Err(e) => TokState::Failed(e),
+                };
+            }
+            if let TokState::Ready(g) = &mut self.state {
+                let token = token.cast(burn::tensor::IntDType::I32);
+                crate::kernels::assign_int_into(&g.input, token, 0, 0);
+                g.step.refresh(&model.stack, caches, &mut g.cursors, &mut g.staging);
+                g.cursors.refresh(&mut g.staging);
+                g.staging.upload(&device);
+                // Safety: the graph's buffers are held by `g`, the model's weights and the
+                // caches, all alive across the replay, and everything runs on this thread's
+                // stream.
+                unsafe { crate::graph::replay(&device, &g.graph, "token step") };
+                g.step.advance(caches);
+                return g.output.clone();
+            }
+        }
+        crate::fused::argmax_last(model.step(token, caches)).reshape([b, 1])
+    }
+
+    /// Why the step runs eagerly, if a capture was tried and failed.
+    pub fn failure(&self) -> Option<&str> {
+        match &self.state {
+            TokState::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Whether the step replays a captured graph.
+    pub fn is_captured(&self) -> bool {
+        matches!(self.state, TokState::Ready(_))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl TokenLm {
+    /// Warms up and records one greedy step over fixed input buffers, leaving the caches as
+    /// they were.
+    fn capture_step(
+        &self,
+        token: &Tensor<2, Int>,
+        caches: &mut [LayerCache],
+    ) -> Result<TokGraph, String> {
+        use crate::layers::StackStep;
+        let device = token.device();
+        let [b, _] = token.dims();
+        let (mut cursors, mut staging) = Default::default();
+        let step = StackStep::new(&self.stack, caches, 1, &mut cursors, &mut staging)?;
+        let input = Tensor::<2, Int>::zeros([b, 1], &device).cast(burn::tensor::IntDType::I32);
+        let token = token.clone().cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(&input, token, 0, 0);
+        step.refresh(&self.stack, caches, &mut cursors, &mut staging);
+        cursors.refresh(&mut staging);
+        staging.upload(&device);
+        let saved = step.save(caches);
+        let run = |caches: &mut [LayerCache]| {
+            staging.scatter();
+            let x = self.emb.forward(input.clone());
+            let h = step.run(&self.stack, x, caches, &cursors.steps());
+            crate::fused::argmax_last(self.logits(h)).reshape([b, 1])
+        };
+        let undo = |caches: &mut [LayerCache]| StackStep::restore(caches, &saved);
+        let (graph, output) = crate::graph::record(&device, caches, 2, run, undo)?;
+        Ok(TokGraph { graph, input, step, cursors, staging, output })
     }
 }
 

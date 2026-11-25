@@ -18,10 +18,14 @@ use burn::tensor::{Device, Distribution, FloatDType, Int, Tensor, TensorData};
 use ncm_model::delta::{DeltaCache, DeltaSpec, GatedDeltaNet};
 use ncm_model::fused::{active, argmax_last, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::Rope;
-use ncm_model::ncm::GraphedDecoder;
+use ncm_model::ncm::{GraphedAppend, GraphedDecoder, GraphedStep};
 use ncm_model::quant::{self, QuantSpec, format::Format};
 use ncm_model::retrieval::{LatentCache, RetrievalSpec, SparseRetrieval};
-use ncm_model::{Acceptance, NcmLm, SpecStats, Speculator, tiny_ncm, tiny_ncm_v2, tiny_v2};
+use ncm_model::tok::GraphedTok;
+use ncm_model::{
+    Acceptance, NcmLm, SpecStats, Speculator, TokenLm, tiny_ncm, tiny_ncm_v2, tiny_tok,
+    tiny_tok_v2, tiny_v2,
+};
 
 fn ints<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
     t.into_data().convert::<i64>().try_to_vec::<i64>().expect("int tensor")
@@ -95,10 +99,119 @@ fn ncm_decode(
     if graphs {
         assert!(decoder.is_captured(), "decoder not captured: {:?}", decoder.failure());
         let backbone = &cache.backbone_graph;
-        let v2 = cache.backbone.iter().all(|c| !matches!(c, ncm_model::LayerCache::Kv(_)));
-        assert_eq!(backbone.is_captured(), v2, "backbone graph: {:?}", backbone.failure());
+        assert!(backbone.is_captured(), "backbone graph: {:?}", backbone.failure());
     }
     (tokens, conds)
+}
+
+/// The 64-token prompt of the NCM checks.
+fn ncm_prompt(device: &Device) -> Tensor<2, Int> {
+    Tensor::<2, Int>::from_data(
+        TensorData::new((0..64).map(|i: i32| i * 37 % 256).collect::<Vec<_>>(), [1, 64]),
+        device,
+    )
+}
+
+/// Greedy NCM decode of `concepts` concepts after the prompt of [`ncm_decode`]: the first
+/// concept eagerly, every later one as one whole concept step ([`GraphedStep`]: append, then
+/// decode), replayed from a graph when `graphs` is on. The tokens of every concept.
+fn ncm_step_decode(model: &NcmLm, graphs: bool, concepts: usize, device: &Device) -> Vec<Vec<i64>> {
+    set_cuda_graphs(graphs);
+    let mut cache = model.make_cache(64 + 4 * concepts + 4, 1, device);
+    let cond = model.prefill(ncm_prompt(device), &mut cache, 16);
+    let (mut next, _) = model.decode_concept(cond, &mut cache, None, false);
+    let mut graphed = GraphedStep::default();
+    let mut tokens = vec![ints(next.clone())];
+    for _ in 1..concepts {
+        next = graphed.step(model, next, &mut cache);
+        tokens.push(ints(next.clone()));
+    }
+    set_cuda_graphs(true);
+    assert_eq!(graphed.is_captured(), graphs, "concept step graph: {:?}", graphed.failure());
+    tokens
+}
+
+/// The whole-concept-step graph (encoder, cross-attention keys, pooling, backbone step,
+/// decoder, argmax in one replay) gives the same tokens as the same kernels run eagerly,
+/// concept after concept, in both designs, with the linear layers dense or quantised per
+/// `spec`. The tiny configs fill the 8-token encoder ring during the prompt, so the step is
+/// captured on the second concept; the fallback backbone's sliding rings (4 concepts) wrap and
+/// its full layers grow inside the graph, and the v2 retrieval turns sparse within the run.
+pub fn graphed_step_matches(device: &Device, spec: Option<QuantSpec>) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        let model = build_ncm(&cfg, spec, device);
+        let eager = ncm_step_decode(&model, false, 12, device);
+        let graphed = ncm_step_decode(&model, true, 12, device);
+        for (concept, (te, tg)) in eager.iter().zip(&graphed).enumerate() {
+            assert_eq!(tg, te, "{} concept {concept}: tokens differ", cfg.attention.name());
+        }
+    }
+}
+
+/// The append-only graph ([`GraphedAppend`], what self-speculation uses) gives the same
+/// conditions as `append_tokens` run eagerly, concept after concept, both designs.
+pub fn graphed_append_matches(device: &Device, tol: f32) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        let model = build_ncm(&cfg, None, device);
+        let run = |graphs: bool| {
+            set_cuda_graphs(graphs);
+            let mut cache = model.make_cache(64 + 4 * 12 + 4, 1, device);
+            model.prefill(ncm_prompt(device), &mut cache, 16);
+            let mut append = GraphedAppend::default();
+            let mut conds = Vec::new();
+            for concept in 0..12 {
+                // Fixed tokens: the conditions alone are compared.
+                let written: Vec<i32> = (0..4).map(|j| (concept * 11 + j * 5) % 256).collect();
+                let written = Tensor::<2, Int>::from_data(TensorData::new(written, [1, 4]), device);
+                let cond = append.append(&model, written, &mut cache);
+                conds.push(values(cond.clone()));
+            }
+            set_cuda_graphs(true);
+            assert_eq!(append.is_captured(), graphs, "append graph: {:?}", append.failure());
+            conds
+        };
+        let (eager, graphed) = (run(false), run(true));
+        for (concept, (e, g)) in eager.iter().zip(&graphed).enumerate() {
+            let err = rel_error(g, e);
+            eprintln!("{} concept {concept}: condition error {err:.2e}", cfg.attention.name());
+            assert!(err <= tol, "concept {concept}: conditions differ by {err:.2e}");
+        }
+    }
+}
+
+/// Greedy token-baseline decode of `steps` tokens after a 16-token prompt, through
+/// [`GraphedTok`] (graphs on) or the same kernels eagerly.
+fn tok_decode(model: &TokenLm, graphs: bool, steps: usize, device: &Device) -> Vec<i64> {
+    set_cuda_graphs(graphs);
+    let prompt = Tensor::<2, Int>::from_data(
+        TensorData::new((0..16).map(|i: i32| i * 37 % 256).collect::<Vec<_>>(), [1, 16]),
+        device,
+    );
+    let mut caches = model.make_cache(16 + steps + 1, 1, device);
+    model.prefill(prompt.clone().narrow(1, 0, 15), &mut caches, 8);
+    let mut token = prompt.narrow(1, 15, 1);
+    let mut graphed = GraphedTok::default();
+    let mut tokens = Vec::new();
+    for _ in 0..steps {
+        token = graphed.step(model, token, &mut caches);
+        tokens.extend(ints(token.clone()));
+    }
+    set_cuda_graphs(true);
+    assert_eq!(graphed.is_captured(), graphs, "token step graph: {:?}", graphed.failure());
+    tokens
+}
+
+/// The token baseline's graphed step (embedding, stack, logits, argmax) gives the same tokens
+/// as the same kernels run eagerly, both designs: the fallback's 8-token sliding rings wrap
+/// and its full layers grow inside the graph; the v2 retrieval turns sparse.
+pub fn graphed_tok_matches(device: &Device, spec: Option<QuantSpec>) {
+    for cfg in [tiny_tok(8), tiny_tok_v2(tiny_v2(4, 2, 8))] {
+        device.seed(9);
+        let model = quant::build(spec, || TokenLm::new(&cfg, device));
+        let eager = tok_decode(&model, false, 40, device);
+        let graphed = tok_decode(&model, true, 40, device);
+        assert_eq!(graphed, eager, "{}: graphed tokens differ", cfg.attention.name());
+    }
 }
 
 /// The quantisations the graphed-decode checks run with: q8, and q4 in groups of 64 with the

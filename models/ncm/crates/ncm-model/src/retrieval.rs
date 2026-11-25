@@ -103,6 +103,13 @@ impl LatentCache {
         crate::kernels::assign_int_into(&self.position, pos, 0, 0);
     }
 
+    /// The device buffer of the next position (`[1]`, i32) the fused kernels read; a captured
+    /// graph copies staged positions into it ([`crate::graph::Staging`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn position(&self) -> &Tensor<1, Int> {
+        &self.position
+    }
+
     /// Advances the position by `t` without writing (a replayed graph wrote the entries).
     #[cfg(feature = "cuda")]
     pub(crate) fn advance(&mut self, t: usize) {

@@ -128,6 +128,14 @@ pub trait NcmKernels: Backend {
         at: usize,
     ) -> FloatTensor<Self>;
 
+    /// See [`assign_into_at`].
+    fn ncm_assign_at(
+        dst: FloatTensor<Self>,
+        src: FloatTensor<Self>,
+        axis: usize,
+        at: IntTensor<Self>,
+    ) -> FloatTensor<Self>;
+
     /// See [`delta_step`].
     #[allow(clippy::too_many_arguments)]
     fn ncm_delta_step(
@@ -324,6 +332,29 @@ impl NcmKernels for CubeBackend {
                 count,
                 axis,
                 at,
+                dtype,
+            );
+        }
+        dst
+    }
+
+    fn ncm_assign_at(dst: CubeTensor, src: CubeTensor, axis: usize, at: CubeTensor) -> CubeTensor {
+        let count = src.meta.shape().num_elements();
+        if count == 0 {
+            return dst;
+        }
+        let dtype = elem(dst.dtype);
+        let client = dst.client.clone();
+        unsafe {
+            assign::assign_at_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(count.div_ceil(assign::CUBE) as u32, 1, 1),
+                CubeDim::new_1d(assign::CUBE as u32),
+                dst.clone().into_tensor_arg(),
+                src.into_tensor_arg(),
+                at.into_tensor_arg(),
+                count,
+                axis,
                 dtype,
             );
         }
@@ -625,6 +656,18 @@ pub fn argmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D, Int> {
 pub fn assign_into<const D: usize>(dst: &Tensor<D>, src: Tensor<D>, axis: usize, at: usize) {
     let dst = dst.clone().into_dispatch();
     drop(<Dispatch as NcmKernels>::ncm_assign(dst, src.into_dispatch(), axis, at));
+}
+
+/// [`assign_into`] at the offset held by the device tensor `at` (`[1]`, i32) rather than a launch
+/// argument: a captured graph writes wherever the host last put the position.
+pub fn assign_into_at<const D: usize>(
+    dst: &Tensor<D>,
+    src: Tensor<D>,
+    axis: usize,
+    at: &Tensor<1, Int>,
+) {
+    let (dst, at) = (dst.clone().into_dispatch(), at.clone().into_dispatch());
+    drop(<Dispatch as NcmKernels>::ncm_assign_at(dst, src.into_dispatch(), axis, at));
 }
 
 /// `x` itself when its layout is packed row-major, otherwise a packed copy (cubecl pitches the

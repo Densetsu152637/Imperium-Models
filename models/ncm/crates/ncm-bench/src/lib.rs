@@ -19,7 +19,9 @@ use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
-use ncm_model::fused::{argmax_last, kernels_built, set_cuda_graphs, set_fused_kernels};
+#[cfg(not(feature = "cuda"))]
+use ncm_model::fused::argmax_last;
+use ncm_model::fused::{kernels_built, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
 use ncm_model::quant::{self, QuantSpec};
 use ncm_model::{
@@ -135,8 +137,8 @@ pub struct Cli {
     /// `--features cuda` build uses by default).
     #[arg(long)]
     pub reference_kernels: bool,
-    /// Run the fused kernels eagerly instead of replaying the NCM decoder and v2 backbone steps
-    /// as captured CUDA graphs.
+    /// Run the fused kernels eagerly instead of replaying the decode steps (NCM concept steps,
+    /// token-baseline steps) as captured CUDA graphs.
     #[arg(long)]
     pub no_cuda_graphs: bool,
     /// Also decode the NCM by self-speculation (the token baseline always decodes plainly).
@@ -271,36 +273,51 @@ fn run_once(
             let concepts = new_tokens / m.concept_size();
             match mode {
                 Decode::Plain => {
-                    // On CUDA with the fused kernels on, the decoder replays one captured graph
-                    // per concept (captured on the first concept once the cross-attention ring
-                    // is full).
+                    // The first concept decodes eagerly from the prompt's condition. On CUDA
+                    // with the fused kernels on, every later concept is one captured graph
+                    // replay: append the concept just written, then decode the next one
+                    // (captured once the cross-attention ring is full).
+                    let (mut tokens, _) = m.decode_concept(cond, &mut cache, None, false);
                     #[cfg(feature = "cuda")]
-                    let mut graphed = ncm_model::ncm::GraphedDecoder::default();
-                    for c in 0..concepts {
+                    let mut graphed = ncm_model::ncm::GraphedStep::default();
+                    for _ in 1..concepts {
                         #[cfg(feature = "cuda")]
-                        let tokens = graphed.decode(m, cond.clone(), &mut cache);
+                        {
+                            tokens = graphed.step(m, tokens, &mut cache);
+                        }
                         #[cfg(not(feature = "cuda"))]
-                        let (tokens, _) = m.decode_concept(cond.clone(), &mut cache, None, false);
-                        if c + 1 < concepts {
-                            cond = m.append_tokens(tokens, &mut cache);
+                        {
+                            let cond = m.append_tokens(tokens, &mut cache);
+                            tokens = m.decode_concept(cond, &mut cache, None, false).0;
                         }
                     }
+                    drop(tokens);
                     #[cfg(feature = "cuda")]
                     if let Some(why) = graphed.failure() {
-                        eprintln!("ncm-bench: decoder graph not captured, decoding eagerly: {why}");
+                        eprintln!("ncm-bench: concept step not captured, eager: {why}");
                     }
                 }
                 Decode::Speculative(acceptance) => {
-                    // The draft and verify passes replay CUDA graphs likewise.
+                    // The draft and verify passes replay CUDA graphs likewise, and so does
+                    // appending each written concept.
                     let mut speculator = Speculator::new(acceptance);
+                    #[cfg(feature = "cuda")]
+                    let mut append = ncm_model::ncm::GraphedAppend::default();
                     for c in 0..concepts {
                         let tokens = speculator.decode(m, cond.clone(), &cache);
                         if c + 1 < concepts {
-                            cond = m.append_tokens(tokens, &mut cache);
+                            #[cfg(feature = "cuda")]
+                            {
+                                cond = append.append(m, tokens, &mut cache);
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                cond = m.append_tokens(tokens, &mut cache);
+                            }
                         }
                     }
                     #[cfg(feature = "cuda")]
-                    if let Some(why) = speculator.failure() {
+                    if let Some(why) = speculator.failure().or(append.failure()) {
                         eprintln!("ncm-bench: speculative graphs not captured, eager: {why}");
                     }
                     spec = Some(speculator.stats());
@@ -316,8 +333,23 @@ fn run_once(
             sync(device);
             let prefilled = Instant::now();
             let mut token = prompt.clone().narrow(1, context - 1, 1);
+            // On CUDA with the fused kernels on, every step is one captured graph replay
+            // (embedding, stack, logits, argmax), as the NCM's concept steps are.
+            #[cfg(feature = "cuda")]
+            let mut graphed = ncm_model::tok::GraphedTok::default();
             for _ in 0..new_tokens {
-                token = argmax_last(m.step(token, &mut caches)).reshape([1, 1]);
+                #[cfg(feature = "cuda")]
+                {
+                    token = graphed.step(m, token, &mut caches);
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    token = argmax_last(m.step(token, &mut caches)).reshape([1, 1]);
+                }
+            }
+            #[cfg(feature = "cuda")]
+            if let Some(why) = graphed.failure() {
+                eprintln!("ncm-bench: token step not captured, eager: {why}");
             }
             (started, prefilled)
         }
