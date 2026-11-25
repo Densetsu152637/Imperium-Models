@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: [emperor, consul]
+        model: [emperor, consul, ncm]
     name: checks (${{ matrix.model }})
     runs-on: ubuntu-latest
     timeout-minutes: 10

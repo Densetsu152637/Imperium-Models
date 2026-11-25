@@ -1,6 +1,6 @@
 # NCM: Next Concept Modelling models for Imperium
 
-Training code, configs and the inference runtime for the 250M Next Concept Modelling (NCM) versions of Emperor and Consul, plus the same-size token baselines they are compared with. Nothing is built or trained yet.
+Training code, configs and the inference runtime for the 250M Next Concept Modelling (NCM) versions of Emperor and Consul, plus the same-size token baselines they are compared with. Stage 1 (design freeze and speed gate) code is in: both models with random weights, tests, and the `ncm-bench` decode-speed benchmark. Nothing is trained yet.
 
 The design, plan and acceptance checks live in Imperium-Research under `docs/next-concept-modelling/` (roadmap R4). This folder holds code and data only.
 

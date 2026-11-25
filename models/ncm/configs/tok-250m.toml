@@ -1,0 +1,16 @@
+# Token baseline: plain decoder-only transformer, same tokenizer, heads and layer pattern as NCM.
+model = "tok"
+vocab_size = 32000
+d_model = 1024
+n_layers = 20
+n_heads = 16
+n_kv_heads = 4
+head_dim = 64
+ff_dim = 2688
+window = 4096        # tokens, sliding layers
+full_every = 4       # every 4th layer attends over the whole context
+rope_base = 10000.0
+rope_base_full = 1000000.0
+rope_scale = 1.0
+rope_scale_full = 1.0
+norm_eps = 1e-6
