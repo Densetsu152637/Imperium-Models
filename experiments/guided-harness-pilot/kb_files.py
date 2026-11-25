@@ -22,6 +22,9 @@ def write(dest, kb_path):
     buckets = {f: [] for f, _, _ in TOPICS}
     buckets["other-facts.md"] = []
     for p in kb:
+        if p.get("topic"):
+            buckets.setdefault(p["topic"], []).append(p)
+            continue
         for f, _, rx in TOPICS:
             if re.search(rx, p["text"]):
                 buckets[f].append(p)
@@ -29,7 +32,9 @@ def write(dest, kb_path):
         else:
             buckets["other-facts.md"].append(p)
     index = ["# Knowledge base index", "", "Facts about a fictional world, one fact per line as `[ID] text`.", ""]
-    for f, title, _ in TOPICS + [("other-facts.md", "Other facts: calendars, measures, rules", "")]:
+    extra = [(f, "Additional facts: " + f[:-3].replace("-", " "), "") for f in buckets
+             if f not in {t[0] for t in TOPICS} and f != "other-facts.md"]
+    for f, title, _ in TOPICS + [("other-facts.md", "Other facts: calendars, measures, rules", "")] + extra:
         rows = sorted(buckets[f], key=lambda p: p["id"])
         if not rows:
             continue

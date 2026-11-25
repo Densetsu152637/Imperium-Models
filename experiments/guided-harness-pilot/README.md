@@ -12,6 +12,7 @@ not training data. Scoring is deterministic; there is no LLM judge.
 |---|---|
 | `plain` | One call, question only, greedy. |
 | `rag` | One call, question plus top-5 BM25 passages, greedy. |
+| `harness_refined` | Imperium with the harness variant in `config/harness-variants/refined.toml` (evidence policy, 4 tools, `--permission-mode full` so `run_command` works in the scratch workspace). |
 | `harness` | Imperium's own agent loop via `imperium run --headless`; KB as markdown files in a per-item scratch workspace copy (`kb_files.py`, `imperium_backend.py`). `harness_note` is the same with one extra prompt sentence (real-world, arithmetic and logic questions need no workspace), for wording parity with `rag`. |
 
 ## Layout
@@ -62,3 +63,12 @@ arm, create `imperium_backend.py` exposing `run_imperium(task, bm25, meter)`; `r
 when the module imports.
 
 Requires the Imperium daemon's local pipe (`daemon.socket = true`; Imperium-AI PR #273). Flags used: `--local --thinking off --context-tokens 16384 --timeout-s 300 --flag max_steps=20 --permission-mode default`. Run `python run.py --arm harness` and `--arm harness_note` after starting the same llama-server.
+
+## Dev and hard suites
+
+`suite/tasks.jsonl` (135 items, dev, used to tune the variant) and `suite/hard_tasks.jsonl` (72 items, held out,
+authored after the variant was frozen; knowledge base `suite/hard_merged_kb.jsonl` = `kb.jsonl` + `hard_kb.jsonl`).
+Select with `GHP_SUITE=hard` (also for `validate_suite.py` and `rescore.py`) and `--out results_hard`.
+Scoring is strict (see `scoring.py`); `rescore.py` re-scores saved outputs, keeping the earlier verdict as
+`correct_lenient`. `build_variant.py` writes a variant TOML; iteration bodies are in
+`config/harness-variants/iterations/`, iteration results in `results/iterations/`.

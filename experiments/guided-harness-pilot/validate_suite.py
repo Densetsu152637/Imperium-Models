@@ -4,9 +4,11 @@ import pathlib
 import sys
 from collections import Counter
 
+import suite_cfg
+
 HERE = pathlib.Path(__file__).parent
-kb = [json.loads(line) for line in open(HERE / "suite/kb.jsonl", encoding="utf-8")]
-tasks = [json.loads(line) for line in open(HERE / "suite/tasks.jsonl", encoding="utf-8")]
+kb = [json.loads(line) for line in open(suite_cfg.KB, encoding="utf-8")]
+tasks = [json.loads(line) for line in open(suite_cfg.TASKS, encoding="utf-8")]
 errors = []
 kb_ids = [p["id"] for p in kb]
 if len(set(kb_ids)) != len(kb_ids):
@@ -17,7 +19,9 @@ task_ids = [t["id"] for t in tasks]
 if len(set(task_ids)) != len(task_ids):
     errors.append("duplicate task ids")
 text = {p["id"]: p["text"] for p in kb}
-KB_CATS = {"single_hop", "multi_hop", "compare_aggregate", "kb_override", "compute"}
+KB_CATS = {"single_hop", "multi_hop", "compare_aggregate", "kb_override", "compute", "hard_chain", "hard_distractor",
+           "hard_temporal", "hard_filter", "hard_compute", "hard_counterfactual", "hard_mixed"}
+GOLD_IN_SUPPORT = {"single_hop", "multi_hop", "hard_chain", "hard_distractor", "hard_temporal", "hard_filter"}
 for t in tasks:
     for k in ("id", "category", "question", "answer", "answer_type", "support"):
         if k not in t:
@@ -31,20 +35,20 @@ for t in tasks:
         errors.append(f"{t['id']}: KB item without support")
     if t["category"] in ("arithmetic", "logic", "general_knowledge", "unanswerable") and t["support"]:
         errors.append(f"{t['id']}: should have no support")
-    if t["category"] in ("single_hop", "multi_hop", "kb_override") and t["answer_type"] == "string":
+    if t["category"] in GOLD_IN_SUPPORT and t["answer_type"] == "string":
         blob = " ".join(text[s] for s in t["support"]).lower()
-        if str(t["answer"]).lower() not in blob and t["category"] != "kb_override":
+        if str(t["answer"]).lower() not in blob:
             errors.append(f"{t['id']}: gold {t['answer']!r} not in its support passages")
-    if t["category"] == "unanswerable":
+    if t["category"] == "unanswerable" or t["answer_type"] == "abstain":
         ent, kws = t["absent"]["entity"].lower(), [k.lower() for k in t["absent"]["keywords"]]
         for p in kb:
             low = p["text"].lower()
             if ent in low and any(k in low for k in kws):
                 errors.append(f"{t['id']}: answer may be present in {p['id']}: {p['text']}")
-        if t["answer_type"] != "abstain":
-            errors.append(f"{t['id']}: unanswerable must be abstain type")
+        if t["answer_type"] != "abstain" or t["support"]:
+            errors.append(f"{t['id']}: unanswerable must be abstain type without support")
 cats = Counter(t["category"] for t in tasks)
-if len(tasks) < 120 or len(cats) < 6:
+if len(tasks) < (60 if suite_cfg.HARD else 120) or len(cats) < 6:
     errors.append(f"too few items/categories: {len(tasks)} / {len(cats)}")
 print(f"{len(kb)} passages, {len(tasks)} tasks, categories: {dict(cats)}")
 if errors:

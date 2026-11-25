@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 
 import kb_files
+import suite_cfg
 
 HERE = pathlib.Path(__file__).parent
 IMPERIUM = os.environ.get("IMPERIUM_EXE", r"C:\Users\Nicholas\AppData\Local\Imperium\imperium.exe")
@@ -47,7 +48,7 @@ def _compact_trace(transcript):
 
 def run_imperium(task, bm25, meter, note=False, variant=None):
     ws = _scratch / task["id"]
-    kb_files.write(ws, HERE / "suite/kb.jsonl")
+    kb_files.write(ws, suite_cfg.KB)
     prompt = f"{INSTRUCTION}{NOTE if note else ''}\n\nQuestion: {task['question']}"
     cmd = [IMPERIUM, "run", "--headless", "--json", "--root-model", ENDPOINT, "--model-id", MODEL_ID,
            "--workspace", str(ws), "--task", prompt] + FLAGS

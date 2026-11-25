@@ -15,6 +15,8 @@ from bm25 import BM25
 from grounding import grounded, grounded_all
 from scoring import score
 
+import suite_cfg
+
 HERE = pathlib.Path(__file__).parent
 # Pluggable backends: fn(task, bm25, meter) -> {"final_text": str, ...optional extras}. The harness arm is
 # registered below once its backend (Imperium headless) is available.
@@ -35,7 +37,7 @@ def main():
     ap.add_argument("--per-cat", type=int, default=0)
     ap.add_argument("--ids", default="")
     a = ap.parse_args()
-    tasks = [json.loads(line) for line in open(HERE / "suite/tasks.jsonl", encoding="utf-8")]
+    tasks = [json.loads(line) for line in open(suite_cfg.TASKS, encoding="utf-8")]
     if a.ids:
         want = set(a.ids.split(","))
         tasks = [t for t in tasks if t["id"] in want]
@@ -52,7 +54,7 @@ def main():
     done = set()
     if path.exists():
         done = {json.loads(line)["id"] for line in open(path, encoding="utf-8")}
-    bm25 = BM25(HERE / "suite/kb.jsonl")
+    bm25 = BM25(suite_cfg.KB)
     llm.chat([{"role": "user", "content": "Say OK."}], llm.Meter(), max_tokens=4)  # warm-up, not recorded
     fn = ARMS[a.arm]
     t_start = time.time()

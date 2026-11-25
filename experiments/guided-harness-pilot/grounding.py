@@ -9,15 +9,19 @@ import pathlib
 import re
 
 import kb_files
+import suite_cfg
 
 HERE = pathlib.Path(__file__).parent
 
 
 def _files():
-    kb = [json.loads(line) for line in open(HERE / "suite/kb.jsonl", encoding="utf-8")]
+    kb = [json.loads(line) for line in open(suite_cfg.KB, encoding="utf-8")]
     buckets = {f: [] for f, _, _ in kb_files.TOPICS}
     buckets["other-facts.md"] = []
     for p in kb:
+        if p.get("topic"):
+            buckets.setdefault(p["topic"], []).append(p)
+            continue
         for f, _, rx in kb_files.TOPICS:
             if re.search(rx, p["text"]):
                 buckets[f].append(p)
