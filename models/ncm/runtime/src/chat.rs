@@ -1,7 +1,7 @@
 //! The NCM chat format: rendering conversations to the text the models were fine-tuned on, and
 //! parsing generated output back into reasoning, content and tool calls.
 //!
-//! The format mirrors `ncm-sft`'s `format.rs` exactly (stage 3 defines it):
+//! The format is rendered by the shared `ncm_model::chat` (stage 3 defines it):
 //!
 //! ```text
 //! <|im_start|>system
@@ -36,13 +36,12 @@
 //! body ends with a newline before `<|im_end|>`. A request ends with the open generation prompt
 //! `<|im_start|>assistant\n`.
 
+use ncm_model::chat as shared;
 use serde_json::Value;
 
-use crate::vocab::{SPECIAL_TOKENS, Specials, Utf8Stream, Vocab};
+use crate::vocab::{Specials, Utf8Stream, Vocab};
 
 pub const GENERATION_PROMPT: &str = "<|im_start|>assistant\n";
-const TOOLS_OPEN: &str = "<tools>";
-const TOOLS_CLOSE: &str = "</tools>";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -54,11 +53,15 @@ pub enum Role {
 
 impl Role {
     pub fn as_str(self) -> &'static str {
+        self.shared().as_str()
+    }
+
+    fn shared(self) -> shared::Role {
         match self {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
+            Role::System => shared::Role::System,
+            Role::User => shared::Role::User,
+            Role::Assistant => shared::Role::Assistant,
+            Role::Tool => shared::Role::Tool,
         }
     }
 
@@ -104,122 +107,68 @@ pub struct ToolDef {
     pub parameters: Value,
 }
 
-/// Every tag that is a reserved token, plus the tool block tags.
-fn reserved() -> impl Iterator<Item = &'static str> {
-    SPECIAL_TOKENS.into_iter().chain([TOOLS_OPEN, TOOLS_CLOSE])
-}
-
 /// Makes text safe to encode: a reserved tag written in message content must not become the
-/// control token (`<|im_end|>` in a user message would end the turn). One space after the `<`
-/// defuses it, as the data pipeline does for documents.
+/// control token (`<|im_end|>` in a user message would end the turn). This is the shared rule
+/// of `ncm_model::chat::defuse`, the same one the data pipeline applies to documents.
 pub fn defuse(text: &str) -> String {
-    if !text.contains('<') {
-        return text.to_owned();
-    }
-    let mut out = text.to_owned();
-    for tag in reserved() {
-        if out.contains(tag) {
-            out = out.replace(tag, &format!("< {}", &tag[1..]));
+    shared::defuse(text).into_owned()
+}
+
+/// [`defuse`] every string inside a JSON value.
+fn defuse_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(defuse(s)),
+        Value::Array(items) => Value::Array(items.iter().map(defuse_value).collect()),
+        Value::Object(map) => {
+            Value::Object(map.iter().map(|(k, v)| (k.clone(), defuse_value(v))).collect())
         }
+        other => other.clone(),
     }
-    out
 }
 
-fn json_string(text: &str) -> String {
-    Value::String(text.to_owned()).to_string()
+fn shared_tool(tool: &ToolDef) -> shared::ToolDef {
+    shared::ToolDef {
+        name: defuse(&tool.name),
+        description: defuse(&tool.description),
+        parameters: defuse_value(&tool.parameters),
+    }
 }
 
-/// One compact definition line, in the key order `name`, `description`, `parameters`.
-fn tool_line(tool: &ToolDef) -> String {
-    format!(
-        "{{\"name\":{},\"description\":{},\"parameters\":{}}}",
-        json_string(&tool.name),
-        json_string(&tool.description),
-        tool.parameters
-    )
+/// Arguments that parse as JSON are written compactly; anything else becomes a JSON string so
+/// the line stays valid JSON.
+fn shared_call(call: &ToolCall) -> shared::ToolCall {
+    let arguments = serde_json::from_str::<Value>(&call.arguments)
+        .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+    shared::ToolCall {
+        id: call.id.clone(),
+        name: defuse(&call.name),
+        arguments: defuse_value(&arguments),
+    }
+}
+
+fn shared_message(message: &Message) -> shared::Message {
+    shared::Message {
+        role: message.role.shared(),
+        content: defuse(&message.content),
+        reasoning: message.reasoning.as_deref().map(defuse),
+        tool_calls: message.tool_calls.iter().map(shared_call).collect(),
+        tool_call_id: None,
+    }
 }
 
 /// The `<tools>` block.
 pub fn tools_block(tools: &[ToolDef]) -> String {
-    let mut block = String::from(TOOLS_OPEN);
-    block.push('\n');
-    for tool in tools {
-        block.push_str(&defuse(&tool_line(tool)));
-        block.push('\n');
-    }
-    block.push_str(TOOLS_CLOSE);
-    block
-}
-
-/// A tool call in the form the model writes it. `arguments` that parse as JSON are written
-/// compactly; anything else is written as a JSON string so the line stays valid JSON.
-pub fn tool_call_text(call: &ToolCall) -> String {
-    let arguments = match serde_json::from_str::<Value>(&call.arguments) {
-        Ok(value) => value.to_string(),
-        Err(_) => json_string(&call.arguments),
-    };
-    format!(
-        "<tool_call>\n{{\"name\":{},\"arguments\":{}}}\n</tool_call>",
-        json_string(&call.name),
-        defuse(&arguments)
-    )
-}
-
-fn push_turn(text: &mut String, role: &str, body: &str) {
-    text.push_str("<|im_start|>");
-    text.push_str(role);
-    text.push('\n');
-    text.push_str(body);
-    text.push_str("<|im_end|>\n");
-}
-
-fn assistant_body(message: &Message) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(reasoning) = message.reasoning.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
-        parts.push(format!("<think>\n{}\n</think>", defuse(reasoning)));
-    }
-    let content = message.content.trim();
-    if !content.is_empty() {
-        parts.push(defuse(content));
-    }
-    parts.extend(message.tool_calls.iter().map(tool_call_text));
-    let mut body = parts.join("\n");
-    body.push('\n');
-    body
+    let tools: Vec<_> = tools.iter().map(shared_tool).collect();
+    shared::render_tools_block(&tools)
 }
 
 /// Renders a conversation as NCM chat text, ending with the generation prompt when
-/// `generation_prompt` is set. A leading system message and the tool definitions share the
-/// system turn.
+/// `generation_prompt` is set. The text comes from the one shared renderer; this only maps the
+/// wire types and defuses reserved tags in everything the client sent.
 pub fn render(messages: &[Message], tools: &[ToolDef], generation_prompt: bool) -> String {
-    let mut text = String::new();
-    let system = messages.first().filter(|m| m.role == Role::System);
-    let block = (!tools.is_empty()).then(|| tools_block(tools));
-    let system_body = match (system, &block) {
-        (Some(s), Some(b)) => Some(format!("{}\n\n{b}\n", defuse(s.content.trim()))),
-        (Some(s), None) => Some(format!("{}\n", defuse(s.content.trim()))),
-        (None, Some(b)) => Some(format!("{b}\n")),
-        (None, None) => None,
-    };
-    if let Some(body) = system_body {
-        push_turn(&mut text, "system", &body);
-    }
-    for message in messages.iter().skip(usize::from(system.is_some())) {
-        match message.role {
-            Role::System | Role::User => {
-                let body = format!("{}\n", defuse(message.content.trim()));
-                push_turn(&mut text, message.role.as_str(), &body);
-            }
-            Role::Tool => {
-                let body = format!(
-                    "<tool_response>\n{}\n</tool_response>\n",
-                    defuse(message.content.trim())
-                );
-                push_turn(&mut text, "tool", &body);
-            }
-            Role::Assistant => push_turn(&mut text, "assistant", &assistant_body(message)),
-        }
-    }
+    let messages: Vec<_> = messages.iter().map(shared_message).collect();
+    let tools: Vec<_> = tools.iter().map(shared_tool).collect();
+    let mut text = shared::render(&messages, &tools).text;
     if generation_prompt {
         text.push_str(GENERATION_PROMPT);
     }

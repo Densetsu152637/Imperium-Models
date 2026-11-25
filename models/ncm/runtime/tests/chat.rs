@@ -27,7 +27,7 @@ fn plain_turns_match_the_sft_format() {
         render(&messages, &[], false),
         "<|im_start|>system\nYou are Emperor.\n<|im_end|>\n\
          <|im_start|>user\nHello\n<|im_end|>\n\
-         <|im_start|>assistant\nHi.\n<|im_end|>\n"
+         <|im_start|>assistant\n<think>\n\n</think>\nHi.\n<|im_end|>\n"
     );
 }
 
@@ -103,7 +103,7 @@ fn tool_calls_and_responses_match_the_sft_format() {
          <tool_call>\n{\"name\":\"web_search\",\"arguments\":{\"query\":\"rust\"}}\n</tool_call>\n\
          <|im_end|>\n\
          <|im_start|>tool\n<tool_response>\nresult text\n</tool_response>\n<|im_end|>\n\
-         <|im_start|>assistant\nDone.\n<|im_end|>\n"
+         <|im_start|>assistant\n<think>\n\n</think>\nDone.\n<|im_end|>\n"
     );
 }
 
