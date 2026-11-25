@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
-use ncm_model::fused::{kernels_built, set_fused_kernels};
+use ncm_model::fused::{argmax_last, kernels_built, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
 use ncm_model::{
     Config, Design, NcmLm, TokenLm, cache_bytes, cache_bytes_with, ncm_250m_of, tiny_ncm,
@@ -184,11 +184,22 @@ fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &
             sync(device);
             let prefilled = Instant::now();
             let concepts = new_tokens / m.concept_size();
+            // On CUDA with the fused kernels on, the decoder replays one captured graph per
+            // concept (captured on the first concept once the cross-attention ring is full).
+            #[cfg(feature = "cuda")]
+            let mut graphed = ncm_model::ncm::GraphedDecoder::default();
             for c in 0..concepts {
+                #[cfg(feature = "cuda")]
+                let tokens = graphed.decode(m, cond.clone(), &mut cache);
+                #[cfg(not(feature = "cuda"))]
                 let (tokens, _) = m.decode_concept(cond.clone(), &mut cache, None, false);
                 if c + 1 < concepts {
                     cond = m.append_tokens(tokens, &mut cache);
                 }
+            }
+            #[cfg(feature = "cuda")]
+            if let Some(why) = graphed.failure() {
+                eprintln!("ncm-bench: decoder graph not captured, decoding eagerly: {why}");
             }
             (started, prefilled)
         }
@@ -201,7 +212,7 @@ fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &
             let prefilled = Instant::now();
             let mut token = prompt.clone().narrow(1, context - 1, 1);
             for _ in 0..new_tokens {
-                token = m.step(token, &mut caches).argmax(2).reshape([1, 1]);
+                token = argmax_last(m.step(token, &mut caches)).reshape([1, 1]);
             }
             (started, prefilled)
         }

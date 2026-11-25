@@ -4,11 +4,14 @@
 //! layers through a Burn backend extension routed to the cubecl backend. The layers call them only
 //! where [`crate::fused::active`] says so; everything else runs the reference tensor code.
 
+mod argmax;
+mod assign;
 mod delta;
 mod retrieval;
 
-use burn::backend::{Backend, Dispatch, backend_extension, tensor::FloatTensor};
-use burn::tensor::{DType, Tensor};
+use burn::backend::tensor::{FloatTensor, IntTensor};
+use burn::backend::{Backend, Dispatch, backend_extension};
+use burn::tensor::{DType, Int, Tensor};
 use burn_cubecl::cubecl::prelude::*;
 use burn_cubecl::cubecl::{CubeCount, CubeDim};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
@@ -77,6 +80,17 @@ impl RetrievalDims {
 
 #[backend_extension(Cube)]
 pub trait NcmKernels: Backend {
+    /// See [`argmax_last`].
+    fn ncm_argmax(x: FloatTensor<Self>) -> IntTensor<Self>;
+
+    /// See [`assign_into`].
+    fn ncm_assign(
+        dst: FloatTensor<Self>,
+        src: FloatTensor<Self>,
+        axis: usize,
+        at: usize,
+    ) -> FloatTensor<Self>;
+
     /// See [`delta_step`].
     #[allow(clippy::too_many_arguments)]
     fn ncm_delta_step(
@@ -111,6 +125,48 @@ pub trait NcmKernels: Backend {
 }
 
 impl NcmKernels for CubeBackend {
+    fn ncm_assign(dst: CubeTensor, src: CubeTensor, axis: usize, at: usize) -> CubeTensor {
+        let count = src.meta.shape().num_elements();
+        if count == 0 {
+            return dst;
+        }
+        let dtype = elem(dst.dtype);
+        let client = dst.client.clone();
+        unsafe {
+            assign::assign_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(count.div_ceil(assign::CUBE) as u32, 1, 1),
+                CubeDim::new_1d(assign::CUBE as u32),
+                dst.clone().into_tensor_arg(),
+                src.into_tensor_arg(),
+                count,
+                axis,
+                at,
+                dtype,
+            );
+        }
+        dst
+    }
+
+    fn ncm_argmax(x: CubeTensor) -> CubeTensor {
+        let [rows, n] = x.meta.shape().dims::<2>();
+        let out = scratch(&x, vec![rows, 1], DType::I32);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        unsafe {
+            argmax::argmax_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(rows as u32, 1, 1),
+                CubeDim::new_1d(argmax::CUBE as u32),
+                x.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                n,
+                dtype,
+            );
+        }
+        out
+    }
+
     fn ncm_delta_step(
         proj: CubeTensor,
         conv_w: CubeTensor,
@@ -369,4 +425,24 @@ pub fn retrieval_decode(
         dims,
     );
     (Tensor::from_dispatch(out), Tensor::from_dispatch(kv), Tensor::from_dispatch(keys))
+}
+
+/// `x.argmax(D - 1)` for `x` `[..., n]` in one kernel launch (one cube per row); the result has
+/// int dtype i32, Burn's on CUDA.
+pub fn argmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D, Int> {
+    let mut shape = x.dims();
+    let n = shape[D - 1];
+    let rows = shape.iter().product::<usize>() / n;
+    let out = <Dispatch as NcmKernels>::ncm_argmax(x.reshape([rows, n]).into_dispatch());
+    shape[D - 1] = 1;
+    Tensor::<2, Int>::from_dispatch(out).reshape(shape)
+}
+
+/// Writes `src` into `dst` in place at offset `at` along `axis` (`dst[.., at + i, ..] =
+/// src[.., i, ..]`), whoever else holds `dst`'s buffer: a captured graph keeps reading the same
+/// buffer, where `slice_assign` would copy it away. The caller answers for any other holder that
+/// expects the old values.
+pub fn assign_into<const D: usize>(dst: &Tensor<D>, src: Tensor<D>, axis: usize, at: usize) {
+    let dst = dst.clone().into_dispatch();
+    drop(<Dispatch as NcmKernels>::ncm_assign(dst, src.into_dispatch(), axis, at));
 }

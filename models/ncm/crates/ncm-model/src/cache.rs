@@ -130,6 +130,14 @@ impl KvCache {
     }
 
     fn assign(&mut self, at: usize, k: Tensor<4>, v: Tensor<4>) {
+        // On CUDA the write always lands in the cache's own buffers, which a captured decoder
+        // graph ([`crate::ncm::GraphedDecoder`]) keeps reading.
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(&self.device) {
+            crate::kernels::assign_into(self.k.as_ref().expect("cache"), k, 2, at);
+            crate::kernels::assign_into(self.v.as_ref().expect("cache"), v, 2, at);
+            return;
+        }
         let n = k.dims()[2];
         let (ck, cv) = (self.k.take().expect("cache"), self.v.take().expect("cache"));
         self.k = Some(ck.slice_assign(s![.., .., at..at + n], k));

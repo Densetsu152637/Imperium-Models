@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use burn::tensor::Device;
+use burn::tensor::{Device, Int, Tensor};
 
 static FUSED_KERNELS: AtomicBool = AtomicBool::new(true);
 
@@ -35,4 +35,14 @@ fn on_cuda(device: &Device) -> bool {
 #[cfg(not(feature = "cuda"))]
 fn on_cuda(_device: &Device) -> bool {
     false
+}
+
+/// `x.argmax(D - 1)`, the greedy token pick: one kernel on CUDA when the fused kernels are
+/// active ([`crate::kernels::argmax_last`]), Burn's reduction otherwise.
+pub fn argmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D, Int> {
+    #[cfg(feature = "cuda")]
+    if active(&x.device()) {
+        return crate::kernels::argmax_last(x);
+    }
+    x.argmax(D - 1)
 }

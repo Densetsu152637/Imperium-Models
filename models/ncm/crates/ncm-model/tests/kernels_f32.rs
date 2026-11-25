@@ -26,3 +26,15 @@ fn retrieval_decode_matches_reference_f32() {
         retrieval_matches(&device, &case, TOL);
     }
 }
+
+#[test]
+fn argmax_matches_burn_f32() {
+    let (device, _lock) = setup(DTYPE);
+    argmax_matches(&device);
+}
+
+#[test]
+fn graphed_decoder_matches_eager_f32() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_decoder_matches(&device);
+}

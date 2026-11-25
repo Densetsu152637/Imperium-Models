@@ -14,11 +14,60 @@
 use std::sync::{Mutex, MutexGuard};
 
 use burn::module::{Module, ModuleMapper, Param};
-use burn::tensor::{Device, Distribution, FloatDType, Tensor};
+use burn::tensor::{Device, Distribution, FloatDType, Int, Tensor, TensorData};
 use ncm_model::delta::{DeltaCache, DeltaSpec, GatedDeltaNet};
-use ncm_model::fused::{active, set_fused_kernels};
+use ncm_model::fused::{active, argmax_last, set_fused_kernels};
 use ncm_model::layers::Rope;
+use ncm_model::ncm::GraphedDecoder;
 use ncm_model::retrieval::{LatentCache, RetrievalSpec, SparseRetrieval};
+use ncm_model::{NcmLm, tiny_ncm, tiny_ncm_v2, tiny_v2};
+
+fn ints<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
+    t.into_data().convert::<i64>().try_to_vec::<i64>().expect("int tensor")
+}
+
+/// The argmax kernel picks the same index as Burn's `argmax` (the first maximum), including on
+/// rows with repeated maxima.
+pub fn argmax_matches(device: &Device) {
+    device.seed(3);
+    let x = Tensor::<3>::random([2, 3, 32000], Distribution::Normal(0.0, 1.0), device);
+    let got = ints(argmax_last(x.clone()));
+    let want = ints(reference(|| x.argmax(2)));
+    assert_eq!(got, want);
+    // Rows of equal values: every unit holds a maximum, the first index must win.
+    let flat =
+        Tensor::<3>::from_data(TensorData::new(vec![1.5f32; 2 * 1000], [2, 1, 1000]), device);
+    assert_eq!(ints(argmax_last(flat)), vec![0, 0]);
+}
+
+/// The decoder graph produces the same tokens and conditions as the eager decoder, concept
+/// after concept, for both NCM designs (tiny configs; the 8-token encoder window fills during
+/// the prompt, so the graph is captured on the first concept).
+pub fn graphed_decoder_matches(device: &Device) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        device.seed(9);
+        let model = NcmLm::new(&cfg, device);
+        let prompt = Tensor::<2, Int>::from_data(
+            TensorData::new((0..64).map(|i: i32| i * 37 % 256).collect::<Vec<_>>(), [1, 64]),
+            device,
+        );
+        let mut eager = model.make_cache(64 + 40, 1, device);
+        let mut graphed_cache = model.make_cache(64 + 40, 1, device);
+        let mut cond_e = model.prefill(prompt.clone(), &mut eager, 16);
+        let mut cond_g = model.prefill(prompt, &mut graphed_cache, 16);
+        let mut graphed = GraphedDecoder::default();
+        for concept in 0..10 {
+            let (tokens_e, _) = model.decode_concept(cond_e, &mut eager, None, false);
+            let tokens_g = graphed.decode(&model, cond_g, &mut graphed_cache);
+            assert!(graphed.is_captured(), "not captured: {:?}", graphed.failure());
+            assert_eq!(ints(tokens_g.clone()), ints(tokens_e.clone()), "concept {concept}");
+            cond_e = model.append_tokens(tokens_e, &mut eager);
+            cond_g = model.append_tokens(tokens_g, &mut graphed_cache);
+            let (ce, cg) = (values(cond_e.clone()), values(cond_g.clone()));
+            assert!(rel_error(&cg, &ce) <= 1e-5, "concept {concept}: conditions differ");
+        }
+    }
+}
 
 static SWITCH: Mutex<()> = Mutex::new(());
 

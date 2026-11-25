@@ -112,6 +112,13 @@ impl Rope {
         (self.cos.clone(), self.sin.clone())
     }
 
+    /// Tables over given `cos` and `sin` buffers `[1, 1, T, head_dim]`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn from_tables(cos: Tensor<4>, sin: Tensor<4>) -> Self {
+        let rot = rotation(cos.dims()[3], &cos.device());
+        Self { cos, sin, rot }
+    }
+
     /// Rows `start..start + len` of these tables.
     pub fn rows(&self, start: usize, len: usize) -> Self {
         Self {

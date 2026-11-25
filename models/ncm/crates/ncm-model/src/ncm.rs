@@ -16,6 +16,11 @@ use burn::module::{Module, Param};
 use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm};
 use burn::tensor::module::linear as linear_op;
 use burn::tensor::{Bool, Device, Int, Tensor};
+#[cfg(feature = "cuda")]
+use burn::{
+    backend::{Backend, BackendGraph, Dispatch},
+    tensor::ExecutionError,
+};
 
 use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
 use crate::config::{Design, NcmConfig};
@@ -355,7 +360,7 @@ impl NcmLm {
     ) -> (Tensor<2, Int>, Option<Tensor<3>>) {
         self.decode_concept_with(cond, cache, want_logits, &mut |j, logits| match &forced {
             Some(forced) => forced.clone().narrow(1, j, 1),
-            None => logits.clone().argmax(2).reshape([logits.dims()[0], 1]),
+            None => crate::fused::argmax_last(logits.clone()).reshape([logits.dims()[0], 1]),
         })
     }
 
@@ -370,14 +375,28 @@ impl NcmLm {
         want_logits: bool,
         pick: &mut dyn FnMut(usize, &Tensor<3>) -> Tensor<2, Int>,
     ) -> (Tensor<2, Int>, Option<Tensor<3>>) {
+        let device = cond.device();
+        let rope_self = self.rope(0, self.k, &device);
+        let rope_q = self.rope(cache.tokens, self.k, &device);
+        self.decode_with_ropes(cond, cache, &rope_self, &rope_q, want_logits, pick)
+    }
+
+    /// The decoder pass of [`Self::decode_concept_with`] with the RoPE tables of the concept's
+    /// own positions (`rope_self`, always 0..k) and of its absolute positions (`rope_q`).
+    fn decode_with_ropes(
+        &self,
+        cond: Tensor<3>,
+        cache: &mut NcmCache,
+        rope_self: &Rope,
+        rope_q: &Rope,
+        want_logits: bool,
+        pick: &mut dyn FnMut(usize, &Tensor<3>) -> Tensor<2, Int>,
+    ) -> (Tensor<2, Int>, Option<Tensor<3>>) {
         let k = self.k;
         let [b, _, _] = cond.dims();
-        let device = cond.device();
         for c in &mut cache.dec_self {
             c.reset();
         }
-        let rope_self = self.rope(0, k, &device);
-        let rope_q = self.rope(cache.tokens, k, &device);
         let mut tokens = Vec::with_capacity(k);
         let mut logits = Vec::new();
         let mut inp =
@@ -420,4 +439,132 @@ pub fn ncm_cache_bytes(
     let cross = layer_cache_bytes(kvh, hd, max_tokens, Some(cfg.enc_window), itemsize, batch);
     let dec_self = layer_cache_bytes(kvh, hd, cfg.k, None, itemsize, batch);
     backbone + encoder + cfg.dec_layers * (cross + dec_self)
+}
+
+/// The NCM's local decoder as one captured CUDA graph per cache, replayed for every concept.
+///
+/// The decoder is most of the NCM's per-token kernel launches (four layers of attention, norms
+/// and MLP for each of the k tokens, then the logits and the greedy pick), and batch-1 decode is
+/// bound by issuing them. Its work is the same for every concept once the cross-attention ring
+/// is full: the per-concept self-attention cache restarts at slot 0, the ring keeps its buffers
+/// (written in place, [`crate::kernels::assign_into`]), and what changes, the condition and the
+/// RoPE tables of the concept's positions, is copied into fixed input buffers before each
+/// replay. The pick is greedy (argmax). On other devices, with the fused kernels off, before the
+/// ring fills, or if the capture fails, [`GraphedDecoder::decode`] runs the decoder eagerly.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedDecoder {
+    state: GraphState,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+enum GraphState {
+    #[default]
+    Untried,
+    Failed(String),
+    Ready(Box<DecoderGraph>),
+}
+
+#[cfg(feature = "cuda")]
+struct DecoderGraph {
+    graph: BackendGraph<Dispatch>,
+    cond: Tensor<3>,
+    rope_q: Rope,
+    /// Kept for the buffers the graph reads.
+    _rope_self: Rope,
+    tokens: Tensor<2, Int>,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedDecoder {
+    /// Greedy tokens `[B, k]` of the next concept, like `model.decode_concept(cond, cache, None,
+    /// false)`. The returned tensor is the graph's output buffer: read it (or pass it to
+    /// `append_tokens`) before the next call, which overwrites it. One `GraphedDecoder` serves
+    /// one cache.
+    pub fn decode(
+        &mut self,
+        model: &NcmLm,
+        cond: Tensor<3>,
+        cache: &mut NcmCache,
+    ) -> Tensor<2, Int> {
+        let device = cond.device();
+        let ring_full = cache.cross.iter().all(|c| c.len() >= c.capacity());
+        if matches!(self.state, GraphState::Untried) && ring_full && crate::fused::active(&device) {
+            self.state = match model.capture_decoder(&cond, cache) {
+                Ok(graph) => GraphState::Ready(Box::new(graph)),
+                Err(e) => GraphState::Failed(e),
+            };
+        }
+        let GraphState::Ready(g) = &self.state else {
+            return model.decode_concept(cond, cache, None, false).0;
+        };
+        let (cos, sin) = model.rope(cache.tokens, model.k, &device).tables();
+        let (q_cos, q_sin) = g.rope_q.tables();
+        crate::kernels::assign_into(&g.cond, cond, 0, 0);
+        crate::kernels::assign_into(&q_cos, cos, 0, 0);
+        crate::kernels::assign_into(&q_sin, sin, 0, 0);
+        // Safety: every buffer the graph touched is held by `g` (its inputs and output), by the
+        // model (weights) or by `cache` (the decoder caches), all of which outlive the replay,
+        // and all work runs on this thread's stream.
+        unsafe { Dispatch::graph_replay(device.as_dispatch(), &g.graph) }
+            .expect("decoder graph replay");
+        g.tokens.clone()
+    }
+
+    /// Why the decoder runs eagerly, if a capture was tried and failed.
+    pub fn failure(&self) -> Option<&str> {
+        match &self.state {
+            GraphState::Failed(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Whether the decoder replays a captured graph.
+    pub fn is_captured(&self) -> bool {
+        matches!(self.state, GraphState::Ready(_))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl NcmLm {
+    /// Warms up and records the greedy decoder pass over fixed input buffers.
+    fn capture_decoder(
+        &self,
+        cond: &Tensor<3>,
+        cache: &mut NcmCache,
+    ) -> Result<DecoderGraph, String> {
+        let device = cond.device();
+        let dispatch = device.as_dispatch();
+        let cond_buffer = Tensor::<3>::zeros(cond.dims(), &device);
+        crate::kernels::assign_into(&cond_buffer, cond.clone(), 0, 0);
+        let (cos, sin) = self.rope(cache.tokens, self.k, &device).tables();
+        let (cos_buffer, sin_buffer) =
+            (Tensor::<4>::zeros(cos.dims(), &device), Tensor::<4>::zeros(sin.dims(), &device));
+        crate::kernels::assign_into(&cos_buffer, cos, 0, 0);
+        crate::kernels::assign_into(&sin_buffer, sin, 0, 0);
+        let rope_q = Rope::from_tables(cos_buffer, sin_buffer);
+        let rope_self = self.rope(0, self.k, &device);
+        let run = |cache: &mut NcmCache| {
+            let mut pick = |_: usize, logits: &Tensor<3>| {
+                crate::fused::argmax_last(logits.clone()).reshape([logits.dims()[0], 1])
+            };
+            let cond = cond_buffer.clone();
+            self.decode_with_ropes(cond, cache, &rope_self, &rope_q, false, &mut pick).0
+        };
+        let err = |what: &str, e: ExecutionError| format!("{what}: {e:?}");
+        Dispatch::graph_prepare(dispatch).map_err(|e| err("graph_prepare", e))?;
+        // Warm-up runs compile every kernel and fill the memory pool with every buffer the
+        // capture will take, so nothing allocates mid-capture.
+        for _ in 0..3 {
+            let out = run(cache);
+            Dispatch::sync(dispatch).map_err(|e| err("warm-up", e))?;
+            drop(out);
+        }
+        Dispatch::graph_start_capture(dispatch).map_err(|e| err("graph_start_capture", e))?;
+        let tokens = run(cache);
+        let graph =
+            Dispatch::graph_stop_capture(dispatch).map_err(|e| err("graph_stop_capture", e))?;
+        Ok(DecoderGraph { graph, cond: cond_buffer, rope_q, _rope_self: rope_self, tokens })
+    }
 }
