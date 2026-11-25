@@ -411,7 +411,7 @@ impl GatedDeltaNet {
         cache.state = crate::kernels::packed(cache.state.clone());
         cache.conv = crate::kernels::packed(cache.conv.clone());
         let out = crate::kernels::delta_step(
-            self.proj.forward(x),
+            crate::fused::linear(&self.proj, x),
             self.conv.val(),
             &cache.conv,
             &cache.state,
@@ -422,6 +422,6 @@ impl GatedDeltaNet {
             self.norm.epsilon,
         );
         cache.length += t;
-        self.o.forward(out)
+        crate::fused::linear(&self.o, out)
     }
 }

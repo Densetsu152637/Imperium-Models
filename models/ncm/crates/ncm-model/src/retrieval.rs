@@ -247,7 +247,7 @@ impl SparseRetrieval {
             cache.refresh_position();
         }
         let out = crate::kernels::retrieval_decode(
-            self.proj.forward(x),
+            crate::fused::linear(&self.proj, x),
             norms,
             rope.tables(),
             self.uk.weight.val(),
@@ -258,7 +258,7 @@ impl SparseRetrieval {
             dims,
         );
         cache.length += 1;
-        self.o.forward(out)
+        crate::fused::linear(&self.o, out)
     }
 
     /// `x` `[B, T, d]` at absolute positions `start..start + T`; `rope` holds the tables of those

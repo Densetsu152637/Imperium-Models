@@ -40,6 +40,33 @@ pub fn argmax_matches(device: &Device) {
     assert_eq!(ints(argmax_last(flat)), vec![0, 0]);
 }
 
+/// The matrix-vector kernels against an f32 CPU matmul: the models' decode shapes (one row and a
+/// concept's four), split and unsplit `K`, a row-major and a transposed (tied-embedding) weight.
+pub fn gemv_matches(device: &Device, tol: f32) {
+    device.seed(4);
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (rows, k, n) in
+        [(1, 1024, 4112), (1, 2240, 1024), (4, 512, 1536), (3, 37, 70), (2, 5000, 64)]
+    {
+        let x = Tensor::<3>::random([1, rows, k], normal, device);
+        let w = Tensor::<2>::random([k, n], normal, device);
+        let got = values(ncm_model::kernels::gemv(x.clone(), w.clone()));
+        let want = values(to_cpu(&x).matmul(to_cpu(&w).unsqueeze::<3>()));
+        let err = rel_error(&got, &want);
+        eprintln!("gemv {rows}x{k}x{n}: error over scale {err:.2e}");
+        assert!(err <= tol, "gemv {rows}x{k}x{n}: error {err:.2e}");
+    }
+    for (rows, k, n) in [(1, 512, 32000), (4, 64, 300)] {
+        let x = Tensor::<3>::random([1, rows, k], normal, device);
+        let emb = Tensor::<2>::random([n, k], normal, device);
+        let got = values(ncm_model::kernels::gemv(x.clone(), emb.clone().transpose()));
+        let want = values(to_cpu(&x).matmul(to_cpu(&emb).transpose().unsqueeze::<3>()));
+        let err = rel_error(&got, &want);
+        eprintln!("gemv transposed {rows}x{k}x{n}: error over scale {err:.2e}");
+        assert!(err <= tol, "gemv transposed {rows}x{k}x{n}: error {err:.2e}");
+    }
+}
+
 /// Greedy NCM decode of `concepts` concepts after a 64-token prompt, through the decoder and
 /// backbone graphs when `graphs` is on: the tokens and conditions of every concept.
 fn ncm_decode(

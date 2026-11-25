@@ -14,7 +14,6 @@
 
 use burn::module::{Module, Param};
 use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm};
-use burn::tensor::module::linear as linear_op;
 use burn::tensor::{Bool, Device, Int, Tensor};
 #[cfg(feature = "cuda")]
 use burn::{
@@ -252,7 +251,7 @@ impl NcmLm {
     }
 
     fn logits(&self, x: Tensor<3>) -> Tensor<3> {
-        linear_op(self.dec_norm.forward(x), self.emb.weight.val().transpose(), None)
+        crate::fused::linear_transposed(self.emb.weight.val(), self.dec_norm.forward(x))
     }
 
     // ------------------------------------------------------------------ full sequence
@@ -337,13 +336,14 @@ impl NcmLm {
             let (keys, values) = blk.cross.make_kv(states.clone(), &rope_k);
             kv_cache.write(keys, values);
         }
-        let concepts = self.pool.forward(states.reshape([b, t / k, k * self.local_dim]));
+        let concepts =
+            crate::fused::linear(&self.pool, states.reshape([b, t / k, k * self.local_dim]));
         #[cfg(feature = "cuda")]
         let h = cache.backbone_graph.forward(&self.backbone, concepts, &mut cache.backbone);
         #[cfg(not(feature = "cuda"))]
         let h = self.backbone.forward(concepts, Some(&mut cache.backbone));
         cache.tokens += t;
-        self.cond_proj.forward(h.narrow(1, t / k - 1, 1))
+        crate::fused::linear(&self.cond_proj, h.narrow(1, t / k - 1, 1))
     }
 
     /// Feed a prompt (length a multiple of k) in chunks; returns the next-concept condition.

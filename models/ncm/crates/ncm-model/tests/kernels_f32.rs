@@ -38,3 +38,9 @@ fn graphed_decode_matches_eager_f32() {
     let (device, _lock) = setup(DTYPE);
     graphed_decode_matches(&device);
 }
+
+#[test]
+fn gemv_matches_cpu_f32() {
+    let (device, _lock) = setup(DTYPE);
+    gemv_matches(&device, TOL);
+}

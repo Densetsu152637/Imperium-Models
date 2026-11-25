@@ -74,3 +74,30 @@ pub fn argmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D, Int> {
     }
     x.argmax(D - 1)
 }
+
+/// `linear.forward(x)`: on CUDA with the fused kernels on, inputs of at most four rows (decode
+/// steps) take the matrix-vector kernels ([`crate::kernels::gemv`]); everything else, and
+/// layers with a bias, Burn's matmul.
+pub fn linear<const D: usize>(linear: &burn::nn::Linear, x: Tensor<D>) -> Tensor<D> {
+    #[cfg(feature = "cuda")]
+    if linear.bias.is_none() && active(&x.device()) {
+        let rows = x.dims()[..D - 1].iter().product::<usize>();
+        if crate::kernels::gemv_rows_ok(rows) {
+            return crate::kernels::gemv(x, linear.weight.val());
+        }
+    }
+    linear.forward(x)
+}
+
+/// `x W^T` for the tied embedding `emb` `[V, d]` (the logits): the matrix-vector kernel on
+/// CUDA for decode steps, Burn's matmul otherwise.
+pub fn linear_transposed<const D: usize>(emb: Tensor<2>, x: Tensor<D>) -> Tensor<D> {
+    #[cfg(feature = "cuda")]
+    if active(&x.device()) {
+        let rows = x.dims()[..D - 1].iter().product::<usize>();
+        if crate::kernels::gemv_rows_ok(rows) {
+            return crate::kernels::gemv(x, emb.transpose());
+        }
+    }
+    burn::tensor::module::linear(x, emb.transpose(), None)
+}

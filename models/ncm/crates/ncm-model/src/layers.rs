@@ -180,9 +180,9 @@ impl Mlp {
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        let mut parts = self.gate_up.forward(x).chunk(2, D - 1).into_iter();
+        let mut parts = crate::fused::linear(&self.gate_up, x).chunk(2, D - 1).into_iter();
         let (gate, up) = (parts.next().expect("gate"), parts.next().expect("up"));
-        self.down.forward(silu(gate) * up)
+        crate::fused::linear(&self.down, silu(gate) * up)
     }
 }
 
@@ -243,8 +243,8 @@ impl Attention {
         let [b, t, _] = x.dims();
         let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
         let device = x.device();
-        let gate = self.gate.as_ref().map(|g| sigmoid(g.forward(x.clone())));
-        let qkv = self.qkv.forward(x);
+        let gate = self.gate.as_ref().map(|g| sigmoid(crate::fused::linear(g, x.clone())));
+        let qkv = crate::fused::linear(&self.qkv, x);
         let (q, k) = match (&self.q_norm, &self.k_norm) {
             (Some(q_norm), Some(k_norm)) => {
                 let q = qkv.clone().narrow(2, 0, h * hd).reshape([b, t, h, hd]);
@@ -276,7 +276,7 @@ impl Attention {
             Some(gate) => out * gate,
             None => out,
         };
-        self.o.forward(out)
+        crate::fused::linear(&self.o, out)
     }
 }
 
@@ -314,7 +314,7 @@ impl CrossAttention {
     pub fn make_kv(&self, states: Tensor<3>, rope: &Rope) -> (Tensor<4>, Tensor<4>) {
         let [b, t, _] = states.dims();
         let (kvh, hd) = (self.kv_heads, self.head_dim);
-        let kv = self.kv.forward(states);
+        let kv = crate::fused::linear(&self.kv, states);
         let k = kv.clone().narrow(2, 0, kvh * hd);
         let v = kv.narrow(2, kvh * hd, kvh * hd);
         let k = apply_rope(k.reshape([b, t, kvh, hd]).swap_dims(1, 2), rope);
@@ -331,9 +331,9 @@ impl CrossAttention {
     ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (h, hd) = (self.heads, self.head_dim);
-        let q = self.q.forward(x).reshape([b, t, h, hd]).swap_dims(1, 2);
+        let q = crate::fused::linear(&self.q, x).reshape([b, t, h, hd]).swap_dims(1, 2);
         let out = attend(apply_rope(q, rope_q), keys, values, mask);
-        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * hd]))
+        crate::fused::linear(&self.o, out.swap_dims(1, 2).reshape([b, t, h * hd]))
     }
 }
 

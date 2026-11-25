@@ -7,6 +7,7 @@
 mod argmax;
 mod assign;
 mod delta;
+mod gemv;
 mod retrieval;
 
 use burn::backend::tensor::{FloatTensor, IntTensor};
@@ -83,6 +84,9 @@ pub trait NcmKernels: Backend {
     /// See [`argmax_last`].
     fn ncm_argmax(x: FloatTensor<Self>) -> IntTensor<Self>;
 
+    /// See [`gemv`].
+    fn ncm_gemv(x: FloatTensor<Self>, w: FloatTensor<Self>) -> FloatTensor<Self>;
+
     /// See [`packed`].
     fn ncm_packed(x: FloatTensor<Self>) -> FloatTensor<Self>;
 
@@ -136,6 +140,73 @@ pub trait NcmKernels: Backend {
 }
 
 impl NcmKernels for CubeBackend {
+    fn ncm_gemv(x: CubeTensor, w: CubeTensor) -> CubeTensor {
+        use gemv::{COLS, CUBE};
+        let [rows, k] = x.meta.shape().dims::<2>();
+        let [_, n] = w.meta.shape().dims::<2>();
+        let y = empty_like(&x, vec![rows, n]);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        let strides = w.meta.strides().to_vec();
+        if strides[1] != 1 && strides[0] == 1 {
+            // Transposed weight: one plane per output column.
+            let planes = CUBE / client.properties().hardware.plane_size_max as usize;
+            unsafe {
+                gemv::gemv_rows_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(n.div_ceil(planes) as u32, 1, 1),
+                    CubeDim::new_1d(CUBE as u32),
+                    x.into_tensor_arg(),
+                    w.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    k,
+                    n,
+                    rows,
+                    dtype,
+                );
+            }
+            return y;
+        }
+        // Enough cubes to keep every SM reading: split K when N alone gives too few tiles.
+        let tiles = n.div_ceil(COLS);
+        let mut splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(COLS).max(1));
+        splits = splits.max(k.div_ceil(512));
+        let k_split = k.div_ceil(splits);
+        let splits = k.div_ceil(k_split);
+        let part = scratch(&x, vec![if splits > 1 { splits * rows * n } else { 1 }], DType::F32);
+        unsafe {
+            gemv::gemv_cols_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(tiles as u32, splits as u32, 1),
+                CubeDim::new_1d(CUBE as u32),
+                x.into_tensor_arg(),
+                w.into_tensor_arg(),
+                y.clone().into_tensor_arg(),
+                part.clone().into_tensor_arg(),
+                k,
+                n,
+                k_split,
+                rows,
+                splits > 1,
+                dtype,
+            );
+            if splits > 1 {
+                let count = rows * n;
+                gemv::gemv_sum_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(count.div_ceil(CUBE) as u32, 1, 1),
+                    CubeDim::new_1d(CUBE as u32),
+                    part.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    count,
+                    splits,
+                    dtype,
+                );
+            }
+        }
+        y
+    }
+
     fn ncm_assign_int(dst: CubeTensor, src: CubeTensor, axis: usize, at: usize) -> CubeTensor {
         Self::ncm_assign(dst, src, axis, at)
     }
@@ -483,4 +554,22 @@ pub fn assign_int_into<const D: usize>(
 ) {
     let dst = dst.clone().into_dispatch();
     drop(<Dispatch as NcmKernels>::ncm_assign_int(dst, src.into_dispatch(), axis, at));
+}
+
+/// `x W` for `x` `[.., K]` with at most four rows in all and `w` `[K, N]` (row-major, or the
+/// transpose of a row-major `[N, K]`), as bandwidth-bound matrix-vector kernels.
+pub fn gemv<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
+    let mut shape = x.dims();
+    let k = shape[D - 1];
+    let rows = shape.iter().product::<usize>() / k;
+    debug_assert!(rows <= gemv::MAX_ROWS, "gemv takes at most {} rows", gemv::MAX_ROWS);
+    shape[D - 1] = w.dims()[1];
+    let y =
+        <Dispatch as NcmKernels>::ncm_gemv(x.reshape([rows, k]).into_dispatch(), w.into_dispatch());
+    Tensor::<2>::from_dispatch(y).reshape(shape)
+}
+
+/// Whether [`gemv`] takes an input of `rows` rows.
+pub fn gemv_rows_ok(rows: usize) -> bool {
+    rows <= gemv::MAX_ROWS
 }
