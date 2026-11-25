@@ -5,6 +5,7 @@
 //! CPU backend; `ncm-bench` adds CUDA behind a cargo feature.
 
 pub mod cache;
+pub mod chat;
 pub mod config;
 pub mod layers;
 pub mod ncm;

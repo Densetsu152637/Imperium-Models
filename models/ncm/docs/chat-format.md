@@ -1,6 +1,6 @@
 # NCM chat format
 
-The text format of every fine-tuning sample for the NCM models (Emperor and Consul). The stage 2 tokenizer reserves each tag below as a single special token, so no tag may appear inside message content. `ncm-sft` (`crates/ncm-sft`) renders it from the token-era teacher data and refuses records whose content already holds a reserved tag.
+The text format of every fine-tuning sample for the NCM models (Emperor and Consul). The stage 2 tokenizer reserves each tag below as a single special token, so no tag may appear inside message content. One renderer, `ncm_model::chat` (`crates/ncm-model/src/chat.rs`), produces it for every crate: `ncm-sft` renders the token-era teacher data and refuses records whose content already holds a reserved tag, `ncm-data` renders the pretraining chat and reasoning sources and defuses reserved tags in them (a space after the first character, `< |im_end|>`), and the runtime renders prompts.
 
 ## Turns
 
