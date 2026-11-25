@@ -1,0 +1,229 @@
+# NCM pretraining data mix (plan stage 2). Every source is an ungated Hugging Face dataset pinned
+# to a commit revision, with a licence that allows training and redistributing derived models.
+#
+# Rules applied to every source:
+#   1. Not gated: nothing here needs an accepted agreement or a token.
+#   2. Licence: permissive or attribution-style (ODC-By, CC BY, Apache-2.0, Blue Oak-listed code).
+#   3. No Claude data: each dataset card was read for Claude or Anthropic involvement as a data
+#      generator or filter; none mentions either. Synthetic sets name their generator models
+#      (DeepSeek-R1, QwQ-32B, Qwen3, GPT-OSS, Llama 3), recorded under `generators`.
+#   4. Crawl and paper dates: web text and papers dated March 2023 or later are dropped (Claude 1
+#      shipped in March 2023), because AI-written text on the web grows after that.
+#
+# Shares are fractions of `budget_tokens` and sum to 1. `phase = "anneal"` sources are only
+# sampled in the last `anneal.fraction` of pretraining; `anneal.shares` is the mix for that phase
+# (it reuses main-phase sources with more weight on maths, papers and reasoning).
+# `est_tokens` estimates the tokens, in this tokenizer, that the selected files hold (stride and
+# max_files choose them): the tokens measured on the stage 2 proof sample, scaled by file size. It
+# should exceed the target `share` x `budget_tokens`, so tokenising meets every target.
+
+budget_tokens = 20_000_000_000
+val_fraction = 0.005
+
+[anneal]
+fraction = 0.10
+
+[anneal.shares]
+fineweb-edu = 0.10
+stack-edu = 0.10
+pes2o = 0.10
+finemath = 0.20
+openthoughts3 = 0.20
+openmathreasoning = 0.20
+openr1-math = 0.10
+
+# ---- educational web text: 45% ----------------------------------------------------------------
+
+[[source]]
+name = "fineweb-edu"
+category = "web"
+phase = "main"
+repo = "HuggingFaceFW/fineweb-edu"
+revision = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+license = "ODC-By-1.0 (and Common Crawl terms of use)"
+gated = false
+share = 0.45
+est_tokens = 10_260_000_000
+kind = "text"
+glob = "data/CC-MAIN-{2013,2014,2015,2016,2017,2018,2019,2020,2021,2022}-*/*.parquet"
+stride = 130
+interleave = 2
+claude_check = "Card read; no Claude or Anthropic use. Quality labels come from a classifier trained on Llama-3-70B-Instruct annotations. Only crawls from 2013 to 2022 are taken."
+generators = "Llama-3-70B-Instruct (annotations for the educational-score classifier); text is human web text"
+note = "Educational-score 3 and above web pages, English. Files are spread evenly over crawls by stride."
+
+# ---- code: 25% --------------------------------------------------------------------------------
+
+[[source]]
+name = "stack-edu"
+category = "code"
+phase = "main"
+repo = "common-pile/stackv2_edu_filtered"
+revision = "c354dbe88469a1153e97c6a63ac50591849654de"
+license = "Per file, Blue Oak Council permissive licences (MIT, Apache-2.0, BSD and similar); see metadata.license"
+gated = false
+share = 0.25
+est_tokens = 6_340_000_000
+kind = "text"
+glob = "stack-edu-*.json.gz"
+stride = 9
+interleave = 12
+claude_check = "Card read; no Claude or Anthropic use. Code is from GitHub repositories in the Software Heritage snapshot of September 2023; files with a revision date from March 2023 are dropped."
+generators = "Educational filter from the StarCoder2 / Stack-Edu classifier (Llama-3-70B-Instruct annotations); code is human-written"
+note = "Common Pile's copy of Stack v2 educational code with file contents included. Files are grouped by language (the first 18 are Markdown), so a stride samples every language and files are read round-robin."
+
+[[source.exclude]]
+field = "metadata.revision_date"
+prefixes = ["2023-03", "2023-04", "2023-05", "2023-06", "2023-07", "2023-08", "2023-09", "2023-10", "2023-11", "2023-12", "2024", "2025"]
+
+# ---- research papers: 10% ---------------------------------------------------------------------
+
+[[source]]
+name = "pes2o"
+category = "research"
+phase = "main"
+repo = "common-pile/peS2o"
+revision = "2caeba1585aaafa3c965410d80af85b09ed11cd9"
+license = "Per paper: CC BY, CC0 or public domain (CC BY-SA papers are dropped); dataset text under the Common Pile terms"
+gated = false
+share = 0.10
+est_tokens = 2_420_000_000
+kind = "text"
+glob = "v0/documents/*.json.gz"
+stride = 14
+claude_check = "Card read; no Claude or Anthropic use. Papers are human-written open-access full texts from S2ORC; papers dated 2023 or later are dropped."
+generators = "None (human-written); S2ORC text extracted with GROBID"
+note = "Openly licensed subset of peS2o. About 98% of papers are CC BY. Preferred over allenai/peS2o, whose papers are not filtered to open licences."
+
+[[source.exclude]]
+field = "metadata.oa_license"
+prefixes = ["CCBYSA", "CCBYNC"]
+
+[[source.exclude]]
+field = "metadata.year"
+prefixes = ["2023", "2024", "2025"]
+
+# ---- maths: 10% -------------------------------------------------------------------------------
+
+[[source]]
+name = "finemath"
+category = "math"
+phase = "main"
+repo = "HuggingFaceTB/finemath"
+subset = "finemath-4plus"
+revision = "e92b25a616738fe95dc186b64dfb19f9c8525594"
+license = "ODC-By-1.0 (and Common Crawl terms of use)"
+gated = false
+share = 0.10
+est_tokens = 2_440_000_000
+kind = "text"
+glob = "finemath-4plus/*.parquet"
+stride = 3
+claude_check = "Card read; no Claude or Anthropic use. Quality labels come from a classifier trained on Llama-3.1-70B-Instruct annotations; crawls from 2023 on are dropped."
+generators = "Llama-3.1-70B-Instruct (annotations for the maths classifier); text is human web text"
+note = "Mathematical web pages with step-by-step explanations, score 4 and above."
+
+[[source.exclude]]
+field = "crawl"
+prefixes = ["CC-MAIN-2023", "CC-MAIN-2024", "CC-MAIN-2025"]
+
+# ---- reasoning traces: 6% ---------------------------------------------------------------------
+# Rendered as a user turn and an assistant turn: <think> reasoning </think> answer.
+
+[[source]]
+name = "openthoughts3"
+category = "reasoning"
+phase = "main"
+repo = "open-thoughts/OpenThoughts3-1.2M"
+revision = "61bcf9d4eb38b30295efc2021227a63cc5bb34c8"
+license = "Apache-2.0"
+gated = false
+share = 0.03
+est_tokens = 640_000_000
+kind = "trace"
+glob = "data/train-*.parquet"
+stride = 8
+prompt_field = "conversations.0.value"
+response_field = "conversations.1.value"
+claude_check = "Card read; no Claude or Anthropic use. Traces are generated by QwQ-32B. Questions are from public sources (StackExchange, competition sites) and from synthetic question sets whose generators the card does not list individually (it points to openmath-2-math); none are named as Claude."
+generators = "QwQ-32B (all traces)"
+note = "850k maths, 250k code and 100k science questions, 16 traces each."
+
+[[source]]
+name = "openmathreasoning"
+category = "reasoning"
+phase = "anneal"
+repo = "nvidia/OpenMathReasoning"
+subset = "cot"
+revision = "d3d08664755704f422af97d43a7ff0ded4bd95df"
+license = "CC-BY-4.0"
+gated = false
+share = 0.02
+est_tokens = 510_000_000
+kind = "trace"
+glob = "data/cot-*.parquet"
+stride = 60
+prompt_field = "problem"
+response_field = "generated_solution"
+claude_check = "Card read; no Claude or Anthropic use. Problems are from the AoPS forums, cleaned with Qwen2.5-32B-Instruct; solutions by DeepSeek-R1 and QwQ-32B."
+generators = "DeepSeek-R1, QwQ-32B (solutions); Qwen2.5-32B-Instruct (problem cleanup)"
+note = "Chain-of-thought split only; the tool-integrated and genselect splits are not used."
+
+[[source]]
+name = "openr1-math"
+category = "reasoning"
+phase = "anneal"
+repo = "open-r1/OpenR1-Math-220k"
+subset = "default"
+revision = "e4e141ec9dea9f8326f4d347be56105859b2bd68"
+license = "Apache-2.0"
+gated = false
+share = 0.01
+est_tokens = 240_000_000
+kind = "trace"
+glob = "data/train-*.parquet"
+stride = 1
+max_files = 7
+prompt_field = "problem"
+response_field = "generations.0"
+require_true = "correctness_math_verify.0"
+claude_check = "Card read; no Claude or Anthropic use. Traces by DeepSeek-R1 on NuminaMath 1.5 problems; Llama-3.3-70B-Instruct judged 12% of answers. Only traces that Math-Verify marks correct are kept."
+generators = "DeepSeek-R1 (traces); Llama-3.3-70B-Instruct (judge)"
+note = "NuminaMath 1.5 prompts include some synthetic problems from OpenAI models (a licensing note for the user, not Claude)."
+
+# ---- tool use and instruction: 4% -------------------------------------------------------------
+
+[[source]]
+name = "nemotron-tools"
+category = "instruct"
+phase = "main"
+repo = "nvidia/Nemotron-Post-Training-Dataset-v1"
+subset = "tool_calling"
+revision = "74e23eb6f830fef4a9e96a92f6f6262214cbb9a8"
+license = "CC-BY-4.0"
+gated = false
+share = 0.02
+est_tokens = 480_000_000
+kind = "chat"
+glob = "data/tool-*.parquet"
+stride = 4
+claude_check = "Card read; no Claude or Anthropic use. Responses are generated by DeepSeek-R1-0528 and Qwen3-235B-A22B; prompts are public or synthetic from those open models."
+generators = "DeepSeek-R1-0528, Qwen3-235B-A22B"
+note = "Single-turn, multi-turn and multi-step tool calling with the tool list in metadata."
+
+[[source]]
+name = "nemotron-agentic"
+category = "instruct"
+phase = "main"
+repo = "nvidia/Nemotron-Agentic-v1"
+revision = "650d590978ca35c8f1ecea2faf136e5fac421b62"
+license = "CC-BY-4.0 (Apache-2.0 for tool sets taken from glaive-function-calling-v2)"
+gated = false
+share = 0.02
+est_tokens = 460_000_000
+kind = "chat"
+glob = "data/*.jsonl"
+fetch_bytes = 2_200_000_000
+claude_check = "Card read; no Claude or Anthropic use. Trajectories are simulated and judged by Qwen3-235B-A22B (Thinking and Instruct), Qwen3-32B and GPT-OSS-120B."
+generators = "Qwen3-235B-A22B-Thinking-2507, Qwen3-235B-A22B-Instruct-2507, Qwen3-32B, GPT-OSS-120B"
+note = "Interactive-agent and tool-calling trajectories. The fetch takes the whole interactive file and a prefix of the 5.3 GB tool-calling file, as much as the share needs."
