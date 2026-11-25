@@ -19,6 +19,7 @@ use ncm_model::delta::{DeltaCache, DeltaSpec, GatedDeltaNet};
 use ncm_model::fused::{active, argmax_last, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::Rope;
 use ncm_model::ncm::GraphedDecoder;
+use ncm_model::quant::{self, QuantSpec, format::Format};
 use ncm_model::retrieval::{LatentCache, RetrievalSpec, SparseRetrieval};
 use ncm_model::{Acceptance, NcmLm, SpecStats, Speculator, tiny_ncm, tiny_ncm_v2, tiny_v2};
 
@@ -100,14 +101,31 @@ fn ncm_decode(
     (tokens, conds)
 }
 
+/// The quantisations the graphed-decode checks run with: q8, and q4 in groups of 64 with the
+/// output head quantised too.
+pub fn quant_specs() -> [QuantSpec; 2] {
+    [
+        QuantSpec { format: Format::q8(), head: false },
+        QuantSpec { format: Format::q4(64), head: true },
+    ]
+}
+
+/// A tiny NCM of `cfg` with random weights, its linear layers (draft head included) quantised
+/// per `spec`.
+fn build_ncm(cfg: &ncm_model::NcmConfig, spec: Option<QuantSpec>, device: &Device) -> NcmLm {
+    device.seed(9);
+    quant::build(spec, || NcmLm::new(cfg, device))
+}
+
 /// The decoder graph (both designs) and the backbone graph (v2) give the same tokens and
-/// conditions as the same kernels run eagerly, concept after concept. Tiny configs: the 8-token
-/// encoder window fills during the prompt, so both graphs are captured on the first concept, and
-/// the v2 backbone's retrieval (blocks of 2, top 2, window 4) turns sparse within the run.
-pub fn graphed_decode_matches(device: &Device) {
+/// conditions as the same kernels run eagerly, concept after concept, with the linear layers
+/// dense or quantised per `spec` (the quantised GEMV kernels then run inside the graphs). Tiny
+/// configs: the 8-token encoder window fills during the prompt, so both graphs are captured on
+/// the first concept, and the v2 backbone's retrieval (blocks of 2, top 2, window 4) turns
+/// sparse within the run.
+pub fn graphed_decode_matches(device: &Device, spec: Option<QuantSpec>) {
     for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
-        device.seed(9);
-        let model = NcmLm::new(&cfg, device);
+        let model = build_ncm(&cfg, spec, device);
         let (tokens_e, conds_e) = ncm_decode(&model, false, 12, device);
         let (tokens_g, conds_g) = ncm_decode(&model, true, 12, device);
         for (concept, (te, tg)) in tokens_e.iter().zip(&tokens_g).enumerate() {
@@ -150,16 +168,15 @@ fn spec_decode(
     (tokens, speculator.stats())
 }
 
-/// The draft and verify graphs (both designs) give the same tokens and counts as the same
-/// kernels run eagerly, under real verification and under an assumed acceptance of one half
+/// The draft and verify graphs (both designs; linear layers dense or quantised per `spec`) give
+/// the same tokens and counts as the same kernels run eagerly, under real verification and under an assumed acceptance of one half
 /// (several verify replays per concept). With `exact`, the speculative tokens also equal plain
 /// greedy decoding through the decoder graph (f32; in bf16 the parallel and step-by-step passes
 /// round differently and a near tie of the two best logits may go either way, so mismatching
 /// concepts are only counted).
-pub fn graphed_speculation_matches(device: &Device, exact: bool) {
+pub fn graphed_speculation_matches(device: &Device, exact: bool, spec: Option<QuantSpec>) {
     for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
-        device.seed(9);
-        let model = NcmLm::new(&cfg, device);
+        let model = build_ncm(&cfg, spec, device);
         for acceptance in [Acceptance::Verify, Acceptance::Assume(0.5)] {
             let (tokens_e, stats_e) = spec_decode(&model, false, acceptance, 12, device);
             let (tokens_g, stats_g) = spec_decode(&model, true, acceptance, 12, device);

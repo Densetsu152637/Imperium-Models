@@ -75,29 +75,22 @@ pub fn argmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D, Int> {
     x.argmax(D - 1)
 }
 
-/// `linear.forward(x)`: on CUDA with the fused kernels on, inputs of at most four rows (decode
-/// steps) take the matrix-vector kernels ([`crate::kernels::gemv`]); everything else, and
-/// layers with a bias, Burn's matmul.
-pub fn linear<const D: usize>(linear: &burn::nn::Linear, x: Tensor<D>) -> Tensor<D> {
-    #[cfg(feature = "cuda")]
-    if linear.bias.is_none() && active(&x.device()) {
-        let rows = x.dims()[..D - 1].iter().product::<usize>();
-        if crate::kernels::gemv_rows_ok(rows) {
-            return crate::kernels::gemv(x, linear.weight.val());
-        }
-    }
-    linear.forward(x)
-}
-
-/// `x W^T` for the tied embedding `emb` `[V, d]` (the logits): the matrix-vector kernel on
-/// CUDA for decode steps, Burn's matmul otherwise.
-pub fn linear_transposed<const D: usize>(emb: Tensor<2>, x: Tensor<D>) -> Tensor<D> {
+/// `x W` for a dense weight `w` `[K, N]` (row-major, or the transpose of a row-major `[N, K]`):
+/// on CUDA with the fused kernels on, inputs of at most four rows (decode steps) take the
+/// matrix-vector kernels ([`crate::kernels::gemv`]); everything else Burn's matmul. Dense
+/// [`crate::quant::QLinear`] layers and the tied output head multiply through it.
+pub fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
     #[cfg(feature = "cuda")]
     if active(&x.device()) {
         let rows = x.dims()[..D - 1].iter().product::<usize>();
         if crate::kernels::gemv_rows_ok(rows) {
-            return crate::kernels::gemv(x, emb.transpose());
+            return crate::kernels::gemv(x, w);
         }
     }
-    burn::tensor::module::linear(x, emb.transpose(), None)
+    burn::tensor::module::linear(x, w, None)
+}
+
+/// `x W^T` for the tied embedding `emb` `[V, d]` (the logits), through [`linear`].
+pub fn linear_transposed<const D: usize>(emb: Tensor<2>, x: Tensor<D>) -> Tensor<D> {
+    linear(x, emb.transpose())
 }

@@ -13,7 +13,7 @@
 //! k .. N - 1 (`logits[:, t - k]` predicts token t).
 
 use burn::module::{Module, Param};
-use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm};
+use burn::nn::{Embedding, EmbeddingConfig, RmsNorm};
 use burn::tensor::{Bool, Device, Int, Tensor};
 #[cfg(feature = "cuda")]
 use burn::{
@@ -27,6 +27,7 @@ use crate::layers::{
     Attention, CrossAttention, LayerKind, Mlp, Rope, Stack, StackSpec, fallback_kinds,
     hybrid_kinds, init_normal, linear, rms_norm,
 };
+use crate::quant::{QLinear as Linear, tied_head};
 use crate::speculative::DraftHead;
 
 #[derive(Module, Debug)]
@@ -208,6 +209,8 @@ pub struct NcmLm {
     dec_blocks: Vec<DecoderBlock>,
     dec_norm: RmsNorm,
     draft: Option<DraftHead>,
+    /// A quantised copy of the tied output head (see [`crate::quant`]); None: logits use `emb`.
+    head: Option<Linear>,
     k: usize,
     local_dim: usize,
     head_dim: usize,
@@ -238,6 +241,7 @@ impl NcmLm {
             dec_blocks: (0..cfg.dec_layers).map(|_| DecoderBlock::new(cfg, device)).collect(),
             dec_norm: rms_norm(d, cfg.norm_eps, device),
             draft: (cfg.draft_layers > 0).then(|| DraftHead::new(cfg, device)),
+            head: tied_head(cfg.vocab_size, d, device),
             k: cfg.k,
             local_dim: d,
             head_dim: cfg.head_dim,
@@ -276,7 +280,16 @@ impl NcmLm {
     }
 
     fn logits(&self, x: Tensor<3>) -> Tensor<3> {
-        crate::fused::linear_transposed(self.emb.weight.val(), self.dec_norm.forward(x))
+        self.project(self.dec_norm.forward(x))
+    }
+
+    /// Normed states `[B, T, d]` to logits through the output head: its quantised copy when the
+    /// model has one, else the tied embedding.
+    pub(crate) fn project(&self, x: Tensor<3>) -> Tensor<3> {
+        match &self.head {
+            Some(head) => head.forward(x),
+            None => crate::fused::linear_transposed(self.emb.weight.val(), x),
+        }
     }
 
     // ------------------------------------------------------------------ full sequence
@@ -339,7 +352,7 @@ impl NcmLm {
         let draft = draft.then(|| {
             let head = self.draft.as_ref().expect("forward_with_draft needs a draft head");
             let x = head.forward(cond, &rope_self, &rope_q, &kvs, Some(mask));
-            head.logits(&self.emb, x.reshape([b, (m - 1) * k, d]))
+            head.logits(self, x.reshape([b, (m - 1) * k, d]))
         });
         (logits, draft)
     }
@@ -393,14 +406,13 @@ impl NcmLm {
             let (keys, values) = blk.cross.make_kv(states.clone(), &rope_k);
             kv_cache.write(keys, values);
         }
-        let concepts =
-            crate::fused::linear(&self.pool, states.reshape([b, t / k, k * self.local_dim]));
+        let concepts = self.pool.forward(states.reshape([b, t / k, k * self.local_dim]));
         #[cfg(feature = "cuda")]
         let h = cache.backbone_graph.forward(&self.backbone, concepts, &mut cache.backbone);
         #[cfg(not(feature = "cuda"))]
         let h = self.backbone.forward(concepts, Some(&mut cache.backbone));
         cache.tokens += t;
-        crate::fused::linear(&self.cond_proj, h.narrow(1, t / k - 1, 1))
+        self.cond_proj.forward(h.narrow(1, t / k - 1, 1))
     }
 
     /// Feed a prompt (length a multiple of k) in chunks; returns the next-concept condition.
@@ -533,7 +545,7 @@ impl NcmLm {
         let [b, _, d] = cond.dims();
         let kvs: Vec<_> = cache.cross.iter().map(KvCache::view).collect();
         let x = head.forward(cond.unsqueeze_dim::<4>(1), rope_self, rope_q, &kvs, None);
-        head.logits(&self.emb, x.reshape([b, self.k, d]))
+        head.logits(self, x.reshape([b, self.k, d]))
     }
 
     /// [`Self::verify_concept`] with the RoPE tables and the causal mask given (no uploads, so

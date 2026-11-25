@@ -23,11 +23,12 @@
 //! position queries for slots 0..k-1 plus the concept's condition, self-attention between the
 //! slots (bidirectional: the slots carry no tokens), cross-attention over the encoder states
 //! through the keys and values of decoder layer i's cross-attention cache (no cache of its
-//! own), a SwiGLU MLP, its own final norm and the tied embedding. Training adds
-//! [`draft_loss`] on [`NcmLm::forward_with_draft`]'s draft logits.
+//! own), a SwiGLU MLP, its own final norm and the model's output head. Its linear layers, and
+//! the head, are quantised with the model's. Training adds [`draft_loss`] on
+//! [`NcmLm::forward_with_draft`]'s draft logits.
 
 use burn::module::{Module, Param};
-use burn::nn::{Embedding, RmsNorm};
+use burn::nn::RmsNorm;
 use burn::tensor::activation::log_softmax;
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 #[cfg(feature = "cuda")]
@@ -124,9 +125,10 @@ impl DraftHead {
         x
     }
 
-    /// Logits over the tied embedding `emb` for states `[B, T, d]`.
-    pub(crate) fn logits(&self, emb: &Embedding, x: Tensor<3>) -> Tensor<3> {
-        crate::fused::linear_transposed(emb.weight.val(), self.norm.forward(x))
+    /// Logits for states `[B, T, d]` through `model`'s output head (the tied embedding, or its
+    /// quantised copy).
+    pub(crate) fn logits(&self, model: &NcmLm, x: Tensor<3>) -> Tensor<3> {
+        model.project(self.norm.forward(x))
     }
 }
 

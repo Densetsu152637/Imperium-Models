@@ -21,6 +21,7 @@ use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
 use ncm_model::fused::{argmax_last, kernels_built, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
+use ncm_model::quant::{self, QuantSpec};
 use ncm_model::{
     Acceptance, Config, Design, NcmLm, SpecStats, Speculator, TokenLm, cache_bytes,
     cache_bytes_with, ncm_250m_of, tiny_ncm, tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2,
@@ -86,6 +87,17 @@ pub enum DtypeChoice {
     F32,
 }
 
+/// Weight-only quantisation of the linear layers (see `ncm_model::quant`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum QuantChoice {
+    /// Dense weights at the run dtype.
+    None,
+    /// 8-bit codes, one scale per output channel (W8A16).
+    Q8,
+    /// 4-bit codes, one scale per `--quant-group` inputs (W4A16).
+    Q4,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "ncm-bench",
@@ -135,6 +147,27 @@ pub struct Cli {
     /// that acceptance would run; the tokens are not the model's output.
     #[arg(long, num_args = 1.., value_name = "RATE")]
     pub assume_accept: Vec<f64>,
+    /// Quantise the linear layers' weights (the random weights are quantised as they are built).
+    #[arg(long, value_enum, default_value = "none")]
+    pub quant: QuantChoice,
+    /// Inputs per scale for `--quant q4` (a multiple of 32).
+    #[arg(long, default_value_t = 64)]
+    pub quant_group: usize,
+    /// Keep the tied output head dense when quantising.
+    #[arg(long)]
+    pub dense_head: bool,
+}
+
+impl Cli {
+    /// The quantisation `--quant`, `--quant-group` and `--dense-head` ask for.
+    pub fn quant_spec(&self) -> Result<Option<QuantSpec>, String> {
+        let mode = match self.quant {
+            QuantChoice::None => "none",
+            QuantChoice::Q8 => "q8",
+            QuantChoice::Q4 => "q4",
+        };
+        QuantSpec::parse(mode, self.quant_group, !self.dense_head)
+    }
 }
 
 pub fn verdict(ratio: f64) -> &'static str {
@@ -185,11 +218,21 @@ impl Model {
         }
     }
 
-    fn parts(&self) -> Vec<(&'static str, usize)> {
+    /// Parameter bytes on the device (codes and scales when quantised).
+    fn weight_bytes(&self) -> usize {
         match self {
-            Model::Tok(m) => m.parts().rows(),
-            Model::Ncm(m) => m.parts().rows(),
+            Model::Tok(m) => quant::weight_bytes(m.as_ref()),
+            Model::Ncm(m) => quant::weight_bytes(m.as_ref()),
         }
+    }
+}
+
+/// Parameter counts of `cfg` by part, from a dense model that is never initialised (a quantised
+/// model's own count would see codes and scales).
+fn dense_parts(cfg: &Config, device: &Device) -> Vec<(&'static str, usize)> {
+    match cfg {
+        Config::Tok(c) => TokenLm::new(c, device).parts().rows(),
+        Config::Ncm(c) => NcmLm::new(c, device).parts().rows(),
     }
 }
 
@@ -331,18 +374,24 @@ fn bench_model(
     cli: &Cli,
     device: &Device,
     itemsize: usize,
+    spec: Option<QuantSpec>,
 ) -> (Value, Vec<(usize, f64)>) {
     device.seed(0);
-    let model = match cfg {
+    let model = quant::build(spec, || match cfg {
         Config::Tok(c) => Model::Tok(Box::new(TokenLm::new(c, device))),
         Config::Ncm(c) => Model::Ncm(Box::new(NcmLm::new(c, device))),
-    };
+    });
     let design = cfg.design().name();
-    let parts = model.parts();
+    let parts = dense_parts(cfg, device);
     let params: usize = parts.iter().map(|p| p.1).sum();
     let unit = cfg.unit();
     let new_tokens = cli.new_tokens - cli.new_tokens % unit;
-    println!("{} ({design}): {} params, {new_tokens} new tokens", model.name(), fmt_params(params));
+    let quant = spec.map_or_else(|| "none".to_owned(), |s| s.name());
+    println!(
+        "{} ({design}, quant {quant}): {} params, {new_tokens} new tokens",
+        model.name(),
+        fmt_params(params)
+    );
     for (name, n) in &parts {
         println!("  {name:<18} {:>10}", fmt_params(*n));
     }
@@ -397,10 +446,15 @@ fn bench_model(
         );
         decode_rates.push((context, decode_tok_s));
     }
+    // After the runs, so every parameter is initialised in the order the runs used them.
+    let weight_bytes = model.weight_bytes();
+    println!("  weights {:.1} MiB on the device", weight_bytes as f64 / (1u64 << 20) as f64);
     let result = json!({
         "name": model.name(),
         "design": design,
+        "quant": quant,
         "params": params,
+        "weight_bytes": weight_bytes,
         "parts": parts.iter().map(|(n, c)| json!({"name": n, "params": c})).collect::<Vec<_>>(),
         "new_tokens": new_tokens,
         "contexts": contexts,
@@ -521,6 +575,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     set_fused_attention(cli.fused_attention);
     set_fused_kernels(!cli.reference_kernels);
     set_cuda_graphs(!cli.no_cuda_graphs);
+    let spec = cli.quant_spec()?;
     let itemsize = match dtype {
         DtypeChoice::Bf16 => 2,
         DtypeChoice::F32 => 4,
@@ -535,7 +590,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     for design in cli.design.designs() {
         for kind in &kinds {
             let cfg = config_for(kind, design, cli.tiny);
-            let (result, decode) = bench_model(&cfg, cli, &device, itemsize);
+            let (result, decode) = bench_model(&cfg, cli, &device, itemsize, spec);
             results.push(result);
             rates.push((kind, design, decode));
         }
@@ -581,6 +636,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
             && !cli.reference_kernels
             && !cli.no_cuda_graphs,
         "speculate": cli.speculate == Speculate::On,
+        "quant": spec.map_or_else(|| "none".to_owned(), |s| s.name()),
         "results": results,
         "ratios": ratios,
         "ncm_v2_over_fallback": design_ratios,

@@ -8,6 +8,7 @@ use burn::tensor::{Device, Int, Tensor};
 use crate::cache::LayerCache;
 use crate::config::{Design, TokConfig};
 use crate::layers::{Stack, StackSpec, fallback_kinds, hybrid_kinds, init_normal};
+use crate::quant::{QLinear, tied_head};
 
 pub struct TokParts {
     pub embeddings: usize,
@@ -51,6 +52,8 @@ pub fn tok_spec(cfg: &TokConfig) -> StackSpec {
 pub struct TokenLm {
     emb: Embedding,
     stack: Stack,
+    /// A quantised copy of the tied output head (see [`crate::quant`]); None: logits use `emb`.
+    head: Option<QLinear>,
 }
 
 impl TokenLm {
@@ -60,6 +63,7 @@ impl TokenLm {
                 .with_initializer(init_normal())
                 .init(device),
             stack: Stack::new(&tok_spec(cfg), device),
+            head: tied_head(cfg.vocab_size, cfg.d_model, device),
         }
     }
 
@@ -68,7 +72,10 @@ impl TokenLm {
     }
 
     fn logits(&self, x: Tensor<3>) -> Tensor<3> {
-        linear_op(x, self.emb.weight.val().transpose(), None)
+        match &self.head {
+            Some(head) => head.forward(x),
+            None => linear_op(x, self.emb.weight.val().transpose(), None),
+        }
     }
 
     /// Final hidden states `[B, T, d]`. Pass caches to run incrementally.

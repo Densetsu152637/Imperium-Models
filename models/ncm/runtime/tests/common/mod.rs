@@ -51,6 +51,7 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
         weights: None,
         seed: 3,
         prefill_chunk: 16,
+        quant: None,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
 }

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use burn::module::Module;
-use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::nn::{Initializer, Linear as DenseLinear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::{sigmoid, silu, softmax};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
@@ -19,6 +19,7 @@ use burn::tensor::{Bool, Device, Tensor, TensorData};
 use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
 use crate::config::{V2Config, is_full_layer};
 use crate::delta::{DeltaSpec, GatedDeltaNet};
+use crate::quant::QLinear as Linear;
 use crate::retrieval::{RetrievalSpec, SparseRetrieval};
 
 /// Weight initialiser used by every linear layer and embedding: N(0, 0.02).
@@ -26,7 +27,13 @@ pub fn init_normal() -> Initializer {
     Initializer::Normal { mean: 0.0, std: 0.02 }
 }
 
+/// A bias-free linear layer: dense, or quantised inside [`crate::quant::build`].
 pub fn linear(d_in: usize, d_out: usize, device: &Device) -> Linear {
+    Linear::new(d_in, d_out, device)
+}
+
+/// A bias-free linear layer that is never quantised (its weight is read as a matrix).
+pub fn dense_linear(d_in: usize, d_out: usize, device: &Device) -> DenseLinear {
     LinearConfig::new(d_in, d_out).with_bias(false).with_initializer(init_normal()).init(device)
 }
 
@@ -184,9 +191,9 @@ impl Mlp {
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
-        let mut parts = crate::fused::linear(&self.gate_up, x).chunk(2, D - 1).into_iter();
+        let mut parts = self.gate_up.forward(x).chunk(2, D - 1).into_iter();
         let (gate, up) = (parts.next().expect("gate"), parts.next().expect("up"));
-        crate::fused::linear(&self.down, silu(gate) * up)
+        self.down.forward(silu(gate) * up)
     }
 }
 
@@ -282,8 +289,8 @@ impl Attention {
     ) -> (Option<Tensor<3>>, Tensor<4>, Tensor<4>, Tensor<4>) {
         let [b, t, _] = x.dims();
         let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
-        let gate = self.gate.as_ref().map(|g| sigmoid(crate::fused::linear(g, x.clone())));
-        let qkv = crate::fused::linear(&self.qkv, x);
+        let gate = self.gate.as_ref().map(|g| sigmoid(g.forward(x.clone())));
+        let qkv = self.qkv.forward(x);
         let (q, k) = match (&self.q_norm, &self.k_norm) {
             (Some(q_norm), Some(k_norm)) => {
                 let q = qkv.clone().narrow(2, 0, h * hd).reshape([b, t, h, hd]);
@@ -310,7 +317,7 @@ impl Attention {
             Some(gate) => out * gate,
             None => out,
         };
-        crate::fused::linear(&self.o, out)
+        self.o.forward(out)
     }
 }
 
@@ -348,7 +355,7 @@ impl CrossAttention {
     pub fn make_kv(&self, states: Tensor<3>, rope: &Rope) -> (Tensor<4>, Tensor<4>) {
         let [b, t, _] = states.dims();
         let (kvh, hd) = (self.kv_heads, self.head_dim);
-        let kv = crate::fused::linear(&self.kv, states);
+        let kv = self.kv.forward(states);
         let k = kv.clone().narrow(2, 0, kvh * hd);
         let v = kv.narrow(2, kvh * hd, kvh * hd);
         let k = apply_rope(k.reshape([b, t, kvh, hd]).swap_dims(1, 2), rope);
@@ -414,9 +421,9 @@ fn cross_attend(
     mask: Option<Tensor<2, Bool>>,
 ) -> Tensor<3> {
     let [b, t, _] = x.dims();
-    let q = crate::fused::linear(q, x).reshape([b, t, h, hd]).swap_dims(1, 2);
+    let q = q.forward(x).reshape([b, t, h, hd]).swap_dims(1, 2);
     let out = attend(apply_rope(q, rope_q), keys, values, mask);
-    crate::fused::linear(o, out.swap_dims(1, 2).reshape([b, t, h * hd]))
+    o.forward(out.swap_dims(1, 2).reshape([b, t, h * hd]))
 }
 
 /// The sequence mixer of one layer. A stack holds a few dozen at most, so the size gap between

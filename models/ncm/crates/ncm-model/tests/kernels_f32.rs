@@ -36,7 +36,7 @@ fn argmax_matches_burn_f32() {
 #[test]
 fn graphed_decode_matches_eager_f32() {
     let (device, _lock) = setup(DTYPE);
-    graphed_decode_matches(&device);
+    graphed_decode_matches(&device, None);
 }
 
 #[test]
@@ -48,5 +48,21 @@ fn gemv_matches_cpu_f32() {
 #[test]
 fn graphed_speculation_matches_eager_f32() {
     let (device, _lock) = setup(DTYPE);
-    graphed_speculation_matches(&device, true);
+    graphed_speculation_matches(&device, true, None);
+}
+
+#[test]
+fn graphed_quantised_decode_matches_eager_f32() {
+    let (device, _lock) = setup(DTYPE);
+    for spec in quant_specs() {
+        graphed_decode_matches(&device, Some(spec));
+    }
+}
+
+#[test]
+fn graphed_quantised_speculation_matches_eager_f32() {
+    let (device, _lock) = setup(DTYPE);
+    for spec in quant_specs() {
+        graphed_speculation_matches(&device, true, Some(spec));
+    }
 }

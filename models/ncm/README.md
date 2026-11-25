@@ -13,7 +13,7 @@ The design, plan and acceptance checks live in Imperium-Research under `docs/nex
 | `crates/ncm-bench/` | `ncm-bench`, the batch-1 decode-speed benchmark |
 | `crates/ncm-data/` | `ncm-data`, the stage 2 data pipeline: fetch, sample, train the tokenizer, tokenise, stats |
 | `configs/` | Model configs (TOML), embedded into `ncm-model`: `*-250m-v2.toml` (the adopted attention design) and `*-250m.toml` (the fallback); and `data-mix.toml`, the pinned pretraining source manifest |
-| `docs/` | `attention.md` (the two attention designs as implemented), `chat-format.md` |
+| `docs/` | `attention.md` (the two attention designs as implemented), `quantisation.md` (8- and 4-bit weights), `chat-format.md` |
 | `runtime/` | `ncm-server`, an OpenAI-compatible inference server launched by Imperium like `llama-server` (see `runtime/README.md`). A training crate (Burn autodiff) will also build on `ncm-model` |
 | `scripts/check.sh` | CI checks: `cargo fmt --check`, `clippy`, `test` on the CPU backend, and a tiny benchmark run |
 | `data/`, `runs/`, `outputs/`, `weights/` | Local only, ignored by Git |
@@ -27,7 +27,7 @@ target/release/ncm-bench --device cuda --design fallback --context 2048 16384   
 target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8              # smoke run
 ```
 
-`--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models. With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
+`--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models. `--quant q8|q4` runs the linear layers on 8-bit or 4-bit weights (`--quant-group 64|128` for q4, `--dense-head` to keep the output head dense; see `docs/quantisation.md`). With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
 
 More switches:
 

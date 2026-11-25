@@ -1,6 +1,7 @@
-//! Fused CubeCL kernels for the host-bound v2 decode paths (cargo feature `cuda`).
+//! Fused CubeCL kernels for the host-bound decode paths (cargo feature `cuda`).
 //!
-//! Each kernel matches a reference path in `delta.rs` or `retrieval.rs` and is exposed to the
+//! Each kernel matches a reference path in `delta.rs`, `retrieval.rs` or the linear layers
+//! ([`crate::quant::QLinear`]: dense and quantised matrix-vector products) and is exposed to the
 //! layers through a Burn backend extension routed to the cubecl backend. The layers call them only
 //! where [`crate::fused::active`] says so; everything else runs the reference tensor code.
 
@@ -8,6 +9,7 @@ mod argmax;
 mod assign;
 mod delta;
 mod gemv;
+mod quant;
 mod retrieval;
 
 use burn::backend::tensor::{FloatTensor, IntTensor};
@@ -86,6 +88,26 @@ pub trait NcmKernels: Backend {
 
     /// See [`gemv`].
     fn ncm_gemv(x: FloatTensor<Self>, w: FloatTensor<Self>) -> FloatTensor<Self>;
+
+    /// See [`qmatmul`]; `x` `[rows, d_in]` with `rows <= GEMV_ROWS`.
+    fn ncm_qgemv(
+        x: FloatTensor<Self>,
+        packed: IntTensor<Self>,
+        scales: FloatTensor<Self>,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+    ) -> FloatTensor<Self>;
+
+    /// See [`qmatmul`]; the decoded weight `[d_in, d_out]` at `dtype`.
+    fn ncm_dequant(
+        packed: IntTensor<Self>,
+        scales: FloatTensor<Self>,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+        dtype: DType,
+    ) -> FloatTensor<Self>;
 
     /// See [`packed`].
     fn ncm_packed(x: FloatTensor<Self>) -> FloatTensor<Self>;
@@ -205,6 +227,72 @@ impl NcmKernels for CubeBackend {
             }
         }
         y
+    }
+
+    fn ncm_qgemv(
+        x: CubeTensor,
+        packed: CubeTensor,
+        scales: CubeTensor,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+    ) -> CubeTensor {
+        use quant::{PLANE, PLANES};
+        let rows = x.meta.shape().dims::<2>()[0];
+        let [n_len, words] = packed.meta.shape().dims::<2>();
+        let out = empty_like(&x, vec![rows, n_len]);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        unsafe {
+            quant::qgemv_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(n_len.div_ceil(PLANES) as u32, 1, 1),
+                CubeDim::new_2d(PLANE as u32, PLANES as u32),
+                x.into_tensor_arg(),
+                packed.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                d_in,
+                n_len,
+                words,
+                bits,
+                rows,
+                group_words,
+                dtype,
+            );
+        }
+        out
+    }
+
+    fn ncm_dequant(
+        packed: CubeTensor,
+        scales: CubeTensor,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+        dtype: DType,
+    ) -> CubeTensor {
+        use quant::DEQUANT_CUBE;
+        let [n_len, words] = packed.meta.shape().dims::<2>();
+        let out = scratch(&packed, vec![d_in, n_len], dtype);
+        let client = packed.client.clone();
+        unsafe {
+            quant::dequant_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static((n_len * words).div_ceil(DEQUANT_CUBE) as u32, 1, 1),
+                CubeDim::new_1d(DEQUANT_CUBE as u32),
+                packed.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                d_in,
+                n_len,
+                words,
+                bits,
+                group_words,
+                elem(dtype),
+            );
+        }
+        out
     }
 
     fn ncm_assign_int(dst: CubeTensor, src: CubeTensor, axis: usize, at: usize) -> CubeTensor {
@@ -572,4 +660,39 @@ pub fn gemv<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
 /// Whether [`gemv`] takes an input of `rows` rows.
 pub fn gemv_rows_ok(rows: usize) -> bool {
     rows <= gemv::MAX_ROWS
+}
+
+/// `x` `[M, d_in]` times a quantised weight (`qweight` `[d_out, words]` i32, `scales`
+/// `[d_out, groups]` f32, in `format`): one dequantise-and-multiply GEMV kernel for up to
+/// [`GEMV_ROWS`](crate::quant::GEMV_ROWS) rows (decode), else the weight decoded at `x`'s dtype
+/// and Burn's matmul (prefill). Codes and scales are only read, so the call can be captured into
+/// a CUDA graph.
+pub fn qmatmul(
+    x: Tensor<2>,
+    qweight: Tensor<2, Int>,
+    scales: Tensor<2>,
+    d_in: usize,
+    format: crate::quant::Format,
+) -> Tensor<2> {
+    let group_words = format.group_len(d_in) / format.per_word();
+    if x.dims()[0] <= crate::quant::GEMV_ROWS {
+        let y = <Dispatch as NcmKernels>::ncm_qgemv(
+            x.into_dispatch(),
+            qweight.into_dispatch(),
+            scales.into_dispatch(),
+            d_in,
+            format.bits,
+            group_words,
+        );
+        return Tensor::from_dispatch(y);
+    }
+    let w = <Dispatch as NcmKernels>::ncm_dequant(
+        qweight.into_dispatch(),
+        scales.into_dispatch(),
+        d_in,
+        format.bits,
+        group_words,
+        x.dtype(),
+    );
+    x.matmul(Tensor::from_dispatch(w))
 }

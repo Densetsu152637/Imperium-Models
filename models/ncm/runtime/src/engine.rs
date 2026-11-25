@@ -5,12 +5,13 @@
 //! resets the caches, prefills its prompt and decodes until a stop token, the token limit, or the
 //! end of the context.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
+use ncm_model::quant::{self, QuantError, QuantSpec};
 use ncm_model::weights::{self, WeightsError};
 use ncm_model::{Config, LayerCache, NcmCache, NcmLm, TokenLm, cache_bytes};
 
@@ -37,6 +38,10 @@ pub enum EngineError {
     Vocab(#[from] VocabError),
     #[error(transparent)]
     Weights(#[from] WeightsError),
+    #[error(transparent)]
+    Quant(#[from] QuantError),
+    #[error("the weight file is quantised as {file}, but {asked} was asked for")]
+    QuantMismatch { file: String, asked: String },
     #[error("device: {0}")]
     Device(String),
 }
@@ -151,6 +156,9 @@ pub struct EngineOptions {
     /// Seed for random weights.
     pub seed: u64,
     pub prefill_chunk: usize,
+    /// Quantise the linear layers' weights at load (see `ncm_model::quant`). A quantised weight
+    /// file loads as it is; this must then be None or the file's own spec.
+    pub quant: Option<QuantSpec>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -179,6 +187,31 @@ impl ModuleMapper for Materialise {
     }
 }
 
+/// Builds a model with `build` and fills it: random weights (quantised per `quant`), a dense
+/// weight file (quantised after loading per `quant`), or a quantised weight file.
+fn load_model<M: Module>(
+    weights: Option<&Path>,
+    dtype: FloatDType,
+    quant: Option<QuantSpec>,
+    device: &Device,
+    build: impl Fn() -> M,
+) -> Result<M, EngineError> {
+    let Some(path) = weights else {
+        return Ok(quant::build(quant, &build).map(&mut Materialise));
+    };
+    if let Some(file) = quant::read_spec(path)? {
+        if let Some(asked) = quant.filter(|q| *q != file) {
+            return Err(EngineError::QuantMismatch { file: file.name(), asked: asked.name() });
+        }
+        return Ok(quant::load_quantized(path, dtype, &build)?.0);
+    }
+    let model = weights::load_weights(build(), path, dtype)?;
+    match quant {
+        Some(spec) => Ok(quant::quantize_model(&model, spec, device, &build)?),
+        None => Ok(model),
+    }
+}
+
 fn itemsize(dtype: FloatDType) -> usize {
     match dtype {
         FloatDType::F64 => 8,
@@ -191,8 +224,17 @@ impl Engine {
     /// Builds the model (loading `options.weights` or initialising random weights) and
     /// allocates the caches for `options.ctx` tokens.
     pub fn new(options: EngineOptions, vocab: Arc<Vocab>) -> Result<Self, EngineError> {
-        let EngineOptions { config, ctx, device, device_name, dtype, weights, seed, prefill_chunk } =
-            options;
+        let EngineOptions {
+            config,
+            ctx,
+            device,
+            device_name,
+            dtype,
+            weights,
+            seed,
+            prefill_chunk,
+            quant,
+        } = options;
         if vocab.len() != config.vocab_size() {
             return Err(EngineError::VocabMismatch {
                 table: vocab.len(),
@@ -209,23 +251,18 @@ impl Engine {
         device.seed(seed);
         let (state, params, arch) = match &config {
             Config::Tok(cfg) => {
-                let model = TokenLm::new(cfg, &device);
-                let model = match &weights {
-                    Some(path) => weights::load_weights(model, path, dtype)?,
-                    None => model.map(&mut Materialise),
-                };
+                let build = || TokenLm::new(cfg, &device);
+                let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
                 let caches = model.make_cache(capacity, 1, &device);
-                let params = model.parts().total();
+                // Counted on a dense model that is never initialised: a quantised one holds codes.
+                let params = TokenLm::new(cfg, &device).parts().total();
                 (State::Tok { model, caches }, params, "tok")
             }
             Config::Ncm(cfg) => {
-                let model = NcmLm::new(cfg, &device);
-                let model = match &weights {
-                    Some(path) => weights::load_weights(model, path, dtype)?,
-                    None => model.map(&mut Materialise),
-                };
+                let build = || NcmLm::new(cfg, &device);
+                let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
                 let cache = model.make_cache(capacity, 1, &device);
-                let params = model.parts().total();
+                let params = NcmLm::new(cfg, &device).parts().total();
                 (State::Ncm { model, cache }, params, "ncm")
             }
         };

@@ -17,6 +17,7 @@ pub mod fused;
 pub mod kernels;
 pub mod layers;
 pub mod ncm;
+pub mod quant;
 pub mod retrieval;
 pub mod speculative;
 pub mod tok;
