@@ -12,6 +12,7 @@ import json
 import math
 import pathlib
 import random
+import re
 
 R = random.Random(20261124)
 OUT = pathlib.Path(__file__).parent
@@ -544,6 +545,35 @@ GK = [("What is the capital city of Australia?", "Canberra", "string"),
       ("Who wrote the play Hamlet?", "William Shakespeare", "string")]
 for q, a, t in GK:
     task("general_knowledge", q, a, t, tol=0.001 if t == "number" else 0.0)
+
+# ---- scoring helpers: aliases (unambiguous short forms) and distractors (rival options), added post hoc
+GK_ALIASES = {"Jane Austen": ["Austen"], "Leonardo da Vinci": ["Leonardo", "da Vinci"], "Neil Armstrong": ["Armstrong"],
+              "William Shakespeare": ["Shakespeare"], "carbon dioxide": ["CO2"]}
+MANUAL_DISTRACTORS = {"noon": ["midnight"], "planet": ["star", "comet"], "slowest": ["fastest"], "no": ["yes"]}
+for t in tasks:
+    a = t["answer"]
+    if t["answer_type"] != "string":
+        continue
+    al = []
+    if a in people:
+        al.append(a.split()[-1])
+    if a in COMPANIES:
+        al.append(a.split()[0])
+    al += GK_ALIASES.get(a, [])
+    if al:
+        t["aliases"] = al
+    ds = list(MANUAL_DISTRACTORS.get(str(a), []))
+    m = re.search(r"(?:,|\s)\s*([^,?]+?) or ([^,?]+?)\?", t["question"])
+    if m and t["category"] == "compare_aggregate":
+        ds += [x.strip() for x in m.groups() if x.strip() != a]
+    if t["category"] == "logic":
+        if a in ("knight", "liar"):
+            ds += ["liar" if a == "knight" else "knight"]
+        else:
+            ds += [n for n in NAMES if n != a and n in re.findall(r"[A-Z][a-z]+", t["question"])]
+            ds += [i for i in ["cat", "dog", "parrot", "rabbit", "fish"] if i != a and False]
+    if ds:
+        t["distractors"] = ds
 
 with open(OUT / "kb.jsonl", "w", encoding="utf-8") as f:
     for r in KB:

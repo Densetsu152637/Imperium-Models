@@ -12,6 +12,7 @@ import time
 import arms
 import llm
 from bm25 import BM25
+from grounding import grounded, grounded_all
 from scoring import score
 
 HERE = pathlib.Path(__file__).parent
@@ -22,6 +23,7 @@ try:
     import imperium_backend
     ARMS["harness"] = imperium_backend.run_imperium
     ARMS["harness_note"] = imperium_backend.run_imperium_note
+    ARMS["harness_refined"] = imperium_backend.run_imperium_refined
 except ImportError:
     pass
 
@@ -71,13 +73,15 @@ def main():
                            escalation_reason=r.get("escalation_reason"), samples=r.get("samples"),
                            retrieved=r.get("retrieved"), trace=r.get("trace"), output=r.get("output"))
                 for k in ("exit_code", "exit_reason", "tool_calls", "failed_tool_calls", "imperium_wall_ms",
-                          "prompt_hash", "cached_tokens", "runtime_error", "endpoint_errors", "stderr"):
+                          "prompt_hash", "variant_hash", "variant_warnings", "cached_tokens", "runtime_error", "endpoint_errors", "stderr"):
                     if k in r:
                         rec[k] = r[k]
                 if parsed is None:
                     rec["error"] = "no_final_answer_line"
             except Exception as e:  # an erroring item counts as wrong and is recorded
                 rec.update(final_answer=None, correct=False, error=f"{type(e).__name__}: {e}")
+            rec["grounded"] = grounded(t, rec)
+            rec["grounded_all"] = grounded_all(t, rec)
             rec.update(wall_time_s=round(time.perf_counter() - t0, 3), model_calls=meter.calls,
                        prompt_tokens=meter.prompt_tokens, completion_tokens=meter.completion_tokens)
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")

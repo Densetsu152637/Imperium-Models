@@ -41,16 +41,23 @@ def _compact_trace(transcript):
     for m in transcript or []:
         for tc in (m.get("tool_calls") or []):
             fn = tc.get("function", {})
-            out.append({"tool": fn.get("name"), "args": str(fn.get("arguments"))[:200]})
+            out.append({"tool": fn.get("name"), "args": str(fn.get("arguments"))[:600]})
     return out
 
 
-def run_imperium(task, bm25, meter, note=False):
+def run_imperium(task, bm25, meter, note=False, variant=None):
     ws = _scratch / task["id"]
     kb_files.write(ws, HERE / "suite/kb.jsonl")
     prompt = f"{INSTRUCTION}{NOTE if note else ''}\n\nQuestion: {task['question']}"
     cmd = [IMPERIUM, "run", "--headless", "--json", "--root-model", ENDPOINT, "--model-id", MODEL_ID,
            "--workspace", str(ws), "--task", prompt] + FLAGS
+    if variant:
+        # the refined arm lets the agent run commands (python3 for arithmetic) in its scratch workspace copy;
+        # the engine's safety floor still stops destructive commands. Other arms stay at `default`, where
+        # commands are denied because nobody can answer the prompt.
+        cmd = [x for x in cmd]
+        cmd[cmd.index("--permission-mode") + 1] = "full"
+        cmd += ["--config-home", str(HERE), "--variant", variant]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=TIMEOUT_S + 60)
         code, stdout, stderr = p.returncode, p.stdout, p.stderr
@@ -71,7 +78,8 @@ def run_imperium(task, bm25, meter, note=False):
     return {"final_text": j.get("final_reply") or "", "exit_code": code, "exit_reason": j.get("exit_reason"),
             "stop_reason": j.get("exit_reason"), "tool_calls": j.get("root_tool_calls"),
             "failed_tool_calls": j.get("failed_tool_calls"), "imperium_wall_ms": j.get("wall_time_ms"),
-            "prompt_hash": j.get("prompt_hash"), "cached_tokens": tot.get("cached_tokens"),
+            "prompt_hash": j.get("prompt_hash"), "variant_hash": (j.get("variant") or {}).get("config_hash"),
+            "variant_warnings": (j.get("variant") or {}).get("warnings"), "cached_tokens": tot.get("cached_tokens"),
             "trace": trace, "output": j.get("final_reply"), "runtime_error": j.get("error"),
             "endpoint_errors": len(j.get("endpoint_errors") or [])}
 
@@ -79,3 +87,8 @@ def run_imperium(task, bm25, meter, note=False):
 def run_imperium_note(task, bm25, meter):
     """Sensitivity variant: the prompt carries the same real-world/arithmetic/logic note the rag arm has."""
     return run_imperium(task, bm25, meter, note=True)
+
+
+def run_imperium_refined(task, bm25, meter):
+    """Imperium with the refined harness variant (config/harness-variants/<name>.toml); neutral task prompt."""
+    return run_imperium(task, bm25, meter, variant=os.environ.get("HARNESS_VARIANT", "refined"))

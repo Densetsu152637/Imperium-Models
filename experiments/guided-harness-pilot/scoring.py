@@ -1,4 +1,17 @@
-"""Deterministic scoring. No LLM judge."""
+"""Deterministic strict scoring. No LLM judge.
+
+Rules (all applied to the text after the last `Final answer:` marker on its line):
+ 1. A missing marker is wrong.
+ 2. Abstain items: correct only if the line abstains (a phrase such as "Unknown" or "not in the knowledge base")
+    and gives no concrete answer (no digit, no hedge word such as "likely" or "but").
+ 3. A non-abstain item whose line abstains is wrong.
+ 4. Number items: after removing numbers listed in the item's `allow_numbers`, the line must contain exactly one
+    number (or, when the line has "=", the number after the last "="); ranges and several candidates fail. The
+    number must be within the item's tolerance of the gold.
+ 5. Text items: the gold (or one of the item's `aliases`) must appear as a whole-token run; the line fails if it
+    also offers an alternative: "or", "either", "/", "and/or", or a list of short capitalised candidates; or if any
+    of the item's `distractors` appears in it.
+"""
 import re
 
 ABSTAIN_PHRASES = [
@@ -8,6 +21,8 @@ ABSTAIN_PHRASES = [
     "abstain", "not available", "cannot be answered", "can t be answered", "cannot answer", "not known",
     "no data", "not given", "not listed",
 ]
+HEDGE_WORDS = {"but", "however", "likely", "probably", "possibly", "perhaps", "maybe", "approximately", "around",
+               "guess", "assuming", "estimated", "roughly", "about"}
 ARTICLES = {"a", "an", "the"}
 NUMBER_WORDS = {w: i for i, w in enumerate(
     "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
@@ -50,15 +65,18 @@ def is_abstain(answer):
     return any(" " + normalize(p) + " " in n for p in ABSTAIN_PHRASES)
 
 
-def first_number(answer):
+def numbers_in(answer):
+    """All numbers in the answer, digits first, then number words when there are no digits."""
     n = normalize(answer)
-    m = re.search(r"-?\d+(?:\.\d+)?", n)
-    if m:
-        return float(m.group(0))
-    for tok in n.split():
-        if tok in NUMBER_WORDS:
-            return float(NUMBER_WORDS[tok])
-    return None
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", n)]
+    if not nums:
+        nums = [float(NUMBER_WORDS[t]) for t in n.split() if t in NUMBER_WORDS]
+    return nums
+
+
+def first_number(answer):
+    nums = numbers_in(answer)
+    return nums[0] if nums else None
 
 
 def contains_tokens(answer_norm, gold_norm):
@@ -68,19 +86,49 @@ def contains_tokens(answer_norm, gold_norm):
     return any(a[i:i + len(g)] == g for i in range(len(a) - len(g) + 1))
 
 
+def has_alternative(ans, gold_norms):
+    """True when the line offers more than one candidate answer."""
+    low = " " + strip_markup(ans).lower() + " "
+    if re.search(r"\s(or|either|and/or)\s|/", low):
+        return True
+    parts = [p.strip() for p in re.split(r",|;|\sand\s|&", strip_markup(ans)) if p.strip()]
+    if len(parts) >= 2:
+        hit = [p for p in parts if any(contains_tokens(normalize(p), g) for g in gold_norms)]
+        others = [p for p in parts if p not in hit]
+        if hit and any(len(p.split()) <= 4 and p[:1].isupper() for p in others):
+            return True
+    return False
+
+
 def score(task, text):
     """Return (correct, parsed_answer). `text` is the model output ending with a Final answer line."""
     ans = extract_final(text)
     if ans is None:
         return False, None
     gold, kind = task["answer"], task["answer_type"]
+    ab = is_abstain(ans)
     if kind == "abstain":
-        return is_abstain(ans), ans
-    if is_abstain(ans):
+        concrete = bool(re.search(r"\d", ans)) or bool(set(normalize(ans).split()) & HEDGE_WORDS)
+        return (ab and not concrete), ans
+    if ab:
         return False, ans
     if kind == "number":
-        v = first_number(ans)
-        return (v is not None and abs(v - float(gold)) <= max(task.get("tol", 0.0), 1e-9) + 1e-6), ans
-    golds = [gold] + list(task.get("aliases", []))
+        nums = numbers_in(ans)
+        allowed = {float(x) for x in task.get("allow_numbers", [])}
+        if "=" in ans and re.search(r"\d", ans.rsplit("=", 1)[1]):
+            nums = numbers_in(ans.rsplit("=", 1)[1])
+        nums = [x for x in nums if x not in allowed]
+        if len(nums) != 1:
+            return False, ans
+        return abs(nums[0] - float(gold)) <= max(task.get("tol", 0.0), 1e-9) + 1e-6, ans
+    golds = [normalize(str(g)) for g in [gold] + list(task.get("aliases", []))]
     an = normalize(ans)
-    return any(contains_tokens(an, normalize(str(g))) for g in golds), ans
+    if not any(contains_tokens(an, g) for g in golds):
+        return False, ans
+    if has_alternative(ans, golds):
+        return False, ans
+    for d in task.get("distractors", []):
+        dn = normalize(str(d))
+        if dn and contains_tokens(an, dn) and not any(contains_tokens(g, dn) for g in golds):
+            return False, ans
+    return True, ans
