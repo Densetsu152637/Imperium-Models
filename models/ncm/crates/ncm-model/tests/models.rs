@@ -208,8 +208,10 @@ fn full_config_param_counts() {
     // Parameters are initialised lazily, so counting does not allocate 250M floats.
     let tok = TokenLm::new(&tok_250m(), &device).parts();
     let ncm = NcmLm::new(&ncm_250m(), &device).parts();
+    // The PyTorch build had no draft head.
+    let ncm_torch_parts = ncm.total() - ncm.draft;
     for (name, total, torch) in
-        [("tok", tok.total(), TORCH_TOK_PARAMS), ("ncm", ncm.total(), TORCH_NCM_PARAMS)]
+        [("tok", tok.total(), TORCH_TOK_PARAMS), ("ncm", ncm_torch_parts, TORCH_NCM_PARAMS)]
     {
         assert!((225_000_000..=265_000_000).contains(&total), "{name}: {total}");
         let off = (total as f64 - torch as f64).abs() / torch as f64;
@@ -217,8 +219,15 @@ fn full_config_param_counts() {
     }
     let m = |n: usize| (n as f64 / 1e5).round() / 10.0;
     assert_eq!(
-        [m(ncm.embeddings), m(ncm.encoder), m(ncm.backbone), m(ncm.decoder), m(ncm.projections)],
-        [16.4, 6.3, 199.3, 15.7, 2.6]
+        [
+            m(ncm.embeddings),
+            m(ncm.encoder),
+            m(ncm.backbone),
+            m(ncm.decoder),
+            m(ncm.draft),
+            m(ncm.projections)
+        ],
+        [16.4, 6.3, 199.3, 15.7, 3.7, 2.6]
     );
     assert_eq!(ncm.rows().iter().map(|r| r.1).sum::<usize>(), ncm.total());
     assert_eq!(tok.rows().iter().map(|r| r.1).sum::<usize>(), tok.total());

@@ -27,6 +27,7 @@ use crate::layers::{
     Attention, CrossAttention, LayerKind, Mlp, Rope, Stack, StackSpec, fallback_kinds,
     hybrid_kinds, init_normal, linear, rms_norm,
 };
+use crate::speculative::DraftHead;
 
 #[derive(Module, Debug)]
 pub struct DecoderBlock {
@@ -51,21 +52,25 @@ impl DecoderBlock {
         }
     }
 
-    /// `x` is `[B, M', k, d]`: every concept's decoder runs in parallel.
+    /// `x` is `[B, M', k, d]`: every concept's decoder runs in parallel, teacher-forced.
+    /// `causal` is the `[k, k]` mask inside a concept; `mask` hides encoder states per query
+    /// (None: every key is visible, as for one concept against the decode cache).
+    #[allow(clippy::too_many_arguments)]
     fn forward_train(
         &self,
         x: Tensor<4>,
         rope_self: &Rope,
         rope_q: &Rope,
+        causal: Tensor<2, Bool>,
         keys: Tensor<4>,
         values: Tensor<4>,
-        mask: Tensor<2, Bool>,
+        mask: Option<Tensor<2, Bool>>,
     ) -> Tensor<4> {
         let [b, m, k, d] = x.dims();
         let h = self.n1.forward(x.clone()).reshape([b * m, k, d]);
-        let x = x + self.self_attn.forward(h, rope_self, None).reshape([b, m, k, d]);
+        let x = x + self.self_attn.forward_masked(h, rope_self, Some(causal)).reshape([b, m, k, d]);
         let h = self.n2.forward(x.clone()).reshape([b, m * k, d]);
-        let x = x + self.cross.forward(h, rope_q, keys, values, Some(mask)).reshape([b, m, k, d]);
+        let x = x + self.cross.forward(h, rope_q, keys, values, mask).reshape([b, m, k, d]);
         x.clone() + self.mlp.forward(self.n3.forward(x))
     }
 
@@ -165,12 +170,19 @@ pub struct NcmParts {
     pub encoder: usize,
     pub backbone: usize,
     pub decoder: usize,
+    /// The parallel draft head (0 without one).
+    pub draft: usize,
     pub projections: usize,
 }
 
 impl NcmParts {
     pub fn total(&self) -> usize {
-        self.embeddings + self.encoder + self.backbone + self.decoder + self.projections
+        self.embeddings
+            + self.encoder
+            + self.backbone
+            + self.decoder
+            + self.draft
+            + self.projections
     }
 
     pub fn rows(&self) -> Vec<(&'static str, usize)> {
@@ -179,6 +191,7 @@ impl NcmParts {
             ("local encoder", self.encoder),
             ("global backbone", self.backbone),
             ("local decoder", self.decoder),
+            ("draft head", self.draft),
             ("projections", self.projections),
         ]
     }
@@ -194,6 +207,7 @@ pub struct NcmLm {
     start_emb: Param<Tensor<1>>,
     dec_blocks: Vec<DecoderBlock>,
     dec_norm: RmsNorm,
+    draft: Option<DraftHead>,
     k: usize,
     local_dim: usize,
     head_dim: usize,
@@ -206,6 +220,10 @@ pub struct NcmLm {
 impl NcmLm {
     pub fn new(cfg: &NcmConfig, device: &Device) -> Self {
         assert!(cfg.k >= 2, "concepts need at least two tokens");
+        assert!(
+            cfg.draft_layers <= cfg.dec_layers,
+            "draft layer i reads decoder layer i's cross-attention cache: draft_layers <= dec_layers"
+        );
         let d = cfg.local_dim;
         let (encoder, backbone) = ncm_specs(cfg);
         Self {
@@ -219,6 +237,7 @@ impl NcmLm {
             start_emb: init_normal().init([d], device),
             dec_blocks: (0..cfg.dec_layers).map(|_| DecoderBlock::new(cfg, device)).collect(),
             dec_norm: rms_norm(d, cfg.norm_eps, device),
+            draft: (cfg.draft_layers > 0).then(|| DraftHead::new(cfg, device)),
             k: cfg.k,
             local_dim: d,
             head_dim: cfg.head_dim,
@@ -234,19 +253,25 @@ impl NcmLm {
         self.k
     }
 
+    /// Whether the model has the parallel draft head that self-speculative decoding needs.
+    pub fn has_draft_head(&self) -> bool {
+        self.draft.is_some()
+    }
+
     pub fn parts(&self) -> NcmParts {
         NcmParts {
             embeddings: self.emb.num_params(),
             encoder: self.encoder.num_params(),
             backbone: self.backbone.num_params(),
             decoder: self.dec_blocks.num_params() + self.dec_norm.num_params(),
+            draft: self.draft.as_ref().map_or(0, Module::num_params),
             projections: self.pool.num_params()
                 + self.cond_proj.num_params()
                 + self.start_emb.num_params(),
         }
     }
 
-    fn rope(&self, start: usize, len: usize, device: &Device) -> Rope {
+    pub(crate) fn rope(&self, start: usize, len: usize, device: &Device) -> Rope {
         Rope::new(start, len, self.head_dim, self.rope_base, self.rope_scale, device)
     }
 
@@ -258,6 +283,19 @@ impl NcmLm {
 
     /// Logits `[B, N - k, V]` for tokens k..N-1 of a sequence whose length is a multiple of k.
     pub fn forward(&self, tokens: Tensor<2, Int>) -> Tensor<3> {
+        self.forward_parts(tokens, false).0
+    }
+
+    /// [`Self::forward`] and the draft head's logits `[B, N - k, V]` over the same positions
+    /// (`draft[:, t - k]` is the draft head's guess for token t, made from the concept's
+    /// condition alone), sharing the encoder and backbone. The training loss adds
+    /// [`crate::speculative::draft_loss`] of the draft logits. Panics without a draft head.
+    pub fn forward_with_draft(&self, tokens: Tensor<2, Int>) -> (Tensor<3>, Tensor<3>) {
+        let (logits, draft) = self.forward_parts(tokens, true);
+        (logits, draft.expect("forward_with_draft needs a model with a draft head"))
+    }
+
+    fn forward_parts(&self, tokens: Tensor<2, Int>, draft: bool) -> (Tensor<3>, Option<Tensor<3>>) {
         let k = self.k;
         let [b, n] = tokens.dims();
         assert!(
@@ -278,19 +316,38 @@ impl NcmLm {
             .forward(targets.narrow(2, 0, k - 1).reshape([b, (m - 1) * (k - 1)]))
             .reshape([b, m - 1, k - 1, d]);
         let start = self.start_emb.val().reshape([1, 1, 1, d]).expand([b, m - 1, 1, d]);
-        let mut x = Tensor::cat(vec![start, written], 2) + cond;
+        let mut x = Tensor::cat(vec![start, written], 2) + cond.clone();
         let rope_self = self.rope(0, k, &device);
         let rope_q = self.rope(k, n - k, &device);
         let rope_k = self.rope(0, n, &device);
+        let causal = self.causal_mask(&device);
         // Concept m' may see encoder states of tokens [k*m' - enc_window, k*m' - 1].
         let ends: Vec<i32> = (k..n).map(|t| ((t / k) * k) as i32 - 1).collect();
         let kpos: Vec<i32> = (0..n as i32).collect();
         let mask = build_mask(&device, &ends, &kpos, Some(self.enc_window));
+        let mut kvs = Vec::new();
         for blk in &self.dec_blocks {
             let (keys, values) = blk.cross.make_kv(states.clone(), &rope_k);
-            x = blk.forward_train(x, &rope_self, &rope_q, keys, values, mask.clone());
+            let (rs, rq, c) = (&rope_self, &rope_q, causal.clone());
+            x = blk.forward_train(x, rs, rq, c, keys.clone(), values.clone(), Some(mask.clone()));
+            // The draft head reads the decoder layers' encoder keys and values.
+            if draft {
+                kvs.push((keys, values));
+            }
         }
-        self.logits(x.reshape([b, (m - 1) * k, d]))
+        let logits = self.logits(x.reshape([b, (m - 1) * k, d]));
+        let draft = draft.then(|| {
+            let head = self.draft.as_ref().expect("forward_with_draft needs a draft head");
+            let x = head.forward(cond, &rope_self, &rope_q, &kvs, Some(mask));
+            head.logits(&self.emb, x.reshape([b, (m - 1) * k, d]))
+        });
+        (logits, draft)
+    }
+
+    /// The `[k, k]` causal mask of a concept's own tokens.
+    pub(crate) fn causal_mask(&self, device: &Device) -> Tensor<2, Bool> {
+        let pos: Vec<i32> = (0..self.k as i32).collect();
+        build_mask(device, &pos, &pos, None)
     }
 
     // ------------------------------------------------------------------ incremental
@@ -432,6 +489,74 @@ impl NcmLm {
         }
         let logits = want_logits.then(|| Tensor::cat(logits, 1));
         (Tensor::cat(tokens, 1), logits)
+    }
+}
+
+/// The two passes of self-speculative decoding ([`crate::speculative`]).
+impl NcmLm {
+    /// The draft head's logits `[B, k, V]` for every token of the next concept, in one pass: its
+    /// slot queries, conditioned on `cond` `[B, 1, d]`, attend to each other and to the encoder
+    /// states held in the decoder's cross-attention caches. Panics without a draft head.
+    pub fn draft_concept(&self, cond: Tensor<3>, cache: &NcmCache) -> Tensor<3> {
+        let device = cond.device();
+        let rope_self = self.rope(0, self.k, &device);
+        let rope_q = self.rope(cache.tokens, self.k, &device);
+        self.draft_with_ropes(cond, cache, &rope_self, &rope_q)
+    }
+
+    /// The local decoder's logits `[B, k, V]` for the next concept, teacher-forced on `tokens`
+    /// `[B, k]` in one parallel pass, causal within the concept: row j is the decoder's
+    /// distribution for token j given `tokens[.., ..j]`, as [`Self::decode_concept`] would give
+    /// it step by step (the last token is not read). The decoder caches are only read.
+    pub fn verify_concept(
+        &self,
+        cond: Tensor<3>,
+        cache: &NcmCache,
+        tokens: Tensor<2, Int>,
+    ) -> Tensor<3> {
+        let device = cond.device();
+        let rope_self = self.rope(0, self.k, &device);
+        let rope_q = self.rope(cache.tokens, self.k, &device);
+        let causal = self.causal_mask(&device);
+        self.verify_with_ropes(cond, cache, tokens, &rope_self, &rope_q, causal)
+    }
+
+    /// [`Self::draft_concept`] with the RoPE tables given.
+    pub(crate) fn draft_with_ropes(
+        &self,
+        cond: Tensor<3>,
+        cache: &NcmCache,
+        rope_self: &Rope,
+        rope_q: &Rope,
+    ) -> Tensor<3> {
+        let head = self.draft.as_ref().expect("speculative decoding needs a draft head");
+        let [b, _, d] = cond.dims();
+        let kvs: Vec<_> = cache.cross.iter().map(KvCache::view).collect();
+        let x = head.forward(cond.unsqueeze_dim::<4>(1), rope_self, rope_q, &kvs, None);
+        head.logits(&self.emb, x.reshape([b, self.k, d]))
+    }
+
+    /// [`Self::verify_concept`] with the RoPE tables and the causal mask given (no uploads, so
+    /// it can be captured into a CUDA graph).
+    pub(crate) fn verify_with_ropes(
+        &self,
+        cond: Tensor<3>,
+        cache: &NcmCache,
+        tokens: Tensor<2, Int>,
+        rope_self: &Rope,
+        rope_q: &Rope,
+        causal: Tensor<2, Bool>,
+    ) -> Tensor<3> {
+        let (k, d) = (self.k, self.local_dim);
+        let [b, _, _] = cond.dims();
+        let written = self.emb.forward(tokens.narrow(1, 0, k - 1));
+        let start = self.start_emb.val().reshape([1, 1, d]).expand([b, 1, d]);
+        let mut x = (Tensor::cat(vec![start, written], 1) + cond).unsqueeze_dim::<4>(1);
+        for (blk, cross) in self.dec_blocks.iter().zip(&cache.cross) {
+            let (keys, values) = cross.view();
+            x = blk.forward_train(x, rope_self, rope_q, causal.clone(), keys, values, None);
+        }
+        self.logits(x.reshape([b, k, d]))
     }
 }
 

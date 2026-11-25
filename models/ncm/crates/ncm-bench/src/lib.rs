@@ -7,6 +7,12 @@
 //!
 //! Both models share the token vocabulary, so decode tokens per second are directly comparable.
 //! Decode tok/s counts output tokens (the NCM emits `k` tokens per decoder pass).
+//!
+//! `--speculate on` also decodes the NCM by self-speculation (`ncm_model::speculative`): the
+//! draft head proposes each concept in one pass and the decoder verifies it in one parallel
+//! pass. Random weights almost never accept a draft, so `--assume-accept` adds synthetic runs
+//! that force a given acceptance rate: they estimate the speed of a trained model, not its
+//! output.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,8 +22,9 @@ use clap::{Parser, ValueEnum};
 use ncm_model::fused::{argmax_last, kernels_built, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
 use ncm_model::{
-    Config, Design, NcmLm, TokenLm, cache_bytes, cache_bytes_with, ncm_250m_of, tiny_ncm,
-    tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2, tok_250m_of,
+    Acceptance, Config, Design, NcmLm, SpecStats, Speculator, TokenLm, cache_bytes,
+    cache_bytes_with, ncm_250m_of, tiny_ncm, tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2,
+    tok_250m_of,
 };
 use serde_json::{Value, json};
 
@@ -61,6 +68,15 @@ pub enum DeviceChoice {
     Cpu,
     /// Any wgpu adapter (build with `--features wgpu`).
     Wgpu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Speculate {
+    /// Plain decoding only.
+    Off,
+    /// Plain decoding, then self-speculative decoding of the NCM (draft head and one parallel
+    /// verify pass per concept), with real verification and every `--assume-accept` rate.
+    On,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -111,6 +127,14 @@ pub struct Cli {
     /// as captured CUDA graphs.
     #[arg(long)]
     pub no_cuda_graphs: bool,
+    /// Also decode the NCM by self-speculation (the token baseline always decodes plainly).
+    #[arg(long, value_enum, default_value = "off")]
+    pub speculate: Speculate,
+    /// With `--speculate on`: one more speculative run per rate, accepting that share of draft
+    /// tokens whatever the decoder says. SYNTHETIC: it times the passes a trained model with
+    /// that acceptance would run; the tokens are not the model's output.
+    #[arg(long, num_args = 1.., value_name = "RATE")]
+    pub assume_accept: Vec<f64>,
 }
 
 pub fn verdict(ratio: f64) -> &'static str {
@@ -173,12 +197,26 @@ fn sync(device: &Device) {
     device.sync().expect("device sync");
 }
 
-/// Prefill the prompt, then greedily decode `new_tokens` tokens; returns (prefill s, decode s).
+/// How the NCM writes its concepts.
+#[derive(Clone, Copy, Debug)]
+enum Decode {
+    Plain,
+    Speculative(Acceptance),
+}
+
+/// Prefill the prompt, then greedily decode `new_tokens` tokens; returns the timings.
 ///
 /// The token baseline prefills all but the last prompt token and decodes from that one, so its
-/// decode loop produces exactly `new_tokens` tokens like the NCM loop does.
-fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &Device) -> Run {
+/// decode loop produces exactly `new_tokens` tokens like the NCM loop does. It ignores `mode`.
+fn run_once(
+    model: &Model,
+    prompt: &Tensor<2, Int>,
+    new_tokens: usize,
+    mode: Decode,
+    device: &Device,
+) -> Run {
     let context = prompt.dims()[1];
+    let mut spec = None;
     let (started, prefilled) = match model {
         Model::Ncm(m) => {
             let mut cache = m.make_cache(context + new_tokens, 1, device);
@@ -188,22 +226,42 @@ fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &
             sync(device);
             let prefilled = Instant::now();
             let concepts = new_tokens / m.concept_size();
-            // On CUDA with the fused kernels on, the decoder replays one captured graph per
-            // concept (captured on the first concept once the cross-attention ring is full).
-            #[cfg(feature = "cuda")]
-            let mut graphed = ncm_model::ncm::GraphedDecoder::default();
-            for c in 0..concepts {
-                #[cfg(feature = "cuda")]
-                let tokens = graphed.decode(m, cond.clone(), &mut cache);
-                #[cfg(not(feature = "cuda"))]
-                let (tokens, _) = m.decode_concept(cond.clone(), &mut cache, None, false);
-                if c + 1 < concepts {
-                    cond = m.append_tokens(tokens, &mut cache);
+            match mode {
+                Decode::Plain => {
+                    // On CUDA with the fused kernels on, the decoder replays one captured graph
+                    // per concept (captured on the first concept once the cross-attention ring
+                    // is full).
+                    #[cfg(feature = "cuda")]
+                    let mut graphed = ncm_model::ncm::GraphedDecoder::default();
+                    for c in 0..concepts {
+                        #[cfg(feature = "cuda")]
+                        let tokens = graphed.decode(m, cond.clone(), &mut cache);
+                        #[cfg(not(feature = "cuda"))]
+                        let (tokens, _) = m.decode_concept(cond.clone(), &mut cache, None, false);
+                        if c + 1 < concepts {
+                            cond = m.append_tokens(tokens, &mut cache);
+                        }
+                    }
+                    #[cfg(feature = "cuda")]
+                    if let Some(why) = graphed.failure() {
+                        eprintln!("ncm-bench: decoder graph not captured, decoding eagerly: {why}");
+                    }
                 }
-            }
-            #[cfg(feature = "cuda")]
-            if let Some(why) = graphed.failure() {
-                eprintln!("ncm-bench: decoder graph not captured, decoding eagerly: {why}");
+                Decode::Speculative(acceptance) => {
+                    // The draft and verify passes replay CUDA graphs likewise.
+                    let mut speculator = Speculator::new(acceptance);
+                    for c in 0..concepts {
+                        let tokens = speculator.decode(m, cond.clone(), &cache);
+                        if c + 1 < concepts {
+                            cond = m.append_tokens(tokens, &mut cache);
+                        }
+                    }
+                    #[cfg(feature = "cuda")]
+                    if let Some(why) = speculator.failure() {
+                        eprintln!("ncm-bench: speculative graphs not captured, eager: {why}");
+                    }
+                    spec = Some(speculator.stats());
+                }
             }
             (started, prefilled)
         }
@@ -228,6 +286,7 @@ fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &
         prefill_s: prefilled.duration_since(started).as_secs_f64(),
         decode_s: done.duration_since(prefilled).as_secs_f64(),
         enqueue_s: enqueued.duration_since(prefilled).as_secs_f64(),
+        spec,
     }
 }
 
@@ -237,6 +296,8 @@ struct Run {
     prefill_s: f64,
     decode_s: f64,
     enqueue_s: f64,
+    /// Speculative runs: what the speculator did.
+    spec: Option<SpecStats>,
 }
 
 fn random_prompt(device: &Device, vocab: usize, n: usize) -> Tensor<2, Int> {
@@ -291,10 +352,11 @@ fn bench_model(
         let context = context - context % unit;
         let prompt = random_prompt(device, cfg.vocab_size(), context);
         let warm = random_prompt(device, cfg.vocab_size(), context.min(64 * unit));
-        run_once(&model, &warm, 2 * unit, device); // warm-up: compile kernels, fill pools
+        // Warm-up: compile kernels, fill pools.
+        run_once(&model, &warm, 2 * unit, Decode::Plain, device);
         let (mut prefills, mut decodes, mut enqueues) = (Vec::new(), Vec::new(), Vec::new());
         for _ in 0..cli.repeats {
-            let run = run_once(&model, &prompt, new_tokens, device);
+            let run = run_once(&model, &prompt, new_tokens, Decode::Plain, device);
             prefills.push(run.prefill_s);
             decodes.push(run.decode_s);
             enqueues.push(run.enqueue_s);
@@ -313,6 +375,12 @@ fn bench_model(
             reserved.map_or("n/a".into(), fmt_bytes),
             fmt_bytes(cache as u64),
         );
+        let speculative = match &model {
+            Model::Ncm(_) if cli.speculate == Speculate::On => {
+                bench_speculative(&model, cli, &prompt, &warm, new_tokens, decode_tok_s, device)
+            }
+            _ => Vec::new(),
+        };
         contexts.insert(
             context.to_string(),
             json!({
@@ -324,6 +392,7 @@ fn bench_model(
                 "reserved_memory_bytes": reserved,
                 "cache_bytes": cache,
                 "cache_bytes_allocated": allocated,
+                "speculative": speculative,
             }),
         );
         decode_rates.push((context, decode_tok_s));
@@ -337,6 +406,66 @@ fn bench_model(
         "contexts": contexts,
     });
     (result, decode_rates)
+}
+
+/// Speculative decode runs of the NCM at one context: real verification, then each assumed
+/// acceptance rate. `plain_tok_s` is the plain decode rate they are compared with.
+fn bench_speculative(
+    model: &Model,
+    cli: &Cli,
+    prompt: &Tensor<2, Int>,
+    warm: &Tensor<2, Int>,
+    new_tokens: usize,
+    plain_tok_s: f64,
+    device: &Device,
+) -> Vec<Value> {
+    let context = prompt.dims()[1];
+    let modes = std::iter::once(Acceptance::Verify)
+        .chain(cli.assume_accept.iter().map(|&rate| Acceptance::Assume(rate)));
+    let mut out = Vec::new();
+    for acceptance in modes {
+        let mode = Decode::Speculative(acceptance);
+        let unit = match model {
+            Model::Ncm(m) => m.concept_size(),
+            Model::Tok(_) => 1,
+        };
+        run_once(model, warm, 2 * unit, mode, device);
+        let (mut decodes, mut stats) = (Vec::new(), SpecStats::default());
+        for _ in 0..cli.repeats {
+            let run = run_once(model, prompt, new_tokens, mode, device);
+            decodes.push(run.decode_s);
+            let s = run.spec.expect("a speculative run reports its stats");
+            stats.concepts += s.concepts;
+            stats.verify_passes += s.verify_passes;
+            stats.judged += s.judged;
+            stats.accepted += s.accepted;
+        }
+        let tok_s = new_tokens as f64 / median(&mut decodes.clone());
+        let speedup = tok_s / plain_tok_s;
+        let (label, assumed) = match acceptance {
+            Acceptance::Verify => ("real verification (random weights)".to_string(), None),
+            Acceptance::Assume(rate) => {
+                (format!("SYNTHETIC assumed acceptance {rate}"), Some(rate))
+            }
+        };
+        println!(
+            "  ctx {context:>7}: speculative, {label}: decode {tok_s:.1} tok/s ({speedup:.2}x \
+             plain), draft tokens kept {:.1}%, {:.2} verify passes per concept",
+            stats.acceptance() * 100.0,
+            stats.passes_per_concept(),
+        );
+        out.push(json!({
+            "acceptance_mode": if assumed.is_some() { "assumed" } else { "verify" },
+            "synthetic": assumed.is_some(),
+            "assumed_acceptance": assumed,
+            "decode_tok_s": tok_s,
+            "speedup_over_plain": speedup,
+            "decode_s_runs": decodes,
+            "draft_acceptance": stats.acceptance(),
+            "verify_passes_per_concept": stats.passes_per_concept(),
+        }));
+    }
+    out
 }
 
 /// The config of model `kind` ("tok" or "ncm") in `design`.
@@ -382,6 +511,12 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     }
     if cli.repeats == 0 || cli.context.is_empty() {
         return Err("--repeats and --context need at least one value".into());
+    }
+    if !cli.assume_accept.is_empty() && cli.speculate == Speculate::Off {
+        return Err("--assume-accept needs --speculate on".into());
+    }
+    if let Some(rate) = cli.assume_accept.iter().find(|r| !(0.0..=1.0).contains(*r)) {
+        return Err(format!("--assume-accept {rate} is not between 0 and 1"));
     }
     set_fused_attention(cli.fused_attention);
     set_fused_kernels(!cli.reference_kernels);
@@ -445,6 +580,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
             && kernels_built()
             && !cli.reference_kernels
             && !cli.no_cuda_graphs,
+        "speculate": cli.speculate == Speculate::On,
         "results": results,
         "ratios": ratios,
         "ncm_v2_over_fallback": design_ratios,

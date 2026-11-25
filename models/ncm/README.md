@@ -29,6 +29,20 @@ target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8        
 
 `--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models. With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
 
+More switches:
+
+| Flag | Effect |
+|---|---|
+| `--reference-kernels` | Run the v2 layers' reference tensor code on CUDA instead of the fused CubeCL kernels (which also turns the CUDA graphs off) |
+| `--no-cuda-graphs` | Keep the fused kernels but run them eagerly instead of replaying the NCM decoder, draft and verify passes and the v2 backbone step as CUDA graphs |
+| `--speculate on` | After each plain NCM run, decode the NCM again by self-speculation (the draft head proposes each concept in one pass, the decoder verifies it in one parallel pass; `docs/attention.md`) and report its tok/s, the share of draft tokens kept and the verify passes per concept. The token baseline always decodes plainly |
+| `--assume-accept 1.0 0.75 0.5` | With `--speculate on`, one more speculative run per rate that keeps that share of draft tokens whatever the decoder says. **Synthetic**: it times the passes a trained model with that acceptance would run (random weights accept few drafts); the output is not the model's, and the report labels it |
+
+```
+target/release/ncm-bench --model ncm --design v2 --device cuda --context 2048 16384 --new-tokens 256 \
+    --speculate on --assume-accept 1.0 0.75 0.5
+```
+
 `cuda` builds need a local CUDA toolkit. `.cargo/config.toml` sets `CUDARC_CUDA_VERSION=13040` because cudarc (under burn-cuda) only lists CUDA up to 13.4 and rejects 13.5; the 13.x runtime is ABI compatible. CI never builds the `cuda` feature.
 
 The benchmark uses random weights, batch 1 and greedy decode with caches. Prefill is timed separately, decode tok/s counts output tokens (median of `--repeats`), and the NCM/token ratio is graded PASS (1.5x or more), WEAK (1.2x to 1.5x) or FAIL. The `host` column is the share of decode time spent enqueueing work: near 100% means the run is bound by host op dispatch, not the GPU.

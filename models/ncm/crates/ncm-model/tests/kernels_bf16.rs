@@ -45,3 +45,9 @@ fn gemv_matches_cpu_bf16() {
     let (device, _lock) = setup(DTYPE);
     gemv_matches(&device, TOL);
 }
+
+#[test]
+fn graphed_speculation_matches_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_speculation_matches(&device, false);
+}

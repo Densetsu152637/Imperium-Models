@@ -178,6 +178,10 @@ pub struct NcmConfig {
     pub dec_heads: usize,
     pub dec_kv_heads: usize,
     pub dec_ff_dim: usize,
+    /// Layers of the parallel draft head on the local decoder, which proposes a whole concept
+    /// in one pass for self-speculative decoding (`src/speculative.rs`); at most `dec_layers`.
+    /// 0, the default, builds no draft head (configs from before it).
+    pub draft_layers: usize,
     pub bb_dim: usize,
     pub bb_layers: usize,
     pub bb_heads: usize,
@@ -212,6 +216,7 @@ impl Default for NcmConfig {
             dec_heads: 8,
             dec_kv_heads: 4,
             dec_ff_dim: 1536,
+            draft_layers: 0,
             bb_dim: 1024,
             bb_layers: 16,
             bb_heads: 16,
@@ -371,6 +376,7 @@ pub fn tiny_ncm(enc_window: usize, bb_window: usize) -> NcmConfig {
         dec_heads: 2,
         dec_kv_heads: 1,
         dec_ff_dim: 64,
+        draft_layers: 1,
         bb_dim: 64,
         bb_layers: 4,
         bb_heads: 4,

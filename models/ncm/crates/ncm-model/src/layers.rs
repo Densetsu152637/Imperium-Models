@@ -44,11 +44,15 @@ pub fn set_fused_attention(on: bool) {
 
 /// The signed permutation `R` with `x @ R = [-x2, x1]` for `x = [x1, x2]` (the two halves of the
 /// last axis), `[1, 1, D, D]`. One tiny matmul replaces two slices and a concatenation.
+///
+/// Cached per thread as well: cubecl gives every thread its own stream, and a CUDA graph
+/// capture that reads a buffer another thread's stream wrote is invalidated.
 fn rotation(head_dim: usize, device: &Device) -> Tensor<4> {
-    type Key = (String, usize, String);
+    type Key = (String, usize, String, std::thread::ThreadId);
     static CACHE: OnceLock<Mutex<HashMap<Key, Tensor<4>>>> = OnceLock::new();
     let dtype = device.settings().float_dtype;
-    let key = (format!("{device:?}"), head_dim, format!("{dtype:?}"));
+    let thread = std::thread::current().id();
+    let key = (format!("{device:?}"), head_dim, format!("{dtype:?}"), thread);
     let mut cache = CACHE.get_or_init(Default::default).lock().expect("rotation cache");
     cache
         .entry(key)
@@ -240,9 +244,44 @@ impl Attention {
     }
 
     pub fn forward(&self, x: Tensor<3>, rope: &Rope, cache: Option<&mut KvCache>) -> Tensor<3> {
+        let t = x.dims()[1];
+        let device = x.device();
+        let (gate, q, k, v) = self.project(x, rope);
+        let out = match cache {
+            None => {
+                let pos: Vec<i32> = (0..t as i32).collect();
+                let mask = (t > 1).then(|| build_mask(&device, &pos, &pos, self.window));
+                attend(q, k, v, mask)
+            }
+            Some(cache) => {
+                let (keys, values, mask) = cache.append(k, v);
+                attend(q, keys, values, mask)
+            }
+        };
+        self.output(out, gate)
+    }
+
+    /// Attention over `x` itself without a cache, with the given `[T, T]` mask (`true` hides a
+    /// key; None: every position sees every other). A mask built ahead of time keeps the call
+    /// free of host-to-device copies, so it can run inside a CUDA graph capture.
+    pub fn forward_masked(
+        &self,
+        x: Tensor<3>,
+        rope: &Rope,
+        mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
+        let (gate, q, k, v) = self.project(x, rope);
+        self.output(attend(q, k, v, mask), gate)
+    }
+
+    /// The output gate (v2), and queries, keys (with RoPE) and values `[B, H or KVH, T, D]`.
+    fn project(
+        &self,
+        x: Tensor<3>,
+        rope: &Rope,
+    ) -> (Option<Tensor<3>>, Tensor<4>, Tensor<4>, Tensor<4>) {
         let [b, t, _] = x.dims();
         let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
-        let device = x.device();
         let gate = self.gate.as_ref().map(|g| sigmoid(crate::fused::linear(g, x.clone())));
         let qkv = crate::fused::linear(&self.qkv, x);
         let (q, k) = match (&self.q_norm, &self.k_norm) {
@@ -260,17 +299,12 @@ impl Attention {
             }
         };
         let v = qkv.narrow(2, (h + kvh) * hd, kvh * hd).reshape([b, t, kvh, hd]).swap_dims(1, 2);
-        let out = match cache {
-            None => {
-                let pos: Vec<i32> = (0..t as i32).collect();
-                let mask = (t > 1).then(|| build_mask(&device, &pos, &pos, self.window));
-                attend(q, k, v, mask)
-            }
-            Some(cache) => {
-                let (keys, values, mask) = cache.append(k, v);
-                attend(q, keys, values, mask)
-            }
-        };
+        (gate, q, k, v)
+    }
+
+    /// Heads `[B, H, T, D]` merged, gated (v2) and projected out.
+    fn output(&self, out: Tensor<4>, gate: Option<Tensor<3>>) -> Tensor<3> {
+        let [b, h, t, hd] = out.dims();
         let out = out.swap_dims(1, 2).reshape([b, t, h * hd]);
         let out = match gate {
             Some(gate) => out * gate,
@@ -329,12 +363,60 @@ impl CrossAttention {
         values: Tensor<4>,
         mask: Option<Tensor<2, Bool>>,
     ) -> Tensor<3> {
-        let [b, t, _] = x.dims();
-        let (h, hd) = (self.heads, self.head_dim);
-        let q = crate::fused::linear(&self.q, x).reshape([b, t, h, hd]).swap_dims(1, 2);
-        let out = attend(apply_rope(q, rope_q), keys, values, mask);
-        crate::fused::linear(&self.o, out.swap_dims(1, 2).reshape([b, t, h * hd]))
+        cross_attend(&self.q, &self.o, self.heads, self.head_dim, x, rope_q, keys, values, mask)
     }
+}
+
+/// Cross-attention queries and output over keys and values that another layer projected: the
+/// NCM draft head reads the local decoder's cross-attention caches through it.
+#[derive(Module, Debug)]
+pub struct CrossQuery {
+    q: Linear,
+    o: Linear,
+    heads: usize,
+    head_dim: usize,
+}
+
+impl CrossQuery {
+    pub fn new(d: usize, heads: usize, head_dim: usize, device: &Device) -> Self {
+        Self {
+            q: linear(d, heads * head_dim, device),
+            o: linear(heads * head_dim, d, device),
+            heads,
+            head_dim,
+        }
+    }
+
+    pub fn forward(
+        &self,
+        x: Tensor<3>,
+        rope_q: &Rope,
+        keys: Tensor<4>,
+        values: Tensor<4>,
+        mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
+        cross_attend(&self.q, &self.o, self.heads, self.head_dim, x, rope_q, keys, values, mask)
+    }
+}
+
+/// Queries `x` `[B, T, d]` through `q`, attends over `keys` and `values` `[B, KVH, S, D]` and
+/// projects out through `o`.
+#[allow(clippy::too_many_arguments)]
+fn cross_attend(
+    q: &Linear,
+    o: &Linear,
+    h: usize,
+    hd: usize,
+    x: Tensor<3>,
+    rope_q: &Rope,
+    keys: Tensor<4>,
+    values: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+) -> Tensor<3> {
+    let [b, t, _] = x.dims();
+    let q = crate::fused::linear(q, x).reshape([b, t, h, hd]).swap_dims(1, 2);
+    let out = attend(apply_rope(q, rope_q), keys, values, mask);
+    crate::fused::linear(o, out.swap_dims(1, 2).reshape([b, t, h * hd]))
 }
 
 /// The sequence mixer of one layer. A stack holds a few dozen at most, so the size gap between

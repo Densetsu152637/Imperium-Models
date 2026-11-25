@@ -20,7 +20,7 @@ use ncm_model::fused::{active, argmax_last, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::Rope;
 use ncm_model::ncm::GraphedDecoder;
 use ncm_model::retrieval::{LatentCache, RetrievalSpec, SparseRetrieval};
-use ncm_model::{NcmLm, tiny_ncm, tiny_ncm_v2, tiny_v2};
+use ncm_model::{Acceptance, NcmLm, SpecStats, Speculator, tiny_ncm, tiny_ncm_v2, tiny_v2};
 
 fn ints<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
     t.into_data().convert::<i64>().try_to_vec::<i64>().expect("int tensor")
@@ -114,6 +114,65 @@ pub fn graphed_decode_matches(device: &Device) {
             assert_eq!(tg, te, "concept {concept}: tokens differ");
             let err = rel_error(&conds_g[concept], &conds_e[concept]);
             assert!(err <= 1e-5, "concept {concept}: conditions differ by {err:.2e}");
+        }
+    }
+}
+
+/// Self-speculative greedy decode of `concepts` concepts after the same prompt as
+/// [`ncm_decode`], with the draft and verify passes replayed from graphs when `graphs` is on:
+/// the tokens of every concept and the speculator's counts.
+fn spec_decode(
+    model: &NcmLm,
+    graphs: bool,
+    acceptance: Acceptance,
+    concepts: usize,
+    device: &Device,
+) -> (Vec<Vec<i64>>, SpecStats) {
+    set_cuda_graphs(graphs);
+    let prompt = Tensor::<2, Int>::from_data(
+        TensorData::new((0..64).map(|i: i32| i * 37 % 256).collect::<Vec<_>>(), [1, 64]),
+        device,
+    );
+    let mut cache = model.make_cache(64 + 4 * concepts + 4, 1, device);
+    let mut cond = model.prefill(prompt, &mut cache, 16);
+    let mut speculator = Speculator::new(acceptance);
+    let mut tokens = Vec::new();
+    for _ in 0..concepts {
+        let next = speculator.decode(model, cond, &cache);
+        tokens.push(ints(next.clone()));
+        cond = model.append_tokens(next, &mut cache);
+    }
+    set_cuda_graphs(true);
+    if graphs {
+        let failure = speculator.failure();
+        assert!(speculator.is_captured(), "speculative graphs not captured: {failure:?}");
+    }
+    (tokens, speculator.stats())
+}
+
+/// The draft and verify graphs (both designs) give the same tokens and counts as the same
+/// kernels run eagerly, under real verification and under an assumed acceptance of one half
+/// (several verify replays per concept). With `exact`, the speculative tokens also equal plain
+/// greedy decoding through the decoder graph (f32; in bf16 the parallel and step-by-step passes
+/// round differently and a near tie of the two best logits may go either way, so mismatching
+/// concepts are only counted).
+pub fn graphed_speculation_matches(device: &Device, exact: bool) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        device.seed(9);
+        let model = NcmLm::new(&cfg, device);
+        for acceptance in [Acceptance::Verify, Acceptance::Assume(0.5)] {
+            let (tokens_e, stats_e) = spec_decode(&model, false, acceptance, 12, device);
+            let (tokens_g, stats_g) = spec_decode(&model, true, acceptance, 12, device);
+            assert_eq!(tokens_g, tokens_e, "{acceptance:?}: graphed tokens differ");
+            assert_eq!(stats_g, stats_e, "{acceptance:?}: graphed passes differ");
+            eprintln!("{} {acceptance:?}: {stats_g:?}", cfg.attention.name());
+        }
+        let (plain, _) = ncm_decode(&model, true, 12, device);
+        let (spec, _) = spec_decode(&model, true, Acceptance::Verify, 12, device);
+        let differ = plain.iter().zip(&spec).filter(|(p, s)| p != s).count();
+        eprintln!("{}: {differ} of 12 concepts differ from plain greedy", cfg.attention.name());
+        if exact {
+            assert_eq!(spec, plain, "speculative greedy differs from plain greedy");
         }
     }
 }

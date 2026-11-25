@@ -5,7 +5,8 @@ An OpenAI-compatible HTTP server over the NCM and the token baseline (`ncm-model
 ```bash
 # CPU (what CI builds)
 cargo run --release -p ncm-server -- --arch ncm --random-weights -c 4096 --port 8080
-# GPU
+# GPU (also builds ncm-model's fused CUDA kernels, run eagerly: the server replays no CUDA graphs
+# and does not decode speculatively yet)
 cargo run --release -p ncm-server --features cuda -- --arch ncm --random-weights -c 4096 --port 8080
 # Trained weights (config in the file's header; tokenizer.json beside it or --tokenizer)
 ncm-server --model weights/ncm-250m.safetensors --tokenizer tokenizer.json -c 1000000 --port 8080

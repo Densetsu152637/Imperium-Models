@@ -18,6 +18,7 @@ v2 settings live in the `[v2]` table of a config (`V2Config`); fallback models i
 | NCM | Local encoder, d = 512 | sliding window (512 tokens), gated DeltaNet, sliding window |
 | NCM | Global backbone, d = 1024, over concepts | 16: DeltaNet, retrieval, DeltaNet, retrieval, ... (8 + 8) |
 | NCM | Local decoder, d = 512 | unchanged from the fallback: 4 layers, self-attention over the concept, cross-attention to the last 512 encoder states |
+| NCM | Draft head, d = 512 | 1 layer (`draft_layers`): the whole next concept in one pass, for self-speculative decoding ([Local decoder and speculative decoding](#local-decoder-and-speculative-decoding-srcspeculativers)) |
 | Token baseline | d = 1024, over tokens | 20: DeltaNet and retrieval alternating (10 + 10) |
 
 Every layer is pre-norm (RMSNorm) with a residual mixer and a residual SwiGLU MLP. The backbone alternates starting with DeltaNet, so the first retrieval layer already sees order from the convolution and recurrence. In v2 the encoder's sliding-window layers also get the output gate and QK-norm.
@@ -63,8 +64,9 @@ Execution paths:
 | Local encoder | 10.5M | |
 | Backbone / layers | 200.1M | 216.9M |
 | Local decoder | 15.7M | |
+| Draft head | 3.7M (3,674,112) | |
 | Projections | 2.6M | |
-| **Total** | **245.3M** (245,299,208) | **249.7M** (249,662,624) |
+| **Total** | **249.0M** (248,973,320) | **249.7M** (249,662,624) |
 
 Per layer at d = 1024: a DeltaNet mixer is 5.27M, a retrieval mixer 5.97M (of which the indexer 0.66M). MLP widths fill the budget: `bb_ff_dim = 2240` for the NCM backbone (6.88M per MLP), `ff_dim = 1700` for the token baseline (5.22M). The encoder is 10.5M against the doc's ~9M because the DeltaNet layer comes with its own MLP and the sliding layers gained gates.
 
@@ -104,13 +106,15 @@ The retrieval kernels take the position from a device buffer (`LatentCache`'s `p
 Burn 0.22 exposes CUDA graph capture (`Backend::graph_prepare`, `graph_start_capture`, `graph_stop_capture`, `graph_replay`, on cubecl's CUDA runtime). A graph replays the recorded launches against the exact buffers and scalar arguments of the capture, so a step is graphable only when its launches do not change from step to step:
 
 - `ncm::GraphedDecoder`: the NCM's local decoder for one concept (k tokens: four layers, logits, argmax), captured once the cross-attention ring is full. The per-concept self cache restarts at slot 0; the condition and the RoPE tables of the concept's positions are copied into fixed buffers before each replay. Both designs.
+- `speculative::Speculator`: the draft pass and the verify pass of self-speculative decoding, one graph each, captured once the ring is full ([below](#local-decoder-and-speculative-decoding-srcspeculativers)). Both designs.
 - `layers::GraphedStack`: one-token steps of a stack of DeltaNet and retrieval layers only (the v2 backbone, from `NcmLm::append_tokens`). Warm-up steps are undone before the capture (DeltaNet states restored, retrieval positions rewound); before each replay the input, the RoPE tables and the position buffers are copied in, and after it the caches' host positions advance.
 
 What Burn's graph API requires, and how it is met here:
 
 - **Fixed buffers.** A graph holds every buffer it touched, so Burn sees them as shared (`can_mut` false) and its `slice_assign` would copy a cache or input to a new buffer, leaving the graph reading the stale one. Cache rows, graph inputs and DeltaNet states are therefore written with `assign_kernel` and the in-place DeltaNet kernel, which write the buffer itself. The caller answers for other holders.
 - **Fixed scalars and shapes.** Anything that varies per step must live in device memory: positions (device buffers), RoPE tables (copied in), selection and slot counts (computed on the device), grid sizes (the largest step).
-- **No host-to-device copies inside a capture.** Uploads (positions, RoPE tables) are issued before each replay; `fused::capturing` tells the layers to leave them out while recording.
+- **No host-to-device copies inside a capture.** Uploads (positions, RoPE tables) are issued before each replay; `fused::capturing` tells the layers to leave them out while recording. Masks a captured pass needs (the verify pass's causal mask) are built before the capture and held by the graph.
+- **One thread.** cubecl gives every thread its own stream, and a capture that reads a buffer last written on another thread's stream is invalidated (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`). The cached RoPE rotation matrix is therefore cached per thread. Capture and replay on the thread that built the model and its caches.
 - **Not graphable as written:** the fallback attention layers and the NCM encoder (full-attention caches that grow, sliding-window masks built on the host), prefill and the token baseline's step (not wired). They run the fused kernels eagerly.
 
 `fused::set_fused_kernels(false)` (`ncm-bench --reference-kernels`) turns the kernels and graphs off on CUDA; `fused::set_cuda_graphs(false)` (`ncm-bench --no-cuda-graphs`) keeps the kernels but runs them eagerly. Burn's fusion backend (`burn/fusion`) was measured and not adopted: it slowed the fallback NCM from 171 to 127 tok/s at 2k, and left the reference v2 at 84.
@@ -134,6 +138,34 @@ RTX 5080, bf16, batch 1, short `ncm-bench` runs (128 new tokens) on a busy CPU; 
 | + GEMV kernels | **453.3** | **375.9** | 93% |
 
 The fallback NCM, which shares the decoder, the GEMV kernels and the argmax, made 251.4 tok/s at 2k in the last run.
+
+## Local decoder and speculative decoding (`src/speculative.rs`)
+
+The local decoder writes a concept token by token: k = 4 passes of its four layers, each waiting for the token before. Self-speculative decoding replaces them with two parallel passes per concept:
+
+1. **Draft pass.** The draft head (`DraftHead`, `draft_layers` blocks at the decoder width) proposes all k tokens at once. Its input at slot j is the concept's condition plus a learned position query for slot j (`slots`, `[k, d]`). Each block has self-attention between the k slots (bidirectional: no slot holds a token), cross-attention over the encoder states and a SwiGLU MLP; then its own RMSNorm and the tied embedding. Block i has its own queries and output projection (`layers::CrossQuery`) but reads the keys and values of decoder layer i's cross-attention cache, so it needs no cache or key-value projection of its own (`draft_layers <= dec_layers`). 3.67M parameters for one block at d = 512; `draft_layers = 0` builds no head (configs written before it).
+2. **Verify pass.** The decoder runs once over the drafted concept, teacher-forced and causal within the concept (`NcmLm::verify_concept`), exactly as the training forward does: row j is the decoder's distribution for token j given the drafted tokens before it. The decoder's caches are only read.
+3. **Accept.** The longest prefix where the draft equals the decoder's argmax is kept; the first mismatch is replaced by the decoder's argmax. If positions remain, the repaired guess goes through another verify pass. Every pass settles at least one token, so a concept takes 1 to k verify passes (one plus one per rejected slot before the last).
+
+Greedy output equals plain greedy decoding: a token is kept only where its whole prefix is settled and it is the decoder's argmax. The parallel pass rounds differently from the step-by-step one, so at an exact near tie of the two best logits the two may differ; the GPU tests find no difference in f32 and count differences in bf16. For sampling, `Speculator::decode_sampled` applies standard speculative acceptance: a drafted token x is kept with probability min(1, p(x)/q(x)), a rejected one is redrawn from the normalised max(0, p - q), with p and q the decoder's and the draft head's distributions after the caller's transform (temperature, top-p, ...). Because the draft head's slots do not depend on earlier tokens, the drafted tokens after a correction remain valid proposals. `ncm-server` does not use speculation yet.
+
+**Training hook.** `NcmLm::forward_with_draft` returns the decoder's logits and the draft head's logits over the same positions, sharing the encoder and backbone; `speculative::draft_loss` is the cross-entropy of the draft logits, overall and per slot. The training crate adds it (weighted) to the decoder loss. Its gradient reaches the decoder layers' cross-attention key-value projections, which the head shares.
+
+**Execution.** One device-to-host transfer per verify pass (the first also brings the draft). On CUDA with the fused kernels and graphs on, the draft and verify passes are captured once the cross-attention ring is full and replayed per concept: the condition and RoPE tables are copied in before the draft replay and the guess before each verify replay. Without CUDA, or before the ring fills, the same passes run eagerly. Under real verification the last verify pass's output buffer is the concept, so no upload follows.
+
+**Tests.** `tests/speculative.rs` (CPU, tiny models of both designs): speculative greedy equals plain greedy over 10 concepts for 6 seeds, and with forced drafts that are right everywhere, right up to slot 2 or 1, or wrong everywhere (also checking the verify-pass count); assumed acceptance gives the rate and pass count it should; speculative sampling with one-hot distributions equals greedy, and accept-or-resample draws reproduce the target distribution (200,000 draws); the verify and draft passes equal the training forward's logits; `draft_loss` against a hand computation; the head is optional. On the GPU (`kernels_f32.rs`, `kernels_bf16.rs`): the graphed draft and verify passes give the same tokens and pass counts as the same kernels run eagerly, under real verification and an assumed rate of 0.5, and in f32 the same tokens as plain greedy decoding through the decoder graph.
+
+**Benchmark.** `ncm-bench --speculate on` adds, per context, a speculative run with real verification and one per `--assume-accept` rate. An assumed rate keeps that share of drafted tokens whatever the decoder says (decision n keeps when frac(n (sqrt 5 - 1)/2) is below the rate), so it times the passes and transfers a trained model with that acceptance would run; its tokens are not the model's output and the report labels it SYNTHETIC. Random weights accept few drafts (2 to 18% at 250M), so the real run measures little more than the worst case. RTX 5080, bf16, v2 NCM, 256 new tokens (2k: median of 3; 16k: one run):
+
+| Run | 2k tok/s | 16k tok/s |
+|---|---|---|
+| Plain (decoder graph) | 499.8 | 474.8 |
+| Speculative, real verification (random weights: 3.5% and 18% kept, 3.9 and 3.5 passes per concept) | 462.4 (0.93x) | 463.4 (0.98x) |
+| Speculative, assumed acceptance 1.0 (1 pass per concept) | 585.9 (1.17x) | 585.1 (1.23x) |
+| Speculative, assumed acceptance 0.75 (1.7 passes) | 540.3 (1.08x) | 553.0 (1.16x) |
+| Speculative, assumed acceptance 0.5 (2.5 passes) | 511.4 (1.02x) | 502.8 (1.06x) |
+
+The fallback NCM at 2k: 430.0 plain, 486.8 (1.13x) at acceptance 1.0, 458.0 at 0.75, 407.9 at 0.5. The gain is bounded because greedy decode is host-bound outside the decoder (95% host share): the plain decoder already replays as one graph whose GPU time overlaps the host issuing the next concept's encoder and backbone work, which speculation does not touch, while each verify pass adds a host sync. Runtimes that sample on the host save more: plain decoding syncs once per token there, speculation once per verify pass.
 
 ## Known slow paths
 

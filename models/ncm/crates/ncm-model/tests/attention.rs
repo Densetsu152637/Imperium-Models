@@ -276,8 +276,15 @@ fn v2_full_config_param_counts() {
     }
     let m = |n: usize| (n as f64 / 1e5).round() / 10.0;
     assert_eq!(
-        [m(ncm.embeddings), m(ncm.encoder), m(ncm.backbone), m(ncm.decoder), m(ncm.projections)],
-        [16.4, 10.5, 200.1, 15.7, 2.6]
+        [
+            m(ncm.embeddings),
+            m(ncm.encoder),
+            m(ncm.backbone),
+            m(ncm.decoder),
+            m(ncm.draft),
+            m(ncm.projections)
+        ],
+        [16.4, 10.5, 200.1, 15.7, 3.7, 2.6]
     );
     assert_eq!([m(tok.embeddings), m(tok.transformer)], [32.8, 216.9]);
 }

@@ -18,6 +18,7 @@ dec_layers = 4
 dec_heads = 8
 dec_kv_heads = 4
 dec_ff_dim = 1536
+draft_layers = 1     # parallel draft head for self-speculative decode (shares the decoder's cross K/V)
 # Global backbone over concepts: 16 layers alternating gated DeltaNet and sparse retrieval
 bb_dim = 1024
 bb_layers = 16

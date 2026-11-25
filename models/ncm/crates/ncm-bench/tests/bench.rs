@@ -16,6 +16,10 @@ fn help_lists_the_documented_flags() {
         "--repeats",
         "--json",
         "--tiny",
+        "--reference-kernels",
+        "--no-cuda-graphs",
+        "--speculate",
+        "--assume-accept",
     ] {
         assert!(help.contains(flag), "missing {flag}");
     }
@@ -105,4 +109,45 @@ fn design_flag_picks_one_design() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["design"], "v2");
     assert!(payload["ratios"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn speculate_reports_real_and_synthetic_runs() {
+    let cli = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--model",
+        "ncm",
+        "--context",
+        "32",
+        "--new-tokens",
+        "8",
+        "--repeats",
+        "1",
+        "--speculate",
+        "on",
+        "--assume-accept",
+        "1.0",
+        "0.5",
+    ]);
+    let payload = run(&cli).expect("tiny run");
+    for result in payload["results"].as_array().unwrap() {
+        let runs = result["contexts"]["32"]["speculative"].as_array().unwrap();
+        let synthetic: Vec<_> = runs.iter().map(|r| r["synthetic"].as_bool().unwrap()).collect();
+        assert_eq!(synthetic, [false, true, true]);
+        assert_eq!(runs[1]["assumed_acceptance"], 1.0);
+        assert_eq!(runs[1]["verify_passes_per_concept"], 1.0);
+        assert!(runs.iter().all(|r| r["decode_tok_s"].as_f64().unwrap() > 0.0));
+    }
+}
+
+#[test]
+fn assume_accept_needs_speculate_and_a_rate() {
+    let base = ["ncm-bench", "--tiny", "--device", "cpu", "--model", "ncm"];
+    let off = Cli::parse_from(base.iter().chain(&["--assume-accept", "0.5"]));
+    assert!(run(&off).unwrap_err().contains("--speculate on"));
+    let bad = Cli::parse_from(base.iter().chain(&["--speculate", "on", "--assume-accept", "1.5"]));
+    assert!(run(&bad).unwrap_err().contains("between 0 and 1"));
 }

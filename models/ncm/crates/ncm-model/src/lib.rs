@@ -18,6 +18,7 @@ pub mod kernels;
 pub mod layers;
 pub mod ncm;
 pub mod retrieval;
+pub mod speculative;
 pub mod tok;
 pub mod weights;
 
@@ -28,6 +29,7 @@ pub use config::{
     tok_250m_v2,
 };
 pub use ncm::{NcmCache, NcmLm, NcmParts, ncm_cache_bytes};
+pub use speculative::{Acceptance, DraftLoss, SpecStats, Speculator, draft_loss};
 pub use tok::{TokParts, TokenLm, tok_cache_bytes};
 
 /// Bytes per indexer-key value in the v2 design: 8-bit keys, as in DeepSeek-V3.2. The reference
