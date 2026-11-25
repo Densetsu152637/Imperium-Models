@@ -1,5 +1,5 @@
-//! The Rust models reproduce the PyTorch reference: tiny-config weights and logits exported by
-//! `scripts/export_parity_fixture.py` (regenerate it with `uv run python` from `models/ncm`).
+//! The Rust models reproduce the PyTorch reference: tiny-config weights and logits exported from
+//! the since-deleted reference at commit 2fa4688. The fixture is frozen (see `fixtures/README.md`).
 
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, Int, Tensor, TensorData};
