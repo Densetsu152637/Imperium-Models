@@ -13,7 +13,7 @@ The design, plan and acceptance checks live in Imperium-Research under `docs/nex
 | `crates/ncm-bench/` | `ncm-bench`, the batch-1 decode-speed benchmark |
 | `crates/ncm-data/` | `ncm-data`, the stage 2 data pipeline: fetch, sample, train the tokenizer, tokenise, stats |
 | `configs/` | Model configs (TOML), embedded into `ncm-model`, and `data-mix.toml`, the pinned pretraining source manifest |
-| `runtime/` | Planned: `ncm-server`, an OpenAI-compatible inference server launched by Imperium like `llama-server`. A training crate (Burn autodiff) will also build on `ncm-model` |
+| `runtime/` | `ncm-server`, an OpenAI-compatible inference server launched by Imperium like `llama-server` (see `runtime/README.md`). A training crate (Burn autodiff) will also build on `ncm-model` |
 | `scripts/check.sh` | CI checks: `cargo fmt --check`, `clippy`, `test` on the CPU backend, and a tiny benchmark run |
 | `data/`, `runs/`, `outputs/`, `weights/` | Local only, ignored by Git |
 

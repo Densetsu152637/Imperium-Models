@@ -1,0 +1,37 @@
+[package]
+name = "ncm-server"
+description = "OpenAI-compatible HTTP server for the NCM and the token baseline, launched like llama-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ncm_server"
+
+[[bin]]
+name = "ncm-server"
+path = "src/main.rs"
+
+[features]
+# The CPU backend is always built; CUDA is opt-in (CI has no GPU).
+cuda = ["burn/cuda"]
+
+[dependencies]
+ncm-model = { path = "../crates/ncm-model" }
+burn = { workspace = true, features = ["flex"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+tokio-stream = "0.1"
+# onig regexes only; no progress bars or HTTP client.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = { version = "0.3", default-features = false }

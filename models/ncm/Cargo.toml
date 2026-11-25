@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ncm-model", "crates/ncm-bench", "crates/ncm-sft", "crates/ncm-data"]
+members = ["crates/ncm-model", "crates/ncm-bench", "crates/ncm-sft", "crates/ncm-data", "runtime"]
 
 [workspace.package]
 version = "0.0.0"

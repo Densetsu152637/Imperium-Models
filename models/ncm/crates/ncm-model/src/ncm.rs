@@ -330,6 +330,23 @@ impl NcmLm {
         forced: Option<Tensor<2, Int>>,
         want_logits: bool,
     ) -> (Tensor<2, Int>, Option<Tensor<3>>) {
+        self.decode_concept_with(cond, cache, want_logits, &mut |j, logits| match &forced {
+            Some(forced) => forced.clone().narrow(1, j, 1),
+            None => logits.clone().argmax(2).reshape([logits.dims()[0], 1]),
+        })
+    }
+
+    /// Like `decode_concept`, but `pick(j, logits)` chooses token `j` of the concept from its
+    /// logits `[B, 1, V]` and returns it as `[B, 1]`. It is how a runtime samples, masks logits
+    /// or constrains the output; it sees the tokens it picked earlier in the concept because
+    /// the decoder feeds each one back before the next call.
+    pub fn decode_concept_with(
+        &self,
+        cond: Tensor<3>,
+        cache: &mut NcmCache,
+        want_logits: bool,
+        pick: &mut dyn FnMut(usize, &Tensor<3>) -> Tensor<2, Int>,
+    ) -> (Tensor<2, Int>, Option<Tensor<3>>) {
         let k = self.k;
         let [b, _, _] = cond.dims();
         let device = cond.device();
@@ -351,10 +368,7 @@ impl NcmLm {
                 x = blk.step(x, &rs, &rq, self_cache, cross_cache);
             }
             let lg = self.logits(x);
-            let next = match &forced {
-                Some(forced) => forced.clone().narrow(1, j, 1),
-                None => lg.clone().argmax(2).reshape([b, 1]),
-            };
+            let next = pick(j, &lg);
             if want_logits {
                 logits.push(lg);
             }
