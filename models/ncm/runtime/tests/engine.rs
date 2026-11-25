@@ -139,6 +139,7 @@ fn contexts_too_small_for_the_model_are_refused() {
         weights: None,
         seed: 0,
         prefill_chunk: 16,
+        quant: None,
     };
     assert!(matches!(
         Engine::new(options(4), vocab()),
@@ -243,4 +244,59 @@ fn the_guard_is_free_until_a_tool_call_opens() {
     assert!(!guard.allows(brace), "nothing but whitespace after the object");
     guard.advance(vocab.ids.tool_call_end);
     assert!(!guard.in_call());
+}
+
+#[test]
+fn quantised_engines_load_dense_and_quantised_weight_files() {
+    use burn::tensor::FloatDType;
+    use ncm_model::quant::{self, Format, QuantSpec};
+    use ncm_model::weights::save_weights;
+    use ncm_model::{Config, NcmLm, TokenLm};
+    use ncm_server::engine::{DeviceChoice, EngineOptions, make_device};
+
+    let dir = tempfile::tempdir().unwrap();
+    let device = make_device(DeviceChoice::Cpu, FloatDType::F32).unwrap();
+    let spec = QuantSpec { format: Format::q4(64), head: true };
+    for (i, config) in [tiny_tok_v2_config(), tiny_ncm_v2_config()].into_iter().enumerate() {
+        let dense = dir.path().join(format!("dense-{i}.safetensors"));
+        let packed = dir.path().join(format!("q4-{i}.safetensors"));
+        match &config {
+            Config::Tok(c) => {
+                let model = TokenLm::new(c, &device);
+                save_weights(&model, &config, &dense).unwrap();
+                let q = quant::quantize_model(&model, spec, &device, || TokenLm::new(c, &device));
+                quant::save_quantized(&q.unwrap(), &config, spec, &packed).unwrap();
+            }
+            Config::Ncm(c) => {
+                let model = NcmLm::new(c, &device);
+                save_weights(&model, &config, &dense).unwrap();
+                let q = quant::quantize_model(&model, spec, &device, || NcmLm::new(c, &device));
+                quant::save_quantized(&q.unwrap(), &config, spec, &packed).unwrap();
+            }
+        }
+        let options = |weights: &std::path::Path, quant| EngineOptions {
+            config: config.clone(),
+            ctx: 64,
+            device: device.clone(),
+            device_name: "cpu".into(),
+            dtype: FloatDType::F32,
+            weights: Some(weights.to_path_buf()),
+            seed: 0,
+            prefill_chunk: 16,
+            quant,
+        };
+        // Quantising a dense file at load and loading the quantised file give the same model.
+        let converted = Engine::new(options(&dense, Some(spec)), vocab()).unwrap();
+        let loaded = Engine::new(options(&packed, None), vocab()).unwrap();
+        let greedy = || request(prompt("quantised"), 8, SamplingParams::GREEDY);
+        let (tokens, stats) = run(&converted, greedy());
+        assert!(stats.completion_tokens > 0);
+        assert_eq!(tokens, run(&loaded, greedy()).0);
+        // A quantised file does not convert to another quantisation.
+        let q8 = QuantSpec { format: Format::q8(), head: true };
+        assert!(matches!(
+            Engine::new(options(&packed, Some(q8)), vocab()),
+            Err(EngineError::QuantMismatch { .. })
+        ));
+    }
 }

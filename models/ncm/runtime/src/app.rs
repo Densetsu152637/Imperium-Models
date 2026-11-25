@@ -142,6 +142,7 @@ pub fn load_engine(plan: &Plan, cli: &Cli) -> Result<Engine, String> {
         weights: plan.weights.clone(),
         seed: cli.weights_seed,
         prefill_chunk: cli.prefill_chunk,
+        quant: cli.quant_spec()?,
     };
     Engine::new(options, Arc::new(vocab)).map_err(|e| e.to_string())
 }

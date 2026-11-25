@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use burn::module::Module;
-use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::nn::{Initializer, Linear as DenseLinear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::activation::{sigmoid, silu, softmax};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
@@ -19,6 +19,7 @@ use burn::tensor::{Bool, Device, Tensor, TensorData};
 use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
 use crate::config::{V2Config, is_full_layer};
 use crate::delta::{DeltaSpec, GatedDeltaNet};
+use crate::quant::QLinear as Linear;
 use crate::retrieval::{RetrievalSpec, SparseRetrieval};
 
 /// Weight initialiser used by every linear layer and embedding: N(0, 0.02).
@@ -26,7 +27,13 @@ pub fn init_normal() -> Initializer {
     Initializer::Normal { mean: 0.0, std: 0.02 }
 }
 
+/// A bias-free linear layer: dense, or quantised inside [`crate::quant::build`].
 pub fn linear(d_in: usize, d_out: usize, device: &Device) -> Linear {
+    Linear::new(d_in, d_out, device)
+}
+
+/// A bias-free linear layer that is never quantised (its weight is read as a matrix).
+pub fn dense_linear(d_in: usize, d_out: usize, device: &Device) -> DenseLinear {
     LinearConfig::new(d_in, d_out).with_bias(false).with_initializer(init_normal()).init(device)
 }
 

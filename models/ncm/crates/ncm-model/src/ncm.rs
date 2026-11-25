@@ -13,7 +13,7 @@
 //! k .. N - 1 (`logits[:, t - k]` predicts token t).
 
 use burn::module::{Module, Param};
-use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm};
+use burn::nn::{Embedding, EmbeddingConfig, RmsNorm};
 use burn::tensor::module::linear as linear_op;
 use burn::tensor::{Bool, Device, Int, Tensor};
 
@@ -23,6 +23,7 @@ use crate::layers::{
     Attention, CrossAttention, LayerKind, Mlp, Rope, Stack, StackSpec, fallback_kinds,
     hybrid_kinds, init_normal, linear, rms_norm,
 };
+use crate::quant::{QLinear as Linear, tied_head};
 
 #[derive(Module, Debug)]
 pub struct DecoderBlock {
@@ -182,6 +183,8 @@ pub struct NcmLm {
     start_emb: Param<Tensor<1>>,
     dec_blocks: Vec<DecoderBlock>,
     dec_norm: RmsNorm,
+    /// A quantised copy of the tied output head (see [`crate::quant`]); None: logits use `emb`.
+    head: Option<Linear>,
     k: usize,
     local_dim: usize,
     head_dim: usize,
@@ -207,6 +210,7 @@ impl NcmLm {
             start_emb: init_normal().init([d], device),
             dec_blocks: (0..cfg.dec_layers).map(|_| DecoderBlock::new(cfg, device)).collect(),
             dec_norm: rms_norm(d, cfg.norm_eps, device),
+            head: tied_head(cfg.vocab_size, d, device),
             k: cfg.k,
             local_dim: d,
             head_dim: cfg.head_dim,
@@ -239,7 +243,11 @@ impl NcmLm {
     }
 
     fn logits(&self, x: Tensor<3>) -> Tensor<3> {
-        linear_op(self.dec_norm.forward(x), self.emb.weight.val().transpose(), None)
+        let x = self.dec_norm.forward(x);
+        match &self.head {
+            Some(head) => head.forward(x),
+            None => linear_op(x, self.emb.weight.val().transpose(), None),
+        }
     }
 
     // ------------------------------------------------------------------ full sequence

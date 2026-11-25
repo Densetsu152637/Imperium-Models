@@ -19,11 +19,12 @@
 //! context, which is exact but costs as much as dense attention.
 
 use burn::module::Module;
-use burn::nn::{Linear, RmsNorm};
+use burn::nn::{Linear as DenseLinear, RmsNorm};
 use burn::tensor::activation::{relu, sigmoid, softmax};
 use burn::tensor::{Bool, Device, Int, Tensor, s};
 
-use crate::layers::{Rope, apply_rope, linear, rms_norm};
+use crate::layers::{Rope, apply_rope, dense_linear, linear, rms_norm};
+use crate::quant::QLinear as Linear;
 
 /// Shape of a sparse retrieval layer.
 #[derive(Debug, Clone)]
@@ -130,8 +131,8 @@ pub struct SparseRetrieval {
     rope_norm: RmsNorm,
     index_norm: RmsNorm,
     /// Latent to per-head keys (no position) and values.
-    uk: Linear,
-    uv: Linear,
+    uk: DenseLinear,
+    uv: DenseLinear,
     o: Linear,
     heads: usize,
     nope_dim: usize,
@@ -164,8 +165,8 @@ impl SparseRetrieval {
             kv_norm: rms_norm(spec.latent, spec.eps, device),
             rope_norm: rms_norm(spec.rope_dim, spec.eps, device),
             index_norm: rms_norm(spec.index_dim, spec.eps, device),
-            uk: linear(spec.latent, h * spec.nope_dim, device),
-            uv: linear(spec.latent, h * spec.v_dim, device),
+            uk: dense_linear(spec.latent, h * spec.nope_dim, device),
+            uv: dense_linear(spec.latent, h * spec.v_dim, device),
             o: linear(h * spec.v_dim, spec.d, device),
             heads: h,
             nope_dim: spec.nope_dim,

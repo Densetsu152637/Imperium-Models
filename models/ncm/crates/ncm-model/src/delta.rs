@@ -15,11 +15,12 @@
 //! state is carried from chunk to chunk. Both are plain Burn tensor code (reference versions).
 
 use burn::module::{Module, Param};
-use burn::nn::{Initializer, Linear, RmsNorm};
+use burn::nn::{Initializer, RmsNorm};
 use burn::tensor::activation::{sigmoid, silu, softplus};
 use burn::tensor::{Bool, Device, Tensor, TensorData};
 
 use crate::layers::{linear, rms_norm};
+use crate::quant::QLinear as Linear;
 
 /// Norm floor of the L2 normalisation of queries and keys.
 const L2_EPS: f64 = 1e-6;

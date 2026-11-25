@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use ncm_model::quant::QuantSpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ArchArg {
@@ -25,6 +26,17 @@ pub enum DeviceArg {
     Cpu,
     /// Needs a build with `--features cuda`.
     Cuda,
+}
+
+/// Weight-only quantisation of the linear layers (see `ncm_model::quant`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum QuantArg {
+    /// Dense weights at the run dtype.
+    None,
+    /// 8-bit codes, one scale per output channel (W8A16).
+    Q8,
+    /// 4-bit codes, one scale per `--quant-group` inputs (W4A16).
+    Q4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -94,6 +106,15 @@ pub struct Cli {
     /// Prompt tokens fed to the model per step.
     #[arg(long, default_value_t = 512)]
     pub prefill_chunk: usize,
+    /// Quantise the linear layers' weights at load. A quantised weight file loads as it is.
+    #[arg(long, value_enum, default_value = "none")]
+    pub quant: QuantArg,
+    /// Inputs per scale for `--quant q4` (a multiple of 32).
+    #[arg(long, default_value_t = 64)]
+    pub quant_group: usize,
+    /// Keep the tied output head dense when quantising.
+    #[arg(long)]
+    pub dense_head: bool,
 
     // llama-server flags: accepted so Imperium's launch line works unchanged.
     /// Layers on the GPU; 0 means CPU. Anything else uses the GPU when the build has one.
@@ -151,6 +172,16 @@ pub fn normalize_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
 }
 
 impl Cli {
+    /// The quantisation `--quant`, `--quant-group` and `--dense-head` ask for.
+    pub fn quant_spec(&self) -> Result<Option<QuantSpec>, String> {
+        let mode = match self.quant {
+            QuantArg::None => "none",
+            QuantArg::Q8 => "q8",
+            QuantArg::Q4 => "q4",
+        };
+        QuantSpec::parse(mode, self.quant_group, !self.dense_head)
+    }
+
     pub fn parse_normalized() -> Self {
         Self::parse_from(normalize_args(std::env::args()))
     }

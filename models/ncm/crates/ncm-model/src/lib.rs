@@ -14,6 +14,7 @@ pub mod config;
 pub mod delta;
 pub mod layers;
 pub mod ncm;
+pub mod quant;
 pub mod retrieval;
 pub mod tok;
 pub mod weights;
