@@ -106,6 +106,12 @@ impl Rope {
         }
     }
 
+    /// The `cos` and `sin` tables `[1, 1, T, head_dim]`.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn tables(&self) -> (Tensor<4>, Tensor<4>) {
+        (self.cos.clone(), self.sin.clone())
+    }
+
     /// Rows `start..start + len` of these tables.
     pub fn rows(&self, start: usize, len: usize) -> Self {
         Self {

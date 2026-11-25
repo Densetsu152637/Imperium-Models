@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
+use ncm_model::fused::{kernels_built, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
 use ncm_model::{
     Config, Design, NcmLm, TokenLm, cache_bytes, cache_bytes_with, ncm_250m_of, tiny_ncm,
@@ -102,6 +103,10 @@ pub struct Cli {
     /// Use Burn's fused attention op instead of matmul-softmax-matmul (experimental).
     #[arg(long)]
     pub fused_attention: bool,
+    /// Run the v2 layers' reference tensor code on CUDA instead of their fused kernels (which a
+    /// `--features cuda` build uses by default).
+    #[arg(long)]
+    pub reference_kernels: bool,
 }
 
 pub fn verdict(ratio: f64) -> &'static str {
@@ -364,6 +369,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         return Err("--repeats and --context need at least one value".into());
     }
     set_fused_attention(cli.fused_attention);
+    set_fused_kernels(!cli.reference_kernels);
     let itemsize = match dtype {
         DtypeChoice::Bf16 => 2,
         DtypeChoice::F32 => 4,
@@ -418,6 +424,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         "dtype": format!("{dtype:?}").to_lowercase(),
         "tiny": cli.tiny,
         "fused_attention": cli.fused_attention,
+        "fused_kernels": cli.device == DeviceChoice::Cuda && kernels_built() && !cli.reference_kernels,
         "results": results,
         "ratios": ratios,
         "ncm_v2_over_fallback": design_ratios,

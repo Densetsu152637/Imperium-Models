@@ -320,8 +320,17 @@ impl GatedDeltaNet {
     }
 
     /// `x` `[B, T, d]`. With a cache the layer continues from its state (one-token steps use
-    /// the recurrent form) and updates it.
-    pub fn forward(&self, x: Tensor<3>, cache: Option<&mut DeltaCache>) -> Tensor<3> {
+    /// the recurrent form) and updates it. On CUDA with the fused kernels on, cached runs of up
+    /// to a chunk take [`crate::kernels::delta_step`] instead.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    pub fn forward(&self, x: Tensor<3>, mut cache: Option<&mut DeltaCache>) -> Tensor<3> {
+        #[cfg(feature = "cuda")]
+        if let Some(c) = cache.as_deref_mut()
+            && x.dims()[1] <= self.chunk
+            && crate::fused::active(&x.device())
+        {
+            return self.forward_fused(x, c);
+        }
         let [b, t, _] = x.dims();
         let (h, hd) = (self.heads, self.head_dim);
         let device = x.device();
@@ -360,5 +369,27 @@ impl GatedDeltaNet {
         }
         let out = self.norm.forward(out).swap_dims(1, 2).reshape([b, t, h * hd]);
         self.o.forward(out * sigmoid(gate))
+    }
+
+    /// The cached path of [`Self::forward`] as one fused kernel between the two projections:
+    /// decode steps and short runs (up to a chunk), token by token.
+    #[cfg(feature = "cuda")]
+    fn forward_fused(&self, x: Tensor<3>, cache: &mut DeltaCache) -> Tensor<3> {
+        let t = x.dims()[1];
+        let (out, conv, state) = crate::kernels::delta_step(
+            self.proj.forward(x),
+            self.conv.val(),
+            cache.conv.clone(),
+            cache.state.clone(),
+            self.a_log.val(),
+            self.dt_bias.val(),
+            self.norm.gamma.val(),
+            self.heads,
+            self.norm.epsilon,
+        );
+        cache.state = state;
+        cache.conv = conv;
+        cache.length += t;
+        self.o.forward(out)
     }
 }

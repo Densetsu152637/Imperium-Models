@@ -189,16 +189,64 @@ impl SparseRetrieval {
         1.0 / ((self.nope_dim + self.rope_dim) as f64).sqrt()
     }
 
+    /// The fused one-token decode ([`crate::kernels::retrieval_decode`]): the same cache write,
+    /// selection and attention as the reference, between the two projections.
+    #[cfg(feature = "cuda")]
+    fn decode_fused(&self, x: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
+        let pos = cache.length;
+        assert!(pos < cache.capacity, "cache capacity {} exceeded", cache.capacity);
+        let dims = crate::kernels::RetrievalDims {
+            heads: self.heads,
+            nope_dim: self.nope_dim,
+            rope_dim: self.rope_dim,
+            v_dim: self.v_dim,
+            latent: self.latent,
+            index_heads: self.index_heads,
+            index_dim: self.index_dim,
+            block: self.block,
+            topk: self.topk,
+            local: self.local,
+            dense: self.dense,
+            eps: self.q_norm.epsilon,
+        };
+        let norms =
+            [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
+        let (out, kv, keys) = crate::kernels::retrieval_decode(
+            self.proj.forward(x),
+            norms,
+            rope.tables(),
+            self.uk.weight.val(),
+            self.uv.weight.val(),
+            cache.kv.take().expect("cache"),
+            cache.keys.take().expect("cache"),
+            pos,
+            dims,
+        );
+        cache.kv = Some(kv);
+        cache.keys = Some(keys);
+        cache.length += 1;
+        self.o.forward(out)
+    }
+
     /// `x` `[B, T, d]` at absolute positions `start..start + T`; `rope` holds the tables of those
     /// positions for the decoupled key width. With a cache, the new positions are appended and
-    /// the queries see everything cached before them.
+    /// the queries see everything cached before them. On CUDA with the fused kernels on,
+    /// one-token steps with a cache take [`Self::decode_fused`].
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     pub fn forward(
         &self,
         x: Tensor<3>,
         start: usize,
         rope: &Rope,
-        cache: Option<&mut LatentCache>,
+        mut cache: Option<&mut LatentCache>,
     ) -> Tensor<3> {
+        #[cfg(feature = "cuda")]
+        if let Some(c) = cache.as_deref_mut()
+            && x.dims()[1] == 1
+            && crate::fused::active(&x.device())
+        {
+            return self.decode_fused(x, rope, c);
+        }
         let [b, t, _] = x.dims();
         let (h, dn, dr, dv, l) =
             (self.heads, self.nope_dim, self.rope_dim, self.v_dim, self.latent);

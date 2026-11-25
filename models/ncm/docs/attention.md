@@ -7,7 +7,7 @@ Both models (the NCM and the token baseline) come in two attention designs, pick
 | `"v2"` | Gated DeltaNet alternating with sparse retrieval attention (adopted 2026-11-25) | `configs/ncm-250m-v2.toml`, `configs/tok-250m-v2.toml` |
 | `"fallback"` (default) | Sliding-window attention with a full-attention layer every fourth (the stage 1 design) | `configs/ncm-250m.toml`, `configs/tok-250m.toml` |
 
-The design itself is settled in Imperium-Research (`docs/next-concept-modelling/architecture.md`). This page records how `ncm-model` implements v2 and the choices made where the design leaves details open. The code is the **reference** version: plain Burn tensor ops, written for correctness. Fused kernels come later (local test plan, step 3).
+The design itself is settled in Imperium-Research (`docs/next-concept-modelling/architecture.md`). This page records how `ncm-model` implements v2 and the choices made where the design leaves details open. The layers are written as **reference** code: plain Burn tensor ops, written for correctness, and the only path on the CPU and in CI. On CUDA the host-bound decode paths run as fused CubeCL kernels instead ([Fused decode kernels](#fused-decode-kernels-srckernels), local test plan step 3), tested against the reference.
 
 v2 settings live in the `[v2]` table of a config (`V2Config`); fallback models ignore them. A weight file's header carries the whole config, so `ncm-server` loads either design from the weights alone.
 
@@ -52,7 +52,7 @@ Execution paths:
 
 | Call | Path |
 |---|---|
-| One-token decode | Indexer scan over all cached positions, block max, top-k, gather the selected blocks and the local window from the cache, absorbed attention over about 3,072 positions |
+| One-token decode | Indexer scan over all cached positions, block max, top-k, gather the selected blocks and the local window from the cache, absorbed attention over about 3,072 positions (on CUDA: the fused kernels, which index the selected blocks in place instead of gathering them) |
 | Prefill chunk or training forward | Indexer scores for every query, selection as a `[T, S]` mask, masked attention over all `S` positions. Exact, but as costly as dense attention |
 
 ## Parameters
@@ -81,13 +81,29 @@ DeltaNet states are kept at the run dtype in the reference; Qwen keeps them in f
 
 `tests/attention.rs` (CPU, tiny configs): the chunked DeltaNet equals the recurrent one (ragged tails, chunk 1, chunk longer than the run); incremental decode equals a full forward pass for both v2 models, sparse and dense, across chunk, block and local-window boundaries; sparse retrieval with every block selected equals dense attention, and top-2 differs from it; NCM causality and conditioning; full-config parameter counts; cache bytes at 1M within 5% of the architecture doc; cache bytes equal the allocation. `tests/weights.rs` round-trips v2 weights. `ncm-server` has a v2 engine test.
 
-## Known slow paths (for fused kernels, step 3)
+## Fused decode kernels (`src/kernels`)
 
-- **Chunked DeltaNet:** the chunk loop runs on the host, about seven tensor ops per chunk per layer; the intra-chunk inverse is six batched matmul squarings.
-- **Recurrent DeltaNet step:** about a dozen small ops per layer per token, so decode is host-dispatch bound.
-- **Indexer scan and top-k:** the scan is a matmul over every cached key per indexer head, then pad, block max, top-k, index arithmetic and a gather of the selected blocks. Keys are read at bf16, twice the design's traffic.
-- **Sparse prefill:** prefill and training compute the selection as a mask over the whole context and then attend densely, so they cost as much as dense attention; a block-sparse kernel is needed to make them sparse in compute.
-- **Absorbed projections** are rebuilt from the weights (reshape and permute) on every call.
+Batch-1 decode is bound by the host issuing small tensor ops (about 10 µs each), not by the GPU. The reference v2 decode issues dozens of ops per DeltaNet or retrieval layer and step (norms alone are nine each); the fused kernels bring each layer down to its two projections plus one to five kernels.
+
+| Kernel | Replaces | Launches per layer and step |
+|---|---|---|
+| `delta_step_kernel` | Gated DeltaNet with a cache over up to `dn_chunk` tokens: short convolution, SiLU, L2 norms, gates, delta-rule update and read-out, per-head RMSNorm, output gate. One cube per (batch, head), one unit per state column; the tokens of a run go one by one inside the kernel, so the NCM encoder's 4-token call per concept is one launch too | 1 (+ the 2 projections) |
+| `ret_prep_kernel` | Retrieval QK-norms, partial RoPE, the absorbed query `q_nope W_uk^T` (softmax scale folded in) and the new cache entry (latent, RoPE key, indexer key) written in place | 1 |
+| `ret_index_kernel`, `ret_topk_kernel` | Indexer scores of every candidate block (block maximum), then the top `ret_topk` blocks by rank counting, on the device: no host round trip. Sparse steps only | 2 |
+| `ret_attend_kernel`, `ret_combine_kernel` | Absorbed attention over the selected blocks and the local window (or the whole context), split into chunks of 64 positions with a partial softmax each, then merged, up-projected by `W_uv` and gated | 2 |
+
+- **When:** `ncm-model`'s cargo feature `cuda` (on in `ncm-bench --features cuda`) builds them; layers on a CUDA device then take them for cached DeltaNet runs of up to `dn_chunk` tokens and one-token retrieval steps. Prefill, training and every non-CUDA device keep the reference. `ncm_model::fused::set_fused_kernels(false)` (`ncm-bench --reference-kernels`) switches them off for A/B runs. CI never builds the feature.
+- **Plumbing:** a Burn backend extension (`#[backend_extension(Cube)]`, trait `NcmKernels`) routes `Tensor` arguments to the cubecl backend's `CubeTensor`s. Kernels read inputs through their strides (cubecl pitches the rows of new buffers, so a contiguous layout cannot be assumed) and write contiguous outputs; the retrieval caches are updated in place.
+- **Numerics:** f32 inside every kernel. The DeltaNet state and the caches stay at the run dtype, as in the reference.
+- **Tests:** `tests/kernels_f32.rs` and `tests/kernels_bf16.rs` (`cargo test --release -p ncm-model --features cuda --test kernels_f32 --test kernels_bf16`, a GPU and the CUDA toolkit needed) run each layer three ways from equal caches: fused on CUDA, reference on CUDA, and reference on the CPU in f32 with the same weights and inputs. The fused output must be within the tolerance of the f32 CPU result at every step, as a share of its largest magnitude: **5e-3 in f32 and 4e-2 in bf16** (the CUDA reference itself is off by up to about 2e-3 and 2.5e-2 away from selection near ties). Cases: DeltaNet at head widths 128, 32 and 16 with 1-, 3- and 4-token runs after a chunked prefill; retrieval with the models' head shapes and small blocks (dense steps, then sparse ones, crossing block and window boundaries), the tiny configs' shapes, dense mode, and the 250M selection (blocks of 64, top 32, window 1,024) past 3,150 positions. Batch 2 throughout. At a near tie for the last selected block, the CUDA paths (keys from the same GPU projection) may pick another block than the CPU; such a step passes when the fused output matches the CUDA reference instead, and at most one step in ten may. The 250M selection case runs in f32 only: with bf16 keys most of its steps are near ties.
+- **Effect** (RTX 5080, bf16, short runs on a busy CPU): kernel launches per decoded NCM token at 2k context fell from 825 (reference) to 507, against 536 for the fallback NCM. Decode tok/s, v2 against fallback: 213.6 against 171.2 at 2k, 155.2 against 87.6 at 16k (the reference v2 made 12.3 at 16k in the same session).
+
+## Known slow paths
+
+- **Chunked DeltaNet (prefill):** the chunk loop runs on the host, about seven tensor ops per chunk per layer; the intra-chunk inverse is six batched matmul squarings.
+- **Sparse prefill:** prefill and training compute the selection as a mask over the whole context and then attend densely, so they cost as much as dense attention; a block-sparse kernel is needed to make them sparse in compute. A 16k-token NCM v2 prefill takes about 28 s against 1 s for the fallback.
+- **Indexer keys** are read at bf16, twice the design's traffic.
+- **Reference decode** (CPU, and CUDA with the kernels off): about a dozen small ops per DeltaNet step, the indexer scan as a matmul plus pad, block max, top-k and a gather, and the absorbed projections rebuilt from the weights on every call.
 
 ## Not yet implemented
 

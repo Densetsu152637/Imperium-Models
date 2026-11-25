@@ -12,6 +12,9 @@ pub mod cache;
 pub mod chat;
 pub mod config;
 pub mod delta;
+pub mod fused;
+#[cfg(feature = "cuda")]
+pub mod kernels;
 pub mod layers;
 pub mod ncm;
 pub mod retrieval;

@@ -4373,6 +4373,7 @@ name = "ncm-model"
 version = "0.0.0"
 dependencies = [
  "burn",
+ "burn-cubecl",
  "serde",
  "serde_json",
  "tempfile",
