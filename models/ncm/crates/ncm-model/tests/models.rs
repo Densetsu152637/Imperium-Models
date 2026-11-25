@@ -3,7 +3,8 @@
 
 use ncm_model::config::{NCM_250M_TOML, TOK_250M_TOML};
 use ncm_model::{
-    Config, KvCache, NcmConfig, NcmLm, TokenLm, cache_bytes, ncm_250m, tiny_ncm, tiny_tok, tok_250m,
+    Config, LayerCache, NcmConfig, NcmLm, TokenLm, cache_bytes, ncm_250m, tiny_ncm, tiny_tok,
+    tok_250m,
 };
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
@@ -242,7 +243,7 @@ fn cache_bytes_match_allocation() {
         let ncm = NcmLm::new(&ncm_cfg, &device).make_cache(n, 1, &device);
         assert_eq!(ncm.nbytes(), cache_bytes(&Config::Ncm(ncm_cfg), n, 4, 1));
         let tok = TokenLm::new(&tok_cfg, &device).make_cache(n, 1, &device);
-        let got: usize = tok.iter().map(KvCache::nbytes).sum();
+        let got: usize = tok.iter().map(LayerCache::nbytes).sum();
         assert_eq!(got, cache_bytes(&Config::Tok(tok_cfg), n, 4, 1));
     }
 }

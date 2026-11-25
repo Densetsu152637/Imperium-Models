@@ -12,7 +12,7 @@ use std::time::Instant;
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use ncm_model::weights::{self, WeightsError};
-use ncm_model::{Config, KvCache, NcmCache, NcmLm, TokenLm, cache_bytes};
+use ncm_model::{Config, LayerCache, NcmCache, NcmLm, TokenLm, cache_bytes};
 
 use crate::constrain::Constraint;
 use crate::sampling::{Sampler, SamplingParams};
@@ -155,7 +155,7 @@ pub struct EngineOptions {
 
 #[allow(clippy::large_enum_variant)]
 enum State {
-    Tok { model: TokenLm, caches: Vec<KvCache> },
+    Tok { model: TokenLm, caches: Vec<LayerCache> },
     Ncm { model: NcmLm, cache: NcmCache },
 }
 
@@ -365,7 +365,7 @@ impl Engine {
     fn generate_tok(
         &self,
         model: &TokenLm,
-        caches: &mut [KvCache],
+        caches: &mut [LayerCache],
         prompt: &[u32],
         run: &mut Run<'_>,
     ) -> Result<GenStats, EngineError> {
@@ -416,10 +416,7 @@ impl Engine {
     ) -> Result<GenStats, EngineError> {
         let k = model.concept_size();
         let ids = run.ids;
-        for c in [&mut cache.backbone, &mut cache.encoder, &mut cache.cross, &mut cache.dec_self] {
-            c.iter_mut().for_each(KvCache::reset);
-        }
-        cache.tokens = 0;
+        cache.reset();
         // The prompt must be whole concepts: left-pad with `<|pad|>` so that it still ends
         // exactly where the reply starts.
         let pad = (k - prompt.len() % k) % k;

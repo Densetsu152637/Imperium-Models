@@ -9,10 +9,11 @@ The design, plan and acceptance checks live in Imperium-Research under `docs/nex
 | Path | Contents |
 |---|---|
 | `Cargo.toml` | Rust workspace. CPU is the default backend; CUDA is the `cuda` feature |
-| `crates/ncm-model/` | Configs, layers, KV caches, the token baseline and the NCM. Device-agnostic: Burn picks CUDA, CPU or wgpu from the `Device` |
+| `crates/ncm-model/` | Configs, layers, caches, the token baseline and the NCM, each in two attention designs (`attention = "v2"` or `"fallback"`, see `docs/attention.md`). Device-agnostic: Burn picks CUDA, CPU or wgpu from the `Device` |
 | `crates/ncm-bench/` | `ncm-bench`, the batch-1 decode-speed benchmark |
 | `crates/ncm-data/` | `ncm-data`, the stage 2 data pipeline: fetch, sample, train the tokenizer, tokenise, stats |
-| `configs/` | Model configs (TOML), embedded into `ncm-model`, and `data-mix.toml`, the pinned pretraining source manifest |
+| `configs/` | Model configs (TOML), embedded into `ncm-model`: `*-250m-v2.toml` (the adopted attention design) and `*-250m.toml` (the fallback); and `data-mix.toml`, the pinned pretraining source manifest |
+| `docs/` | `attention.md` (the two attention designs as implemented), `chat-format.md` |
 | `runtime/` | `ncm-server`, an OpenAI-compatible inference server launched by Imperium like `llama-server` (see `runtime/README.md`). A training crate (Burn autodiff) will also build on `ncm-model` |
 | `scripts/check.sh` | CI checks: `cargo fmt --check`, `clippy`, `test` on the CPU backend, and a tiny benchmark run |
 | `data/`, `runs/`, `outputs/`, `weights/` | Local only, ignored by Git |
@@ -21,9 +22,12 @@ The design, plan and acceptance checks live in Imperium-Research under `docs/nex
 
 ```
 cargo build --release -p ncm-bench --features cuda
-target/release/ncm-bench --device cuda --context 2048 16384 --new-tokens 256   # the stage 1 gate
-target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8       # smoke run
+target/release/ncm-bench --device cuda --context 2048 16384 131072 --new-tokens 256   # speed gate, all four models
+target/release/ncm-bench --device cuda --design fallback --context 2048 16384          # the stage 1 gate
+target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8              # smoke run
 ```
+
+`--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models. With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
 
 `cuda` builds need a local CUDA toolkit. `.cargo/config.toml` sets `CUDARC_CUDA_VERSION=13040` because cudarc (under burn-cuda) only lists CUDA up to 13.4 and rejects 13.5; the 13.x runtime is ABI compatible. CI never builds the `cuda` feature.
 

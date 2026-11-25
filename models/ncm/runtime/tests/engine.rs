@@ -5,7 +5,10 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{engine as build, request, tiny_ncm_config, tiny_tok_config, vocab};
+use common::{
+    engine as build, request, tiny_ncm_config, tiny_ncm_v2_config, tiny_tok_config,
+    tiny_tok_v2_config, vocab,
+};
 use ncm_server::constrain::ToolCallGuard;
 use ncm_server::engine::{Backend, Engine, EngineError, Finish, GenRequest};
 use ncm_server::sampling::SamplingParams;
@@ -52,6 +55,19 @@ fn greedy_decoding_is_deterministic_and_repeatable_across_requests() {
         // Another prompt in between does not leak into the next run.
         run(&engine, request(prompt("something else entirely"), 5, SamplingParams::GREEDY));
         assert_eq!(first, run(&engine, request(prompt("abcdefgh"), 24, SamplingParams::GREEDY)).0);
+    }
+}
+
+#[test]
+fn v2_models_decode_and_reset_between_requests() {
+    // Prompts long enough that retrieval selects blocks and DeltaNet spans several chunks.
+    for config in [tiny_tok_v2_config(), tiny_ncm_v2_config()] {
+        let engine = build(config, 256);
+        let text = "the quick brown fox jumps over the lazy dog, twice: the quick brown fox";
+        let (first, stats) = run(&engine, request(prompt(text), 12, SamplingParams::GREEDY));
+        assert!(stats.completion_tokens > 0);
+        let (second, _) = run(&engine, request(prompt(text), 12, SamplingParams::GREEDY));
+        assert_eq!(first, second, "a request must not see the previous one's state");
     }
 }
 

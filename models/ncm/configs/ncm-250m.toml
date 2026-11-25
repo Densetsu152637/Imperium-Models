@@ -1,5 +1,6 @@
 # Next Concept Model: local encoder -> k-token concepts -> global backbone -> local decoder.
 model = "ncm"
+attention = "fallback"  # first design; see ncm-250m-v2.toml for the adopted one
 vocab_size = 32000
 k = 4
 head_dim = 64

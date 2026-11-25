@@ -6,7 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use burn::tensor::FloatDType;
-use ncm_model::{Config, NcmConfig, TokConfig, tiny_ncm, tiny_tok};
+use ncm_model::{
+    Config, NcmConfig, TokConfig, tiny_ncm, tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2,
+};
 use ncm_server::api::ApiError;
 use ncm_server::engine::{
     Backend, DeviceChoice, Engine, EngineError, EngineOptions, Finish, GenRequest, GenStats,
@@ -23,6 +25,16 @@ pub fn tiny_tok_config() -> Config {
 
 pub fn tiny_ncm_config() -> Config {
     Config::Ncm(NcmConfig { vocab_size: BYTE_TOKENIZER_SIZE, ..tiny_ncm(8, 4) })
+}
+
+/// The v2 attention design: retrieval over blocks of 4 tokens, top 2 plus the last 8.
+pub fn tiny_tok_v2_config() -> Config {
+    Config::Tok(TokConfig { vocab_size: BYTE_TOKENIZER_SIZE, ..tiny_tok_v2(tiny_v2(4, 2, 8)) })
+}
+
+/// The v2 attention design: retrieval over blocks of 2 concepts, top 2 plus the last 4.
+pub fn tiny_ncm_v2_config() -> Config {
+    Config::Ncm(NcmConfig { vocab_size: BYTE_TOKENIZER_SIZE, ..tiny_ncm_v2(8, tiny_v2(2, 2, 4)) })
 }
 
 pub fn vocab() -> Arc<Vocab> {

@@ -1,7 +1,9 @@
 //! Shared building blocks: RoPE, SwiGLU, attention, transformer blocks and stacks.
 //!
 //! Both models run through exactly these layers, so any kernel-level speed difference between
-//! them comes from the architecture, not from a different attention path.
+//! them comes from the architecture, not from a different attention path. A stack's layers
+//! each pick a sequence mixer ([`LayerKind`]): grouped-query attention for the fallback design,
+//! gated DeltaNet and sparse retrieval for v2.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,13 +11,15 @@ use std::sync::{Mutex, OnceLock};
 
 use burn::module::Module;
 use burn::nn::{Initializer, Linear, LinearConfig, RmsNorm, RmsNormConfig};
-use burn::tensor::activation::{silu, softmax};
+use burn::tensor::activation::{sigmoid, silu, softmax};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Bool, Device, Tensor, TensorData};
 
-use crate::cache::{KvCache, build_mask};
-use crate::config::is_full_layer;
+use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
+use crate::config::{V2Config, is_full_layer};
+use crate::delta::{DeltaSpec, GatedDeltaNet};
+use crate::retrieval::{RetrievalSpec, SparseRetrieval};
 
 /// Weight initialiser used by every linear layer and embedding: N(0, 0.02).
 pub fn init_normal() -> Initializer {
@@ -169,11 +173,15 @@ impl Mlp {
     }
 }
 
-/// Causal GQA self-attention; `window` None means full attention.
+/// Causal GQA self-attention; `window` None means full attention. The v2 design adds QK-norm
+/// (RMSNorm of each query and key head before RoPE) and a sigmoid output gate.
 #[derive(Module, Debug)]
 pub struct Attention {
     qkv: Linear,
     o: Linear,
+    gate: Option<Linear>,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -192,6 +200,9 @@ impl Attention {
         Self {
             qkv: linear(d, (heads + 2 * kv_heads) * head_dim, device),
             o: linear(heads * head_dim, d, device),
+            gate: None,
+            q_norm: None,
+            k_norm: None,
             heads,
             kv_heads,
             head_dim,
@@ -199,15 +210,42 @@ impl Attention {
         }
     }
 
+    /// The same layer with an output gate and QK-norm (v2).
+    pub fn gated(mut self, d: usize, eps: f64, device: &Device) -> Self {
+        self.gate = Some(linear(d, self.heads * self.head_dim, device));
+        self.q_norm = Some(rms_norm(self.head_dim, eps, device));
+        self.k_norm = Some(rms_norm(self.head_dim, eps, device));
+        self
+    }
+
+    pub fn window(&self) -> Option<usize> {
+        self.window
+    }
+
+    pub fn make_cache(&self, max_positions: usize, batch: usize, device: &Device) -> KvCache {
+        KvCache::make(batch, self.kv_heads, self.head_dim, max_positions, self.window, device)
+    }
+
     pub fn forward(&self, x: Tensor<3>, rope: &Rope, cache: Option<&mut KvCache>) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
         let device = x.device();
+        let gate = self.gate.as_ref().map(|g| sigmoid(g.forward(x.clone())));
         let qkv = self.qkv.forward(x);
-        // Queries and keys share positions, so one RoPE pass covers both.
-        let qk = qkv.clone().narrow(2, 0, (h + kvh) * hd);
-        let qk = apply_rope(qk.reshape([b, t, h + kvh, hd]).swap_dims(1, 2), rope);
-        let (q, k) = (qk.clone().narrow(1, 0, h), qk.narrow(1, h, kvh));
+        let (q, k) = match (&self.q_norm, &self.k_norm) {
+            (Some(q_norm), Some(k_norm)) => {
+                let q = qkv.clone().narrow(2, 0, h * hd).reshape([b, t, h, hd]);
+                let k = qkv.clone().narrow(2, h * hd, kvh * hd).reshape([b, t, kvh, hd]);
+                let q = apply_rope(q_norm.forward(q).swap_dims(1, 2), rope);
+                (q, apply_rope(k_norm.forward(k).swap_dims(1, 2), rope))
+            }
+            _ => {
+                // Queries and keys share positions, so one RoPE pass covers both.
+                let qk = qkv.clone().narrow(2, 0, (h + kvh) * hd);
+                let qk = apply_rope(qk.reshape([b, t, h + kvh, hd]).swap_dims(1, 2), rope);
+                (qk.clone().narrow(1, 0, h), qk.narrow(1, h, kvh))
+            }
+        };
         let v = qkv.narrow(2, (h + kvh) * hd, kvh * hd).reshape([b, t, kvh, hd]).swap_dims(1, 2);
         let out = match cache {
             None => {
@@ -220,7 +258,12 @@ impl Attention {
                 attend(q, keys, values, mask)
             }
         };
-        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * hd]))
+        let out = out.swap_dims(1, 2).reshape([b, t, h * hd]);
+        let out = match gate {
+            Some(gate) => out * gate,
+            None => out,
+        };
+        self.o.forward(out)
     }
 }
 
@@ -281,67 +324,220 @@ impl CrossAttention {
     }
 }
 
+/// The sequence mixer of one layer. A stack holds a few dozen at most, so the size gap between
+/// variants costs nothing worth boxing for.
+#[allow(clippy::large_enum_variant)]
+#[derive(Module, Debug)]
+pub enum Mixer {
+    Attention(Attention),
+    DeltaNet(GatedDeltaNet),
+    Retrieval(SparseRetrieval),
+}
+
+/// RoPE tables of one stack forward pass, by layer type.
+struct Ropes {
+    local: Option<Rope>,
+    full: Option<Rope>,
+    retrieval: Option<Rope>,
+}
+
 #[derive(Module, Debug)]
 pub struct Block {
     n1: RmsNorm,
-    attn: Attention,
+    attn: Mixer,
     n2: RmsNorm,
     mlp: Mlp,
 }
 
 impl Block {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        d: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        ff: usize,
-        window: Option<usize>,
-        eps: f64,
-        device: &Device,
-    ) -> Self {
+    pub fn new(spec: &StackSpec, kind: LayerKind, device: &Device) -> Self {
+        let mixer = match kind {
+            LayerKind::Attention { window } => {
+                let attn = Attention::new(
+                    spec.d,
+                    spec.heads,
+                    spec.kv_heads,
+                    spec.head_dim,
+                    window,
+                    device,
+                );
+                Mixer::Attention(if spec.gated {
+                    attn.gated(spec.d, spec.eps, device)
+                } else {
+                    attn
+                })
+            }
+            LayerKind::DeltaNet => Mixer::DeltaNet(GatedDeltaNet::new(&spec.delta(), device)),
+            LayerKind::Retrieval => {
+                Mixer::Retrieval(SparseRetrieval::new(&spec.retrieval(), device))
+            }
+        };
         Self {
-            n1: rms_norm(d, eps, device),
-            attn: Attention::new(d, heads, kv_heads, head_dim, window, device),
-            n2: rms_norm(d, eps, device),
-            mlp: Mlp::new(d, ff, device),
+            n1: rms_norm(spec.d, spec.eps, device),
+            attn: mixer,
+            n2: rms_norm(spec.d, spec.eps, device),
+            mlp: Mlp::new(spec.d, spec.ff, device),
         }
     }
 
-    pub fn forward(&self, x: Tensor<3>, rope: &Rope, cache: Option<&mut KvCache>) -> Tensor<3> {
-        let x = x.clone() + self.attn.forward(self.n1.forward(x), rope, cache);
+    fn mix(
+        &self,
+        x: Tensor<3>,
+        start: usize,
+        ropes: &Ropes,
+        cache: Option<&mut LayerCache>,
+    ) -> Tensor<3> {
+        fn table(rope: &Option<Rope>) -> &Rope {
+            rope.as_ref().expect("the stack built this table")
+        }
+        match &self.attn {
+            Mixer::Attention(attn) => {
+                let rope = if attn.window().is_some() { &ropes.local } else { &ropes.full };
+                attn.forward(x, table(rope), cache.map(LayerCache::kv))
+            }
+            Mixer::DeltaNet(delta) => delta.forward(x, cache.map(LayerCache::delta)),
+            Mixer::Retrieval(ret) => {
+                ret.forward(x, start, table(&ropes.retrieval), cache.map(LayerCache::latent))
+            }
+        }
+    }
+
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        start: usize,
+        ropes: &Ropes,
+        cache: Option<&mut LayerCache>,
+    ) -> Tensor<3> {
+        let x = x.clone() + self.mix(self.n1.forward(x), start, ropes, cache);
         x.clone() + self.mlp.forward(self.n2.forward(x))
+    }
+
+    fn make_cache(&self, max_positions: usize, batch: usize, device: &Device) -> LayerCache {
+        match &self.attn {
+            Mixer::Attention(attn) => LayerCache::Kv(attn.make_cache(max_positions, batch, device)),
+            Mixer::DeltaNet(delta) => LayerCache::Delta(delta.make_cache(batch, device)),
+            Mixer::Retrieval(ret) => {
+                LayerCache::Latent(ret.make_cache(max_positions, batch, device))
+            }
+        }
     }
 }
 
-/// Shape of a layer stack: width, depth, heads, window pattern and RoPE settings.
+/// The sequence mixer of one layer of a stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    /// Grouped-query attention over a sliding `window`, or the whole context when None.
+    Attention {
+        window: Option<usize>,
+    },
+    DeltaNet,
+    Retrieval,
+}
+
+/// The fallback layer pattern: sliding-window layers with every `full_every`-th layer full.
+pub fn fallback_kinds(layers: usize, window: usize, full_every: usize) -> Vec<LayerKind> {
+    (0..layers)
+        .map(|i| LayerKind::Attention { window: (!is_full_layer(i, full_every)).then_some(window) })
+        .collect()
+}
+
+/// The v2 backbone pattern: gated DeltaNet and sparse retrieval alternating, DeltaNet first.
+pub fn hybrid_kinds(layers: usize) -> Vec<LayerKind> {
+    (0..layers)
+        .map(|i| if i % 2 == 0 { LayerKind::DeltaNet } else { LayerKind::Retrieval })
+        .collect()
+}
+
+/// Shape of a layer stack: width, the mixer of every layer, and their settings.
 #[derive(Debug, Clone)]
 pub struct StackSpec {
     pub d: usize,
-    pub layers: usize,
+    pub ff: usize,
+    pub kinds: Vec<LayerKind>,
+    /// Attention layers.
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
-    pub ff: usize,
-    pub window: usize,
-    pub full_every: usize,
+    /// Output gate and QK-norm on attention layers (v2).
+    pub gated: bool,
+    /// Sliding attention layers.
     pub rope_base: f64,
-    pub rope_base_full: f64,
     pub rope_scale: f64,
+    /// Full attention layers and the retrieval layers' decoupled key.
+    pub rope_base_full: f64,
     pub rope_scale_full: f64,
     pub eps: f64,
+    /// DeltaNet and retrieval layers.
+    pub v2: V2Config,
 }
 
-/// Pre-norm transformer layers with the sliding / every-Nth-full layer pattern.
+impl StackSpec {
+    pub fn delta(&self) -> DeltaSpec {
+        DeltaSpec {
+            d: self.d,
+            head_dim: self.v2.dn_head_dim,
+            conv: self.v2.dn_conv,
+            chunk: self.v2.dn_chunk,
+            eps: self.eps,
+        }
+    }
+
+    pub fn retrieval(&self) -> RetrievalSpec {
+        let v2 = &self.v2;
+        RetrievalSpec {
+            d: self.d,
+            heads: v2.ret_heads,
+            nope_dim: v2.ret_nope_dim,
+            rope_dim: v2.ret_rope_dim,
+            v_dim: v2.ret_v_dim,
+            latent: v2.ret_latent,
+            index_heads: v2.idx_heads,
+            index_dim: v2.idx_dim,
+            block: v2.ret_block,
+            topk: v2.ret_topk,
+            local: v2.ret_local,
+            dense: v2.ret_dense,
+            eps: self.eps,
+        }
+    }
+
+    /// Bytes of the stack's caches for a run of `max_positions`; indexer keys at
+    /// `index_itemsize`, everything else at `itemsize`.
+    pub fn cache_bytes(
+        &self,
+        max_positions: usize,
+        itemsize: usize,
+        index_itemsize: usize,
+        batch: usize,
+    ) -> usize {
+        self.kinds
+            .iter()
+            .map(|kind| match *kind {
+                LayerKind::Attention { window } => layer_cache_bytes(
+                    self.kv_heads,
+                    self.head_dim,
+                    max_positions,
+                    window,
+                    itemsize,
+                    batch,
+                ),
+                LayerKind::DeltaNet => self.delta().cache_bytes(itemsize, batch),
+                LayerKind::Retrieval => {
+                    self.retrieval().cache_bytes(max_positions, itemsize, index_itemsize, batch)
+                }
+            })
+            .sum()
+    }
+}
+
+/// Pre-norm residual layers, each a sequence mixer and a SwiGLU MLP.
 #[derive(Module, Debug)]
 pub struct Stack {
     blocks: Vec<Block>,
     norm: RmsNorm,
-    kv_heads: usize,
     head_dim: usize,
-    window: usize,
-    full_every: usize,
+    retrieval_rope_dim: usize,
     rope_base: f64,
     rope_base_full: f64,
     rope_scale: f64,
@@ -350,28 +546,11 @@ pub struct Stack {
 
 impl Stack {
     pub fn new(spec: &StackSpec, device: &Device) -> Self {
-        let blocks = (0..spec.layers)
-            .map(|i| {
-                let window = (!is_full_layer(i, spec.full_every)).then_some(spec.window);
-                Block::new(
-                    spec.d,
-                    spec.heads,
-                    spec.kv_heads,
-                    spec.head_dim,
-                    spec.ff,
-                    window,
-                    spec.eps,
-                    device,
-                )
-            })
-            .collect();
         Self {
-            blocks,
+            blocks: spec.kinds.iter().map(|&kind| Block::new(spec, kind, device)).collect(),
             norm: rms_norm(spec.d, spec.eps, device),
-            kv_heads: spec.kv_heads,
             head_dim: spec.head_dim,
-            window: spec.window,
-            full_every: spec.full_every,
+            retrieval_rope_dim: spec.v2.ret_rope_dim,
             rope_base: spec.rope_base,
             rope_base_full: spec.rope_base_full,
             rope_scale: spec.rope_scale,
@@ -379,44 +558,50 @@ impl Stack {
         }
     }
 
-    pub fn layer_window(&self, index: usize) -> Option<usize> {
-        (!is_full_layer(index, self.full_every)).then_some(self.window)
+    fn ropes(&self, start: usize, t: usize, device: &Device) -> Ropes {
+        let (mut local, mut full, mut retrieval) = (false, false, false);
+        for block in &self.blocks {
+            match &block.attn {
+                Mixer::Attention(a) if a.window().is_some() => local = true,
+                Mixer::Attention(_) => full = true,
+                Mixer::Retrieval(_) => retrieval = true,
+                Mixer::DeltaNet(_) => {}
+            }
+        }
+        let table = |on: bool, dim: usize, base: f64, scale: f64| {
+            on.then(|| Rope::new(start, t, dim, base, scale, device))
+        };
+        Ropes {
+            local: table(local, self.head_dim, self.rope_base, self.rope_scale),
+            full: table(full, self.head_dim, self.rope_base_full, self.rope_scale_full),
+            retrieval: table(
+                retrieval,
+                self.retrieval_rope_dim,
+                self.rope_base_full,
+                self.rope_scale_full,
+            ),
+        }
     }
 
-    pub fn forward(&self, x: Tensor<3>, mut caches: Option<&mut [KvCache]>) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>, mut caches: Option<&mut [LayerCache]>) -> Tensor<3> {
         let t = x.dims()[1];
         let device = x.device();
         let start = caches.as_ref().map_or(0, |c| c[0].len());
-        let rope_local =
-            Rope::new(start, t, self.head_dim, self.rope_base, self.rope_scale, &device);
-        let has_full = (0..self.blocks.len()).any(|i| is_full_layer(i, self.full_every));
-        let rope_full = has_full.then(|| {
-            Rope::new(start, t, self.head_dim, self.rope_base_full, self.rope_scale_full, &device)
-        });
+        let ropes = self.ropes(start, t, &device);
         let mut x = x;
         for (i, block) in self.blocks.iter().enumerate() {
-            let rope = match (&rope_full, is_full_layer(i, self.full_every)) {
-                (Some(full), true) => full,
-                _ => &rope_local,
-            };
-            x = block.forward(x, rope, caches.as_mut().map(|c| &mut c[i]));
+            x = block.forward(x, start, &ropes, caches.as_mut().map(|c| &mut c[i]));
         }
         self.norm.forward(x)
     }
 
     /// One cache per layer for runs of up to `max_positions`.
-    pub fn make_caches(&self, max_positions: usize, batch: usize, device: &Device) -> Vec<KvCache> {
-        (0..self.blocks.len())
-            .map(|i| {
-                KvCache::make(
-                    batch,
-                    self.kv_heads,
-                    self.head_dim,
-                    max_positions,
-                    self.layer_window(i),
-                    device,
-                )
-            })
-            .collect()
+    pub fn make_caches(
+        &self,
+        max_positions: usize,
+        batch: usize,
+        device: &Device,
+    ) -> Vec<LayerCache> {
+        self.blocks.iter().map(|b| b.make_cache(max_positions, batch, device)).collect()
     }
 }

@@ -1,7 +1,8 @@
-//! Batch-1 decode-speed benchmark: NCM against the token baseline, random weights.
+//! Batch-1 decode-speed benchmark: NCM against the token baseline, random weights, in either or
+//! both attention designs.
 //!
 //! ```text
-//! ncm-bench --model both --context 2048 16384 --new-tokens 256 --device cuda
+//! ncm-bench --model both --design both --context 2048 16384 --new-tokens 256 --device cuda
 //! ```
 //!
 //! Both models share the token vocabulary, so decode tokens per second are directly comparable.
@@ -13,11 +14,16 @@ use std::time::Instant;
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
 use ncm_model::layers::set_fused_attention;
-use ncm_model::{Config, NcmLm, TokenLm, cache_bytes, ncm_250m, tiny_ncm, tiny_tok, tok_250m};
+use ncm_model::{
+    Config, Design, NcmLm, TokenLm, cache_bytes, cache_bytes_with, ncm_250m_of, tiny_ncm,
+    tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2, tok_250m_of,
+};
 use serde_json::{Value, json};
 
 pub const PASS_RATIO: f64 = 1.5;
 pub const WEAK_RATIO: f64 = 1.2;
+/// The v2 NCM may be at most 25% slower than the fallback NCM (plan, local test plan step 2).
+pub const FALLBACK_FLOOR: f64 = 0.75;
 const PREFILL_CHUNK: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -25,6 +31,25 @@ pub enum ModelChoice {
     Tok,
     Ncm,
     Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DesignChoice {
+    /// Gated DeltaNet and sparse retrieval (the adopted design).
+    V2,
+    /// Sliding-window attention with a full layer every fourth (the stage 1 design).
+    Fallback,
+    Both,
+}
+
+impl DesignChoice {
+    fn designs(self) -> Vec<Design> {
+        match self {
+            Self::V2 => vec![Design::V2],
+            Self::Fallback => vec![Design::Fallback],
+            Self::Both => vec![Design::Fallback, Design::V2],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -53,6 +78,9 @@ pub enum DtypeChoice {
 pub struct Cli {
     #[arg(long, value_enum, default_value = "both")]
     pub model: ModelChoice,
+    /// Attention design(s) to run.
+    #[arg(long, value_enum, default_value = "both")]
+    pub design: DesignChoice,
     /// Prompt lengths in tokens.
     #[arg(long, num_args = 1.., default_values_t = [2048usize, 16384], value_name = "N")]
     pub context: Vec<usize>,
@@ -84,6 +112,11 @@ pub fn verdict(ratio: f64) -> &'static str {
     } else {
         "FAIL"
     }
+}
+
+/// Verdict on v2 NCM decode speed relative to the fallback NCM.
+pub fn fallback_verdict(ratio: f64) -> &'static str {
+    if ratio >= FALLBACK_FLOOR { "PASS" } else { "FAIL" }
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -223,11 +256,12 @@ fn bench_model(
         Config::Tok(c) => Model::Tok(Box::new(TokenLm::new(c, device))),
         Config::Ncm(c) => Model::Ncm(Box::new(NcmLm::new(c, device))),
     };
+    let design = cfg.design().name();
     let parts = model.parts();
     let params: usize = parts.iter().map(|p| p.1).sum();
     let unit = cfg.unit();
     let new_tokens = cli.new_tokens - cli.new_tokens % unit;
-    println!("{}: {} params, {new_tokens} new tokens", model.name(), fmt_params(params));
+    println!("{} ({design}): {} params, {new_tokens} new tokens", model.name(), fmt_params(params));
     for (name, n) in &parts {
         println!("  {name:<18} {:>10}", fmt_params(*n));
     }
@@ -246,7 +280,9 @@ fn bench_model(
             enqueues.push(run.enqueue_s);
         }
         let reserved = device.memory_pool_usage().map(|u| u.bytes_reserved);
+        // The design's cache (8-bit indexer keys in v2) and what the reference allocates.
         let cache = cache_bytes(cfg, context + new_tokens, itemsize, 1);
+        let allocated = cache_bytes_with(cfg, context + new_tokens, itemsize, itemsize, 1);
         let decode_tok_s = new_tokens as f64 / median(&mut decodes.clone());
         let prefill_s = median(&mut prefills.clone());
         let host_share = median(&mut enqueues.clone()) / median(&mut decodes.clone());
@@ -267,18 +303,44 @@ fn bench_model(
                 "prefill_s_runs": prefills,
                 "reserved_memory_bytes": reserved,
                 "cache_bytes": cache,
+                "cache_bytes_allocated": allocated,
             }),
         );
         decode_rates.push((context, decode_tok_s));
     }
     let result = json!({
         "name": model.name(),
+        "design": design,
         "params": params,
         "parts": parts.iter().map(|(n, c)| json!({"name": n, "params": c})).collect::<Vec<_>>(),
         "new_tokens": new_tokens,
         "contexts": contexts,
     });
     (result, decode_rates)
+}
+
+/// The config of model `kind` ("tok" or "ncm") in `design`.
+fn config_for(kind: &str, design: Design, tiny: bool) -> Config {
+    match (kind, design, tiny) {
+        ("tok", Design::Fallback, true) => Config::Tok(tiny_tok(8)),
+        ("tok", Design::V2, true) => Config::Tok(tiny_tok_v2(tiny_v2(4, 2, 8))),
+        ("tok", design, false) => Config::Tok(tok_250m_of(design)),
+        (_, Design::Fallback, true) => Config::Ncm(tiny_ncm(8, 4)),
+        (_, Design::V2, true) => Config::Ncm(tiny_ncm_v2(8, tiny_v2(2, 2, 4))),
+        (_, design, false) => Config::Ncm(ncm_250m_of(design)),
+    }
+}
+
+/// Decode tok/s by context of one model.
+type Rates = Vec<(usize, f64)>;
+
+/// `a / b` at every context both measured.
+fn rate_ratios(a: &Rates, b: &Rates) -> Vec<(usize, f64)> {
+    a.iter()
+        .filter_map(|(context, ra)| {
+            b.iter().find(|(c, _)| c == context).map(|(_, rb)| (*context, ra / rb))
+        })
+        .collect()
 }
 
 /// Run the benchmark described by `cli`; prints the report and returns the JSON payload.
@@ -292,9 +354,12 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         DtypeChoice::Bf16 => FloatDType::BF16,
         DtypeChoice::F32 => FloatDType::F32,
     };
-    device
-        .configure(float)
-        .map_err(|e| format!("cannot use {dtype:?} on {:?}: {e}", cli.device))?;
+    // A device's dtype locks on first use; a second run in the same process may reuse it.
+    if let Err(e) = device.configure(float)
+        && device.settings().float_dtype != float
+    {
+        return Err(format!("cannot use {dtype:?} on {:?}: {e}", cli.device));
+    }
     if cli.repeats == 0 || cli.context.is_empty() {
         return Err("--repeats and --context need at least one value".into());
     }
@@ -309,29 +374,43 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         ModelChoice::Both => vec!["tok", "ncm"],
     };
     let mut results = Vec::new();
-    let mut rates = Vec::new();
-    for kind in &kinds {
-        let cfg = match (*kind, cli.tiny) {
-            ("tok", true) => Config::Tok(tiny_tok(8)),
-            ("tok", false) => Config::Tok(tok_250m()),
-            (_, true) => Config::Ncm(tiny_ncm(8, 4)),
-            (_, false) => Config::Ncm(ncm_250m()),
-        };
-        let (result, decode) = bench_model(&cfg, cli, &device, itemsize);
-        results.push(result);
-        rates.push((*kind, decode));
+    let mut rates: Vec<(&str, Design, Rates)> = Vec::new();
+    for design in cli.design.designs() {
+        for kind in &kinds {
+            let cfg = config_for(kind, design, cli.tiny);
+            let (result, decode) = bench_model(&cfg, cli, &device, itemsize);
+            results.push(result);
+            rates.push((kind, design, decode));
+        }
     }
+    let find = |kind: &str, design: Design| {
+        rates.iter().find(|r| r.0 == kind && r.1 == design).map(|r| &r.2)
+    };
+    let note = if cli.tiny { "  (tiny config: smoke run, not a gate result)" } else { "" };
     let mut ratios = Vec::new();
-    let tok = rates.iter().find(|r| r.0 == "tok");
-    let ncm = rates.iter().find(|r| r.0 == "ncm");
-    if let (Some((_, tok)), Some((_, ncm))) = (tok, ncm) {
-        for (context, ncm_rate) in ncm {
-            let Some((_, tok_rate)) = tok.iter().find(|(c, _)| c == context) else { continue };
-            let ratio = ncm_rate / tok_rate;
+    for design in cli.design.designs() {
+        let (Some(tok), Some(ncm)) = (find("tok", design), find("ncm", design)) else { continue };
+        for (context, ratio) in rate_ratios(ncm, tok) {
             let v = verdict(ratio);
-            let note = if cli.tiny { "  (tiny config: smoke run, not a gate result)" } else { "" };
-            println!("ratio ncm/tok @ ctx {context}: {ratio:.2}x {v}{note}");
-            ratios.push(json!({"context": context, "ratio": ratio, "verdict": v}));
+            println!("ratio ncm/tok ({}) @ ctx {context}: {ratio:.2}x {v}{note}", design.name());
+            ratios.push(json!({
+                "design": design.name(),
+                "context": context,
+                "ratio": ratio,
+                "verdict": v,
+            }));
+        }
+    }
+    // The second gate: the v2 NCM against the fallback NCM.
+    let mut design_ratios = Vec::new();
+    if let (Some(v2), Some(fallback)) = (find("ncm", Design::V2), find("ncm", Design::Fallback)) {
+        for (context, ratio) in rate_ratios(v2, fallback) {
+            let v = fallback_verdict(ratio);
+            println!(
+                "ratio ncm v2/fallback @ ctx {context}: {ratio:.2}x {v} \
+                 (floor {FALLBACK_FLOOR}x){note}"
+            );
+            design_ratios.push(json!({"context": context, "ratio": ratio, "verdict": v}));
         }
     }
     Ok(json!({
@@ -341,5 +420,6 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         "fused_attention": cli.fused_attention,
         "results": results,
         "ratios": ratios,
+        "ncm_v2_over_fallback": design_ratios,
     }))
 }

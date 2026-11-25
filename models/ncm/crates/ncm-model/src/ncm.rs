@@ -17,10 +17,11 @@ use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm};
 use burn::tensor::module::linear as linear_op;
 use burn::tensor::{Bool, Device, Int, Tensor};
 
-use crate::cache::{KvCache, build_mask, stack_cache_bytes};
-use crate::config::NcmConfig;
+use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
+use crate::config::{Design, NcmConfig};
 use crate::layers::{
-    Attention, CrossAttention, Mlp, Rope, Stack, StackSpec, init_normal, linear, rms_norm,
+    Attention, CrossAttention, LayerKind, Mlp, Rope, Stack, StackSpec, fallback_kinds,
+    hybrid_kinds, init_normal, linear, rms_norm,
 };
 
 #[derive(Module, Debug)]
@@ -81,8 +82,8 @@ impl DecoderBlock {
 
 /// All caches of one NCM generation run.
 pub struct NcmCache {
-    pub backbone: Vec<KvCache>,
-    pub encoder: Vec<KvCache>,
+    pub backbone: Vec<LayerCache>,
+    pub encoder: Vec<LayerCache>,
     /// Per decoder layer: encoder-state keys and values, a ring of `enc_window`.
     pub cross: Vec<KvCache>,
     /// Per decoder layer: only the current concept, reset every concept.
@@ -92,13 +93,59 @@ pub struct NcmCache {
 }
 
 impl NcmCache {
+    /// Bytes allocated.
     pub fn nbytes(&self) -> usize {
-        [&self.backbone, &self.encoder, &self.cross, &self.dec_self]
-            .into_iter()
-            .flatten()
-            .map(KvCache::nbytes)
-            .sum()
+        let stacks = self.backbone.iter().chain(&self.encoder).map(LayerCache::nbytes);
+        let decoder = self.cross.iter().chain(&self.dec_self).map(KvCache::nbytes);
+        stacks.chain(decoder).sum()
     }
+
+    /// Forget everything, ready for a new sequence.
+    pub fn reset(&mut self) {
+        self.backbone.iter_mut().chain(&mut self.encoder).for_each(LayerCache::reset);
+        self.cross.iter_mut().chain(&mut self.dec_self).for_each(KvCache::reset);
+        self.tokens = 0;
+    }
+}
+
+/// The encoder and backbone stacks of an NCM config.
+pub fn ncm_specs(cfg: &NcmConfig) -> (StackSpec, StackSpec) {
+    let v2 = cfg.attention == Design::V2;
+    let window = LayerKind::Attention { window: Some(cfg.enc_window) };
+    let mut enc_kinds = vec![window; cfg.enc_layers];
+    if v2 {
+        // One gated DeltaNet layer after the first sliding-window layer.
+        enc_kinds.insert(1.min(cfg.enc_layers), LayerKind::DeltaNet);
+    }
+    let encoder = StackSpec {
+        d: cfg.local_dim,
+        ff: cfg.enc_ff_dim,
+        kinds: enc_kinds,
+        heads: cfg.enc_heads,
+        kv_heads: cfg.enc_kv_heads,
+        head_dim: cfg.head_dim,
+        gated: v2,
+        rope_base: cfg.rope_base,
+        rope_scale: cfg.rope_scale,
+        rope_base_full: cfg.rope_base_full,
+        rope_scale_full: cfg.rope_scale_full,
+        eps: cfg.norm_eps,
+        v2: cfg.v2.clone(),
+    };
+    let bb_kinds = if v2 {
+        hybrid_kinds(cfg.bb_layers)
+    } else {
+        fallback_kinds(cfg.bb_layers, cfg.bb_window, cfg.full_every)
+    };
+    let backbone = StackSpec {
+        d: cfg.bb_dim,
+        ff: cfg.bb_ff_dim,
+        kinds: bb_kinds,
+        heads: cfg.bb_heads,
+        kv_heads: cfg.bb_kv_heads,
+        ..encoder.clone()
+    };
+    (encoder, backbone)
 }
 
 pub struct NcmParts {
@@ -148,31 +195,7 @@ impl NcmLm {
     pub fn new(cfg: &NcmConfig, device: &Device) -> Self {
         assert!(cfg.k >= 2, "concepts need at least two tokens");
         let d = cfg.local_dim;
-        let encoder = StackSpec {
-            d,
-            layers: cfg.enc_layers,
-            heads: cfg.enc_heads,
-            kv_heads: cfg.enc_kv_heads,
-            head_dim: cfg.head_dim,
-            ff: cfg.enc_ff_dim,
-            window: cfg.enc_window,
-            full_every: 0,
-            rope_base: cfg.rope_base,
-            rope_base_full: cfg.rope_base_full,
-            rope_scale: cfg.rope_scale,
-            rope_scale_full: cfg.rope_scale_full,
-            eps: cfg.norm_eps,
-        };
-        let backbone = StackSpec {
-            d: cfg.bb_dim,
-            layers: cfg.bb_layers,
-            heads: cfg.bb_heads,
-            kv_heads: cfg.bb_kv_heads,
-            ff: cfg.bb_ff_dim,
-            window: cfg.bb_window,
-            full_every: cfg.full_every,
-            ..encoder.clone()
-        };
+        let (encoder, backbone) = ncm_specs(cfg);
         Self {
             emb: EmbeddingConfig::new(cfg.vocab_size, d)
                 .with_initializer(init_normal())
@@ -380,41 +403,21 @@ impl NcmLm {
     }
 }
 
-pub fn ncm_cache_bytes(cfg: &NcmConfig, max_tokens: usize, itemsize: usize, batch: usize) -> usize {
+/// Cache bytes at `max_tokens`; indexer keys (v2) at `index_itemsize`, the rest at `itemsize`.
+pub fn ncm_cache_bytes(
+    cfg: &NcmConfig,
+    max_tokens: usize,
+    itemsize: usize,
+    index_itemsize: usize,
+    batch: usize,
+) -> usize {
+    let (encoder, backbone) = ncm_specs(cfg);
     let concepts = max_tokens.div_ceil(cfg.k);
-    let hd = cfg.head_dim;
-    let backbone = stack_cache_bytes(
-        cfg.bb_layers,
-        cfg.full_every,
-        cfg.bb_window,
-        concepts,
-        cfg.bb_kv_heads,
-        hd,
-        itemsize,
-        batch,
-    );
-    let encoder = stack_cache_bytes(
-        cfg.enc_layers,
-        0,
-        cfg.enc_window,
-        max_tokens,
-        cfg.enc_kv_heads,
-        hd,
-        itemsize,
-        batch,
-    );
-    // Cross-attention ring and the per-concept decoder self cache.
-    let cross = stack_cache_bytes(
-        cfg.dec_layers,
-        0,
-        cfg.enc_window,
-        max_tokens,
-        cfg.dec_kv_heads,
-        hd,
-        itemsize,
-        batch,
-    );
-    let dec_self =
-        stack_cache_bytes(cfg.dec_layers, 1, cfg.k, cfg.k, cfg.dec_kv_heads, hd, itemsize, batch);
-    backbone + encoder + cross + dec_self
+    let backbone = backbone.cache_bytes(concepts, itemsize, index_itemsize, batch);
+    let encoder = encoder.cache_bytes(max_tokens, itemsize, index_itemsize, batch);
+    // Per decoder layer: the cross-attention ring and the per-concept self cache.
+    let (kvh, hd) = (cfg.dec_kv_heads, cfg.head_dim);
+    let cross = layer_cache_bytes(kvh, hd, max_tokens, Some(cfg.enc_window), itemsize, batch);
+    let dec_self = layer_cache_bytes(kvh, hd, cfg.k, None, itemsize, batch);
+    backbone + encoder + cfg.dec_layers * (cross + dec_self)
 }

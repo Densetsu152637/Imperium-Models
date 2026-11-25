@@ -1,7 +1,8 @@
 //! Model configurations and TOML loading.
 //!
-//! The same `configs/*.toml` files are read by the PyTorch reference and by this crate, so the
-//! field names and defaults mirror `src/ncm/config.py`.
+//! Field names and defaults are those of the first (PyTorch-era) configs. `attention` picks the
+//! attention design and the `[v2]` table holds the settings of the newer one; see
+//! `docs/attention.md`.
 
 use std::path::Path;
 
@@ -11,10 +12,90 @@ use serde::{Deserialize, Serialize};
 pub const TOK_250M_TOML: &str = include_str!("../../../configs/tok-250m.toml");
 /// The 250M NCM config.
 pub const NCM_250M_TOML: &str = include_str!("../../../configs/ncm-250m.toml");
+/// The 250M token baseline in the v2 attention design.
+pub const TOK_250M_V2_TOML: &str = include_str!("../../../configs/tok-250m-v2.toml");
+/// The 250M NCM in the v2 attention design.
+pub const NCM_250M_V2_TOML: &str = include_str!("../../../configs/ncm-250m-v2.toml");
 
 /// Every `full_every`-th layer (1-based) attends over the whole context.
 pub fn is_full_layer(index: usize, full_every: usize) -> bool {
     full_every > 0 && (index + 1).is_multiple_of(full_every)
+}
+
+/// Which attention design a model uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Design {
+    /// The first design: sliding-window attention with a full-attention layer every
+    /// `full_every`-th layer and grouped-query KV caches.
+    #[default]
+    Fallback,
+    /// Gated DeltaNet alternating with sparse retrieval attention (indexer, top-k blocks, MLA
+    /// cache), with output gates and QK-norm. Settings in [`V2Config`].
+    V2,
+}
+
+impl Design {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+/// Settings of the v2 attention design, shared by both models (`[v2]` in the config files).
+/// Fallback models ignore them.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct V2Config {
+    /// Gated DeltaNet key and value width per head; heads = layer width / `dn_head_dim`.
+    pub dn_head_dim: usize,
+    /// Width of the short causal depthwise convolution over q, k and v.
+    pub dn_conv: usize,
+    /// Chunk length of the chunked (parallel) DeltaNet form.
+    pub dn_chunk: usize,
+    /// Retrieval attention query heads.
+    pub ret_heads: usize,
+    /// Per-head query/key width without position; absorbed into the latent for decode.
+    pub ret_nope_dim: usize,
+    /// Decoupled RoPE key width, shared by all heads (partial RoPE).
+    pub ret_rope_dim: usize,
+    pub ret_v_dim: usize,
+    /// MLA compressed key-value latent per position.
+    pub ret_latent: usize,
+    pub idx_heads: usize,
+    /// Indexer key width.
+    pub idx_dim: usize,
+    /// Positions per retrievable block.
+    pub ret_block: usize,
+    /// Blocks each query retrieves.
+    pub ret_topk: usize,
+    /// Most recent positions every query sees.
+    pub ret_local: usize,
+    /// Dense attention over the whole causal context (top-k = all): the training warm-up.
+    pub ret_dense: bool,
+}
+
+impl Default for V2Config {
+    fn default() -> Self {
+        Self {
+            dn_head_dim: 128,
+            dn_conv: 4,
+            dn_chunk: 64,
+            ret_heads: 8,
+            ret_nope_dim: 128,
+            ret_rope_dim: 64,
+            ret_v_dim: 128,
+            ret_latent: 512,
+            idx_heads: 4,
+            idx_dim: 128,
+            ret_block: 64,
+            ret_topk: 32,
+            ret_local: 1024,
+            ret_dense: false,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -29,10 +110,11 @@ pub enum ConfigError {
     UnknownModel(String),
 }
 
-/// Plain decoder-only baseline.
+/// Decoder-only baseline.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TokConfig {
+    pub attention: Design,
     pub vocab_size: usize,
     pub d_model: usize,
     pub n_layers: usize,
@@ -44,15 +126,18 @@ pub struct TokConfig {
     pub window: usize,
     pub full_every: usize,
     pub rope_base: f64,
+    /// Full-attention layers; in v2, the retrieval layers' decoupled key.
     pub rope_base_full: f64,
     pub rope_scale: f64,
     pub rope_scale_full: f64,
     pub norm_eps: f64,
+    pub v2: V2Config,
 }
 
 impl Default for TokConfig {
     fn default() -> Self {
         Self {
+            attention: Design::Fallback,
             vocab_size: 32000,
             d_model: 1024,
             n_layers: 20,
@@ -67,6 +152,7 @@ impl Default for TokConfig {
             rope_scale: 1.0,
             rope_scale_full: 1.0,
             norm_eps: 1e-6,
+            v2: V2Config::default(),
         }
     }
 }
@@ -75,11 +161,13 @@ impl Default for TokConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NcmConfig {
+    pub attention: Design,
     pub vocab_size: usize,
     pub k: usize,
     pub head_dim: usize,
     /// Encoder, decoder and embedding width.
     pub local_dim: usize,
+    /// Sliding-window layers; v2 adds one gated DeltaNet layer after the first.
     pub enc_layers: usize,
     pub enc_heads: usize,
     pub enc_kv_heads: usize,
@@ -99,15 +187,18 @@ pub struct NcmConfig {
     pub bb_window: usize,
     pub full_every: usize,
     pub rope_base: f64,
+    /// Full-attention layers; in v2, the retrieval layers' decoupled key.
     pub rope_base_full: f64,
     pub rope_scale: f64,
     pub rope_scale_full: f64,
     pub norm_eps: f64,
+    pub v2: V2Config,
 }
 
 impl Default for NcmConfig {
     fn default() -> Self {
         Self {
+            attention: Design::Fallback,
             vocab_size: 32000,
             k: 4,
             head_dim: 64,
@@ -133,6 +224,7 @@ impl Default for NcmConfig {
             rope_scale: 1.0,
             rope_scale_full: 1.0,
             norm_eps: 1e-6,
+            v2: V2Config::default(),
         }
     }
 }
@@ -171,8 +263,15 @@ impl Config {
             Self::Tok(c) => ("tok", toml::Table::try_from(c)),
             Self::Ncm(c) => ("ncm", toml::Table::try_from(c)),
         };
-        let table = toml::to_string(&table.expect("a config is a flat table of numbers"));
+        let table = toml::to_string(&table.expect("a config is a table of plain values"));
         format!("model = \"{kind}\"\n{}", table.expect("a config serialises to TOML"))
+    }
+
+    pub fn design(&self) -> Design {
+        match self {
+            Self::Tok(c) => c.attention,
+            Self::Ncm(c) => c.attention,
+        }
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -191,19 +290,53 @@ impl Config {
     }
 }
 
+fn parse_tok(text: &str) -> TokConfig {
+    match Config::parse(text) {
+        Ok(Config::Tok(c)) => c,
+        _ => unreachable!("the shipped tok configs parse (checked by tests)"),
+    }
+}
+
+fn parse_ncm(text: &str) -> NcmConfig {
+    match Config::parse(text) {
+        Ok(Config::Ncm(c)) => c,
+        _ => unreachable!("the shipped ncm configs parse (checked by tests)"),
+    }
+}
+
 /// The 250M token baseline.
 pub fn tok_250m() -> TokConfig {
-    match Config::parse(TOK_250M_TOML) {
-        Ok(Config::Tok(c)) => c,
-        _ => unreachable!("configs/tok-250m.toml is a tok config (checked by tests)"),
-    }
+    parse_tok(TOK_250M_TOML)
 }
 
 /// The 250M NCM.
 pub fn ncm_250m() -> NcmConfig {
-    match Config::parse(NCM_250M_TOML) {
-        Ok(Config::Ncm(c)) => c,
-        _ => unreachable!("configs/ncm-250m.toml is an ncm config (checked by tests)"),
+    parse_ncm(NCM_250M_TOML)
+}
+
+/// The 250M token baseline in the v2 attention design.
+pub fn tok_250m_v2() -> TokConfig {
+    parse_tok(TOK_250M_V2_TOML)
+}
+
+/// The 250M NCM in the v2 attention design.
+pub fn ncm_250m_v2() -> NcmConfig {
+    parse_ncm(NCM_250M_V2_TOML)
+}
+
+/// The 250M token baseline of `design`.
+pub fn tok_250m_of(design: Design) -> TokConfig {
+    match design {
+        Design::Fallback => tok_250m(),
+        Design::V2 => tok_250m_v2(),
+    }
+}
+
+/// The 250M NCM of `design`.
+pub fn ncm_250m_of(design: Design) -> NcmConfig {
+    match design {
+        Design::Fallback => ncm_250m(),
+        Design::V2 => ncm_250m_v2(),
     }
 }
 
@@ -247,4 +380,35 @@ pub fn tiny_ncm(enc_window: usize, bb_window: usize) -> NcmConfig {
         full_every: 2,
         ..NcmConfig::default()
     }
+}
+
+/// v2 settings small enough for CPU tests: retrieval over blocks of `block` positions, `topk`
+/// of them plus a `local` window, and DeltaNet chunks of 4 so short runs span several chunks.
+pub fn tiny_v2(block: usize, topk: usize, local: usize) -> V2Config {
+    V2Config {
+        dn_head_dim: 16,
+        dn_conv: 4,
+        dn_chunk: 4,
+        ret_heads: 2,
+        ret_nope_dim: 16,
+        ret_rope_dim: 8,
+        ret_v_dim: 16,
+        ret_latent: 32,
+        idx_heads: 2,
+        idx_dim: 16,
+        ret_block: block,
+        ret_topk: topk,
+        ret_local: local,
+        ret_dense: false,
+    }
+}
+
+/// The tiny token baseline in the v2 design: 4 layers, 2 DeltaNet and 2 retrieval.
+pub fn tiny_tok_v2(v2: V2Config) -> TokConfig {
+    TokConfig { attention: Design::V2, v2, ..tiny_tok(8) }
+}
+
+/// The tiny NCM in the v2 design; the encoder's sliding window is `enc_window` tokens.
+pub fn tiny_ncm_v2(enc_window: usize, v2: V2Config) -> NcmConfig {
+    NcmConfig { attention: Design::V2, v2, ..tiny_ncm(enc_window, 4) }
 }

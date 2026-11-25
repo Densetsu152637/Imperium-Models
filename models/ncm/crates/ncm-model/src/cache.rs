@@ -1,4 +1,5 @@
-//! Preallocated KV caches shared by both models.
+//! Decode caches shared by both models: preallocated KV caches for attention layers, and
+//! [`LayerCache`], one layer's cache whatever its mixer (KV, DeltaNet state or MLA latent).
 //!
 //! Full-attention layers keep `capacity` positions and grow into it. Sliding layers keep a ring
 //! buffer of exactly `window` positions. Positions are contiguous: the cache itself tracks the
@@ -8,7 +9,8 @@
 
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData, s};
 
-use crate::config::is_full_layer;
+use crate::delta::DeltaCache;
+use crate::retrieval::LatentCache;
 
 /// Key position stored for an empty ring slot. Far ahead of every query, so the causal test
 /// masks it.
@@ -217,22 +219,62 @@ pub fn layer_cache_bytes(
     2 * batch * kv_heads * cap * head_dim * itemsize
 }
 
-/// Bytes of a layer stack's caches.
-#[allow(clippy::too_many_arguments)]
-pub fn stack_cache_bytes(
-    n_layers: usize,
-    full_every: usize,
-    window: usize,
-    max_positions: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    itemsize: usize,
-    batch: usize,
-) -> usize {
-    (0..n_layers)
-        .map(|i| {
-            let w = (!is_full_layer(i, full_every)).then_some(window);
-            layer_cache_bytes(kv_heads, head_dim, max_positions, w, itemsize, batch)
-        })
-        .sum()
+/// The decode cache of one layer of a stack, by its sequence mixer.
+pub enum LayerCache {
+    Kv(KvCache),
+    Delta(DeltaCache),
+    Latent(LatentCache),
+}
+
+impl LayerCache {
+    /// Next absolute position.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Kv(c) => c.len(),
+            Self::Delta(c) => c.len(),
+            Self::Latent(c) => c.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn reset(&mut self) {
+        match self {
+            Self::Kv(c) => c.reset(),
+            Self::Delta(c) => c.reset(),
+            Self::Latent(c) => c.reset(),
+        }
+    }
+
+    /// Bytes allocated.
+    pub fn nbytes(&self) -> usize {
+        match self {
+            Self::Kv(c) => c.nbytes(),
+            Self::Delta(c) => c.nbytes(),
+            Self::Latent(c) => c.nbytes(),
+        }
+    }
+
+    pub(crate) fn kv(&mut self) -> &mut KvCache {
+        match self {
+            Self::Kv(c) => c,
+            _ => unreachable!("an attention layer gets the cache it made"),
+        }
+    }
+
+    pub(crate) fn delta(&mut self) -> &mut DeltaCache {
+        match self {
+            Self::Delta(c) => c,
+            _ => unreachable!("a DeltaNet layer gets the cache it made"),
+        }
+    }
+
+    pub(crate) fn latent(&mut self) -> &mut LatentCache {
+        match self {
+            Self::Latent(c) => c,
+            _ => unreachable!("a retrieval layer gets the cache it made"),
+        }
+    }
 }
