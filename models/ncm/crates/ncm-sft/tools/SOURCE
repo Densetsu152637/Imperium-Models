@@ -1,0 +1,1 @@
+Copied from models/emperor/src/emperor/eval/vendor/imperium/tools/ (which pins an Imperium-AI commit in its SOURCE file), without index.json. The `status` key is ignored by ncm-sft.
