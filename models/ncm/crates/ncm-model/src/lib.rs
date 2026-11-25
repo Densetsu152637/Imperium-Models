@@ -10,6 +10,7 @@ pub mod config;
 pub mod layers;
 pub mod ncm;
 pub mod tok;
+pub mod weights;
 
 pub use cache::KvCache;
 pub use config::{

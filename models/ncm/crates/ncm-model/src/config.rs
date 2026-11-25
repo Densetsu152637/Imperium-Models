@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The 250M token-baseline config, embedded so binaries need no config directory.
 pub const TOK_250M_TOML: &str = include_str!("../../../configs/tok-250m.toml");
@@ -30,7 +30,7 @@ pub enum ConfigError {
 }
 
 /// Plain decoder-only baseline.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TokConfig {
     pub vocab_size: usize,
@@ -72,7 +72,7 @@ impl Default for TokConfig {
 }
 
 /// Hierarchical Next Concept Model with fixed k-token concepts.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NcmConfig {
     pub vocab_size: usize,
@@ -163,6 +163,16 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
         Self::parse(&text)
+    }
+
+    /// The config as TOML, with the `model` key first, in the form `parse` reads back.
+    pub fn to_toml(&self) -> String {
+        let (kind, table) = match self {
+            Self::Tok(c) => ("tok", toml::Table::try_from(c)),
+            Self::Ncm(c) => ("ncm", toml::Table::try_from(c)),
+        };
+        let table = toml::to_string(&table.expect("a config is a flat table of numbers"));
+        format!("model = \"{kind}\"\n{}", table.expect("a config serialises to TOML"))
     }
 
     pub fn vocab_size(&self) -> usize {
