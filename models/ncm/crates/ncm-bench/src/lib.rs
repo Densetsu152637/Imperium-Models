@@ -1,0 +1,345 @@
+//! Batch-1 decode-speed benchmark: NCM against the token baseline, random weights.
+//!
+//! ```text
+//! ncm-bench --model both --context 2048 16384 --new-tokens 256 --device cuda
+//! ```
+//!
+//! Both models share the token vocabulary, so decode tokens per second are directly comparable.
+//! Decode tok/s counts output tokens (the NCM emits `k` tokens per decoder pass).
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
+use clap::{Parser, ValueEnum};
+use ncm_model::layers::set_fused_attention;
+use ncm_model::{Config, NcmLm, TokenLm, cache_bytes, ncm_250m, tiny_ncm, tiny_tok, tok_250m};
+use serde_json::{Value, json};
+
+pub const PASS_RATIO: f64 = 1.5;
+pub const WEAK_RATIO: f64 = 1.2;
+const PREFILL_CHUNK: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ModelChoice {
+    Tok,
+    Ncm,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DeviceChoice {
+    /// CUDA (build with `--features cuda`).
+    Cuda,
+    /// Portable CPU backend.
+    Cpu,
+    /// Any wgpu adapter (build with `--features wgpu`).
+    Wgpu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DtypeChoice {
+    Bf16,
+    #[value(alias = "fp32")]
+    F32,
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "ncm-bench",
+    version,
+    about = "Batch-1 decode speed of the NCM against the token baseline (random weights)."
+)]
+pub struct Cli {
+    #[arg(long, value_enum, default_value = "both")]
+    pub model: ModelChoice,
+    /// Prompt lengths in tokens.
+    #[arg(long, num_args = 1.., default_values_t = [2048usize, 16384], value_name = "N")]
+    pub context: Vec<usize>,
+    #[arg(long, default_value_t = 256)]
+    pub new_tokens: usize,
+    #[arg(long, value_enum, default_value = "cuda")]
+    pub device: DeviceChoice,
+    /// Defaults to bf16 on cuda and f32 elsewhere.
+    #[arg(long, value_enum)]
+    pub dtype: Option<DtypeChoice>,
+    #[arg(long, default_value_t = 3)]
+    pub repeats: usize,
+    /// Also write the results as JSON.
+    #[arg(long, value_name = "PATH")]
+    pub json: Option<PathBuf>,
+    /// Tiny configs for a CPU smoke run.
+    #[arg(long)]
+    pub tiny: bool,
+    /// Use Burn's fused attention op instead of matmul-softmax-matmul (experimental).
+    #[arg(long)]
+    pub fused_attention: bool,
+}
+
+pub fn verdict(ratio: f64) -> &'static str {
+    if ratio >= PASS_RATIO {
+        "PASS"
+    } else if ratio >= WEAK_RATIO {
+        "WEAK"
+    } else {
+        "FAIL"
+    }
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 { values[mid] } else { (values[mid - 1] + values[mid]) / 2.0 }
+}
+
+fn make_device(choice: DeviceChoice) -> Result<Device, String> {
+    match choice {
+        DeviceChoice::Cpu => Ok(Device::flex()),
+        #[cfg(feature = "cuda")]
+        DeviceChoice::Cuda => Ok(Device::cuda(0)),
+        #[cfg(not(feature = "cuda"))]
+        DeviceChoice::Cuda => Err("--device cuda needs a build with `--features cuda`".into()),
+        #[cfg(feature = "wgpu")]
+        DeviceChoice::Wgpu => Ok(Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)),
+        #[cfg(not(feature = "wgpu"))]
+        DeviceChoice::Wgpu => Err("--device wgpu needs a build with `--features wgpu`".into()),
+    }
+}
+
+enum Model {
+    Tok(Box<TokenLm>),
+    Ncm(Box<NcmLm>),
+}
+
+impl Model {
+    fn name(&self) -> &'static str {
+        match self {
+            Model::Tok(_) => "tok",
+            Model::Ncm(_) => "ncm",
+        }
+    }
+
+    fn parts(&self) -> Vec<(&'static str, usize)> {
+        match self {
+            Model::Tok(m) => m.parts().rows(),
+            Model::Ncm(m) => m.parts().rows(),
+        }
+    }
+}
+
+fn sync(device: &Device) {
+    device.sync().expect("device sync");
+}
+
+/// Prefill the prompt, then greedily decode `new_tokens` tokens; returns (prefill s, decode s).
+///
+/// The token baseline prefills all but the last prompt token and decodes from that one, so its
+/// decode loop produces exactly `new_tokens` tokens like the NCM loop does.
+fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &Device) -> Run {
+    let context = prompt.dims()[1];
+    let (started, prefilled) = match model {
+        Model::Ncm(m) => {
+            let mut cache = m.make_cache(context + new_tokens, 1, device);
+            sync(device);
+            let started = Instant::now();
+            let mut cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK);
+            sync(device);
+            let prefilled = Instant::now();
+            let concepts = new_tokens / m.concept_size();
+            for c in 0..concepts {
+                let (tokens, _) = m.decode_concept(cond.clone(), &mut cache, None, false);
+                if c + 1 < concepts {
+                    cond = m.append_tokens(tokens, &mut cache);
+                }
+            }
+            (started, prefilled)
+        }
+        Model::Tok(m) => {
+            let mut caches = m.make_cache(context + new_tokens, 1, device);
+            sync(device);
+            let started = Instant::now();
+            let _ = m.prefill(prompt.clone().narrow(1, 0, context - 1), &mut caches, PREFILL_CHUNK);
+            sync(device);
+            let prefilled = Instant::now();
+            let mut token = prompt.clone().narrow(1, context - 1, 1);
+            for _ in 0..new_tokens {
+                token = m.step(token, &mut caches).argmax(2).reshape([1, 1]);
+            }
+            (started, prefilled)
+        }
+    };
+    let enqueued = Instant::now();
+    sync(device);
+    let done = Instant::now();
+    Run {
+        prefill_s: prefilled.duration_since(started).as_secs_f64(),
+        decode_s: done.duration_since(prefilled).as_secs_f64(),
+        enqueue_s: enqueued.duration_since(prefilled).as_secs_f64(),
+    }
+}
+
+/// Timings of one run. `enqueue_s` is the decode time before the final device sync: close to
+/// `decode_s` means the host, not the GPU, is the bottleneck.
+struct Run {
+    prefill_s: f64,
+    decode_s: f64,
+    enqueue_s: f64,
+}
+
+fn random_prompt(device: &Device, vocab: usize, n: usize) -> Tensor<2, Int> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let data: Vec<i32> = (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % vocab as u64) as i32
+        })
+        .collect();
+    Tensor::from_data(TensorData::new(data, [1, n]), device)
+}
+
+fn fmt_params(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else {
+        format!("{:.1}K", n as f64 / 1e3)
+    }
+}
+
+fn fmt_bytes(n: u64) -> String {
+    format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64)
+}
+
+/// One model's benchmark: params, then per-context prefill time, decode tok/s and cache bytes.
+fn bench_model(
+    cfg: &Config,
+    cli: &Cli,
+    device: &Device,
+    itemsize: usize,
+) -> (Value, Vec<(usize, f64)>) {
+    device.seed(0);
+    let model = match cfg {
+        Config::Tok(c) => Model::Tok(Box::new(TokenLm::new(c, device))),
+        Config::Ncm(c) => Model::Ncm(Box::new(NcmLm::new(c, device))),
+    };
+    let parts = model.parts();
+    let params: usize = parts.iter().map(|p| p.1).sum();
+    let unit = cfg.unit();
+    let new_tokens = cli.new_tokens - cli.new_tokens % unit;
+    println!("{}: {} params, {new_tokens} new tokens", model.name(), fmt_params(params));
+    for (name, n) in &parts {
+        println!("  {name:<18} {:>10}", fmt_params(*n));
+    }
+    let mut contexts = serde_json::Map::new();
+    let mut decode_rates = Vec::new();
+    for &context in &cli.context {
+        let context = context - context % unit;
+        let prompt = random_prompt(device, cfg.vocab_size(), context);
+        let warm = random_prompt(device, cfg.vocab_size(), context.min(64 * unit));
+        run_once(&model, &warm, 2 * unit, device); // warm-up: compile kernels, fill pools
+        let (mut prefills, mut decodes, mut enqueues) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..cli.repeats {
+            let run = run_once(&model, &prompt, new_tokens, device);
+            prefills.push(run.prefill_s);
+            decodes.push(run.decode_s);
+            enqueues.push(run.enqueue_s);
+        }
+        let reserved = device.memory_pool_usage().map(|u| u.bytes_reserved);
+        let cache = cache_bytes(cfg, context + new_tokens, itemsize, 1);
+        let decode_tok_s = new_tokens as f64 / median(&mut decodes.clone());
+        let prefill_s = median(&mut prefills.clone());
+        let host_share = median(&mut enqueues.clone()) / median(&mut decodes.clone());
+        println!(
+            "  ctx {context:>7}: prefill {prefill_s:.3}s  decode {decode_tok_s:.1} tok/s  \
+             host {:.0}%  reserved {}  cache {}",
+            host_share * 100.0,
+            reserved.map_or("n/a".into(), fmt_bytes),
+            fmt_bytes(cache as u64),
+        );
+        contexts.insert(
+            context.to_string(),
+            json!({
+                "prefill_s": prefill_s,
+                "decode_tok_s": decode_tok_s,
+                "decode_host_share": host_share,
+                "decode_s_runs": decodes,
+                "prefill_s_runs": prefills,
+                "reserved_memory_bytes": reserved,
+                "cache_bytes": cache,
+            }),
+        );
+        decode_rates.push((context, decode_tok_s));
+    }
+    let result = json!({
+        "name": model.name(),
+        "params": params,
+        "parts": parts.iter().map(|(n, c)| json!({"name": n, "params": c})).collect::<Vec<_>>(),
+        "new_tokens": new_tokens,
+        "contexts": contexts,
+    });
+    (result, decode_rates)
+}
+
+/// Run the benchmark described by `cli`; prints the report and returns the JSON payload.
+pub fn run(cli: &Cli) -> Result<Value, String> {
+    let mut device = make_device(cli.device)?;
+    let dtype = cli.dtype.unwrap_or(match cli.device {
+        DeviceChoice::Cuda => DtypeChoice::Bf16,
+        _ => DtypeChoice::F32,
+    });
+    let float = match dtype {
+        DtypeChoice::Bf16 => FloatDType::BF16,
+        DtypeChoice::F32 => FloatDType::F32,
+    };
+    device
+        .configure(float)
+        .map_err(|e| format!("cannot use {dtype:?} on {:?}: {e}", cli.device))?;
+    if cli.repeats == 0 || cli.context.is_empty() {
+        return Err("--repeats and --context need at least one value".into());
+    }
+    set_fused_attention(cli.fused_attention);
+    let itemsize = match dtype {
+        DtypeChoice::Bf16 => 2,
+        DtypeChoice::F32 => 4,
+    };
+    let kinds: Vec<&str> = match cli.model {
+        ModelChoice::Tok => vec!["tok"],
+        ModelChoice::Ncm => vec!["ncm"],
+        ModelChoice::Both => vec!["tok", "ncm"],
+    };
+    let mut results = Vec::new();
+    let mut rates = Vec::new();
+    for kind in &kinds {
+        let cfg = match (*kind, cli.tiny) {
+            ("tok", true) => Config::Tok(tiny_tok(8)),
+            ("tok", false) => Config::Tok(tok_250m()),
+            (_, true) => Config::Ncm(tiny_ncm(8, 4)),
+            (_, false) => Config::Ncm(ncm_250m()),
+        };
+        let (result, decode) = bench_model(&cfg, cli, &device, itemsize);
+        results.push(result);
+        rates.push((*kind, decode));
+    }
+    let mut ratios = Vec::new();
+    let tok = rates.iter().find(|r| r.0 == "tok");
+    let ncm = rates.iter().find(|r| r.0 == "ncm");
+    if let (Some((_, tok)), Some((_, ncm))) = (tok, ncm) {
+        for (context, ncm_rate) in ncm {
+            let Some((_, tok_rate)) = tok.iter().find(|(c, _)| c == context) else { continue };
+            let ratio = ncm_rate / tok_rate;
+            let v = verdict(ratio);
+            let note = if cli.tiny { "  (tiny config: smoke run, not a gate result)" } else { "" };
+            println!("ratio ncm/tok @ ctx {context}: {ratio:.2}x {v}{note}");
+            ratios.push(json!({"context": context, "ratio": ratio, "verdict": v}));
+        }
+    }
+    Ok(json!({
+        "device": format!("{:?}", cli.device).to_lowercase(),
+        "dtype": format!("{dtype:?}").to_lowercase(),
+        "tiny": cli.tiny,
+        "fused_attention": cli.fused_attention,
+        "results": results,
+        "ratios": ratios,
+    }))
+}

@@ -1,0 +1,5 @@
+[env]
+# cudarc (under burn-cuda) lists supported CUDA toolkits and stops at 13.4, but the 13.x runtime
+# is ABI compatible, so a local CUDA 13.5 build binds the 13.4 symbols. Only the `cuda` feature
+# reads it; CI never builds that feature.
+CUDARC_CUDA_VERSION = "13040"

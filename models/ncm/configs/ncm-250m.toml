@@ -1,0 +1,29 @@
+# Next Concept Model: local encoder -> k-token concepts -> global backbone -> local decoder.
+model = "ncm"
+vocab_size = 32000
+k = 4
+head_dim = 64
+# Local encoder (also the tied-embedding width) and local decoder
+local_dim = 512
+enc_layers = 2
+enc_heads = 8
+enc_kv_heads = 4
+enc_ff_dim = 1536
+enc_window = 512     # tokens; the decoder cross-attends to the same window
+dec_layers = 4
+dec_heads = 8
+dec_kv_heads = 4
+dec_ff_dim = 1536
+# Global backbone over concepts
+bb_dim = 1024
+bb_layers = 16
+bb_heads = 16
+bb_kv_heads = 4
+bb_ff_dim = 3200
+bb_window = 1024     # concepts, sliding layers
+full_every = 4
+rope_base = 10000.0
+rope_base_full = 1000000.0
+rope_scale = 1.0
+rope_scale_full = 1.0
+norm_eps = 1e-6

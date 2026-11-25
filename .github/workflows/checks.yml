@@ -13,10 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model: [emperor, consul]
+        model: [emperor, consul, ncm]
     name: checks (${{ matrix.model }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The ncm job also builds Burn and runs the Rust checks.
+    timeout-minutes: ${{ matrix.model == 'ncm' && 25 || 10 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
