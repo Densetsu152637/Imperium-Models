@@ -51,6 +51,26 @@ impl Memory {
         self.extra.dims()[2]
     }
 
+    /// Block `i`'s memory alone (one block, the same token states).
+    pub fn block(&self, i: usize) -> Memory {
+        let e = self.extra_len();
+        Memory {
+            nb: 1,
+            seq: self.seq.clone(),
+            seq_start: self.seq_start,
+            windows: vec![self.windows[i]],
+            copy_windows: vec![self.copy_windows[i]],
+            seq_next: self.seq_next.clone(),
+            extra: self.extra.clone().narrow(1, i, 1),
+            extra_pos: self.extra_pos[i * e..(i + 1) * e].to_vec(),
+            extra_hidden: self.extra_hidden.clone().narrow(1, i, 1),
+            copy_extra: self
+                .copy_extra
+                .as_ref()
+                .map(|(o, l, n)| (*o, *l, n.clone().narrow(1, i, 1))),
+        }
+    }
+
     /// The `[nb * q, N]` mask of the token states for `q` queries per block over `windows`
     /// (`true` hides).
     fn seq_mask(&self, windows: &[(usize, usize)], q: usize, device: &Device) -> Tensor<2, Bool> {

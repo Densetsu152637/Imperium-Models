@@ -366,17 +366,14 @@ impl HybridLm {
 
     // ------------------------------------------------------------------ shared pieces
 
-    #[allow(dead_code)] // used by the decode loop
     pub(crate) fn encoder(&self) -> &Stack {
         &self.encoder
     }
 
-    #[allow(dead_code)] // used by the decode loop
     pub(crate) fn backbone(&self) -> &Stack {
         &self.backbone
     }
 
-    #[allow(dead_code)] // used by the decode loop
     pub(crate) fn embed(&self, tokens: Tensor<2, Int>) -> Tensor<3> {
         self.emb.forward(tokens)
     }
@@ -422,7 +419,7 @@ impl HybridLm {
     /// `known` the encoder states of the known prefix `[B, L - 1, d]` (zero-padded) and each
     /// row's prefix length. Positions: slots and retrieved tokens at `start`, the known prefix at
     /// `start + i`.
-    pub(crate) fn block_entries(
+    pub fn block_entries(
         &self,
         cond: Tensor<3>,
         retrieved: &[(Vec<i32>, Vec<i32>)],
@@ -476,7 +473,7 @@ impl HybridLm {
     /// The generator's input for level `k` of one block, `[B, ℓ_k, d]`: the learned query for
     /// level 0, else the reconstruction so far `zhat` `[B, L, C]` area-pooled and projected; plus
     /// the level embedding.
-    pub(crate) fn level_input(&self, k: usize, zhat: Option<Tensor<3>>) -> Tensor<3> {
+    pub fn level_input(&self, k: usize, zhat: Option<Tensor<3>>) -> Tensor<3> {
         let d = self.local_dim;
         let level = self.level_emb.val().narrow(0, k, 1).reshape([1, 1, d]);
         match (k, zhat) {
@@ -494,7 +491,7 @@ impl HybridLm {
 
     /// The generator over inputs `[B, nb, q, d]`: its states projected to the latent width
     /// `[B, nb, q, C]`.
-    pub(crate) fn run_generator(
+    pub fn run_generator(
         &self,
         x: Tensor<4>,
         shape: &PassShape,
@@ -509,17 +506,17 @@ impl HybridLm {
     }
 
     /// Each generator layer's keys and values of `memory`.
-    pub(crate) fn generator_kv(&self, memory: &Memory) -> Vec<LayerKv> {
+    pub fn generator_kv(&self, memory: &Memory) -> Vec<LayerKv> {
         self.gen_blocks.iter().map(|b| b.cross.project(memory, self.rope_base)).collect()
     }
 
     /// Positions of the generator's training pass, levels concatenated and each restarting at 0.
-    pub(crate) fn level_positions(&self) -> Vec<usize> {
+    pub fn level_positions(&self) -> Vec<usize> {
         self.h.levels.iter().flat_map(|&n| 0..n).collect()
     }
 
     /// The block-diagonal `[Σℓ, Σℓ]` mask between levels (`true` hides).
-    pub(crate) fn level_mask(&self, device: &Device) -> Tensor<2, Bool> {
+    pub fn level_mask(&self, device: &Device) -> Tensor<2, Bool> {
         let level: Vec<usize> = self
             .h
             .levels
@@ -537,7 +534,7 @@ impl HybridLm {
     /// Token-decoder inputs `[B, nb, L, d]` for blocks whose tokens are `tokens` `[B * nb, L]`
     /// (position i reads token i - 1, position 0 a learned start), plus the projected `zhat`
     /// `[B * nb, L, C]` times `zmask` `[B * nb]` when given (None: the autoregressive path).
-    pub(crate) fn decoder_input(
+    pub fn decoder_input(
         &self,
         tokens: Tensor<2, Int>,
         zhat: Option<(Tensor<3>, Tensor<1>)>,
@@ -555,7 +552,7 @@ impl HybridLm {
     }
 
     /// The token decoder over inputs `[B, nb, L, d]`: log-probabilities `[B, nb * L, V]`.
-    pub(crate) fn run_decoder(
+    pub fn run_decoder(
         &self,
         x: Tensor<4>,
         shape: &PassShape,
@@ -573,12 +570,12 @@ impl HybridLm {
     }
 
     /// Each token-decoder layer's keys and values of `memory`.
-    pub(crate) fn decoder_kv(&self, memory: &Memory) -> Vec<LayerKv> {
+    pub fn decoder_kv(&self, memory: &Memory) -> Vec<LayerKv> {
         self.dec_blocks.iter().map(|b| b.cross.project(memory, self.rope_base)).collect()
     }
 
     /// The token decoder's self-attention tables (block positions 0..L) and causal mask.
-    pub(crate) fn decoder_self(&self, device: &Device) -> (Rope, Tensor<2, Bool>) {
+    pub fn decoder_self(&self, device: &Device) -> (Rope, Tensor<2, Bool>) {
         let l = self.h.block;
         let pos: Vec<i32> = (0..l as i32).collect();
         let rope = Rope::new(0, l, self.head_dim, self.rope_base, 1.0, device);
@@ -772,7 +769,7 @@ impl HybridLm {
 }
 
 /// The tokens of the `picked` blocks of `seq` (L each) and the token following each.
-pub(crate) fn retrieved_tokens(seq: &[i32], picked: &[usize], l: usize) -> (Vec<i32>, Vec<i32>) {
+pub fn retrieved_tokens(seq: &[i32], picked: &[usize], l: usize) -> (Vec<i32>, Vec<i32>) {
     let mut ids = Vec::with_capacity(picked.len() * l);
     let mut next = Vec::with_capacity(picked.len() * l);
     for &j in picked {
@@ -795,7 +792,7 @@ fn rows_of(x: Tensor<3>, b: usize, nb: usize) -> Vec<Vec<f32>> {
 /// d]` by segment (slots, retrieved, known prefix), per batch row the hidden flags, the
 /// positions, the copy segment, and the shape of the part both passes share (segments, flags,
 /// positions without the known prefix).
-pub(crate) struct Entries {
+pub struct Entries {
     vectors: Vec<Tensor<4>>,
     hidden: Vec<Vec<bool>>,
     pos: Vec<usize>,
@@ -807,7 +804,7 @@ impl Entries {
     /// The memory of these blocks (one `Entries` per block, in order), with the known prefix
     /// (generator) or without (token decoder), over the token states `seq` at `seq_start`.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn memory(
+    pub fn memory(
         blocks: &[Entries],
         with_known: bool,
         seq: Option<Tensor<3>>,

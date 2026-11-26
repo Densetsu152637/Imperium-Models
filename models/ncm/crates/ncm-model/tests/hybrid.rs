@@ -342,3 +342,276 @@ fn training_forward_is_causal_across_blocks() {
         assert_eq!(rows(&base.token_logp), rows(&other.token_logp), "rows before {cut}");
     }
 }
+
+// ----------------------------------------------------------------------------- decoding
+
+use ncm_model::hybrid::{DecodeOptions, Hooks, HybridSession, hybrid_cache_bytes};
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+fn host_ints(t: Tensor<2, Int>) -> Vec<i32> {
+    t.into_data().convert::<i32>().try_to_vec::<i32>().expect("int tensor")
+}
+
+/// Training-mode generator logits (all levels in one pass, block-diagonal) equal the per-level
+/// inference passes over the same block memory, teacher-forced on the same codes.
+#[test]
+fn generator_training_logits_match_per_level_passes() {
+    let (model, cfg, h, device) = tiny_model(20);
+    let l = h.block;
+    let nb = 5;
+    let toks = tokens(&device, cfg.vocab_size, 1, nb * l, 21);
+    let codes = block_codes(&model, toks.clone());
+    let mut plan = TrainPlan::exact(codes.clone());
+    plan.known[3] = 3;
+    let out = model.forward_train(toks, codes.clone(), &plan);
+    for blk in [0, 3, 4] {
+        let memory = out.memory.block(blk);
+        let kvs = model.generator_kv(&memory);
+        let row = host_ints(codes.clone().narrow(0, blk, 1));
+        let mut zhat: Option<Tensor<3>> = None;
+        for k in 0..h.depth() {
+            let got = model.level_logits(&memory, &kvs, k, zhat.clone(), blk * l);
+            let want = out.code_logits[k].clone().narrow(0, blk, 1);
+            assert_close(&values(got), &values(want), 1e-4, 1e-3);
+            let at = h.level_offset(k);
+            let level = Tensor::<2, Int>::from_data(
+                TensorData::new(row[at..at + h.levels[k]].to_vec(), [1, h.levels[k]]),
+                &device,
+            );
+            let c = model.tokenizer().contribution(k, level);
+            zhat = Some(match zhat {
+                Some(z) => z + c,
+                None => c,
+            });
+        }
+    }
+}
+
+/// Incremental decoding equals the full forward pass: the decode loop's autoregressive pass
+/// over a block, after prefilling the stream up to its start, gives the training forward's
+/// token log-probabilities with z = 0; and its memories match the training memories.
+#[test]
+fn incremental_autoregressive_path_matches_training_forward() {
+    let (model, cfg, h, device) = tiny_model(22);
+    let l = h.block;
+    let nb = 6;
+    let n = nb * l;
+    let toks = tokens(&device, cfg.vocab_size, 1, n, 23);
+    let host = host_ints(toks.clone());
+    let codes = block_codes(&model, toks.clone());
+    let mut plan = TrainPlan::exact(codes.clone());
+    plan.zero = vec![true; nb];
+    plan.known[4] = 2;
+    let out = model.forward_train(toks, codes, &plan);
+    let v = cfg.vocab_size;
+    for blk in [0, 2, 4, 5] {
+        let mut session = HybridSession::new(&model, n + l, &device);
+        session.prefill(&model, &host[..blk * l]);
+        let block = &host[blk * l..(blk + 1) * l];
+        let got = session.ar_logprobs(&model, block);
+        let want = values(out.token_logp.clone().narrow(1, blk * l, l));
+        assert_eq!(got.len(), l * v);
+        assert_close(&got, &want, 1e-4, 1e-3);
+        // The generator's memory with the same known prefix (prefilled, as in a reply).
+        let known = plan.known[blk];
+        let mut session = HybridSession::new(&model, n + l, &device);
+        session.prefill(&model, &host[..blk * l + known]);
+        let (memory, _) = session.block_memories(&model, &block[..known]);
+        let train = out.memory.block(blk);
+        assert_eq!(memory.extra_pos, train.extra_pos);
+        let flags = |m: &ncm_model::hybrid::Memory| values(m.extra_hidden.clone().int().float());
+        assert_eq!(flags(&memory), flags(&train));
+        // Hidden entries may differ (padding); compare the visible ones.
+        let d = cfg.local_dim;
+        let (a, b) = (values(memory.extra.clone()), values(train.extra.clone()));
+        for (i, &hidden) in flags(&memory).iter().enumerate() {
+            if hidden < 0.5 {
+                assert_close(&a[i * d..(i + 1) * d], &b[i * d..(i + 1) * d], 1e-4, 1e-3);
+            }
+        }
+    }
+}
+
+fn greedy(verified: bool) -> DecodeOptions {
+    DecodeOptions { verified, ar_only: !verified, ..DecodeOptions::default() }
+}
+
+/// Verified mode at temperature 0 equals the autoregressive path's greedy decode token for
+/// token, over prompts ending at every offset of a block, with drafts forced wrong or random
+/// and re-decodes forced at every allowed point or never.
+#[test]
+fn verified_mode_equals_autoregressive_greedy() {
+    let (model, cfg, h, device) = tiny_model(24);
+    let l = h.block;
+    let v = cfg.vocab_size as i32;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 8 * l, 25));
+    let reply = 3 * l;
+    for offset in 0..l {
+        let prompt = &stream[..2 * l + offset];
+        let mut ar = HybridSession::new(&model, 8 * l, &device);
+        ar.prefill(&model, prompt);
+        let (want, _) = ar.generate_reply(&model, reply, &greedy(false), &mut Hooks::default());
+        assert_eq!(want.len(), reply);
+        for (case, redecode) in [(0, 1), (1, l + 1), (2, h.redecode_min), (3, 1)] {
+            let mut session = HybridSession::new(&model, 8 * l, &device);
+            session.prefill(&model, prompt);
+            let mut state = (offset * 31 + case) as u64 + 1;
+            let mut wrong = |pass: usize, draft: &mut Vec<i32>| match case {
+                0 => draft.iter_mut().for_each(|t| *t = (*t + 1) % v),
+                1 => {}
+                _ => {
+                    for t in draft.iter_mut().skip(pass) {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        *t = ((state >> 33) % v as u64) as i32;
+                    }
+                }
+            };
+            let mut hooks = Hooks { draft: Some(&mut wrong), ..Hooks::default() };
+            let opts = DecodeOptions { redecode_min: Some(redecode), ..greedy(true) };
+            let (got, stats) = session.generate_reply(&model, reply, &opts, &mut hooks);
+            assert_eq!(got, want, "offset {offset}, case {case}");
+            if case == 0 {
+                // Every draft is wrong, so every block re-decodes when enough remains.
+                assert!(stats.iter().any(|s| s.redecoded), "re-decodes forced");
+            }
+        }
+    }
+}
+
+/// The autoregressive path's rows are bit-identical whatever the codes, z, drafts or the
+/// generator's known prefix (forced re-decodes): every row seen for the same block tokens and
+/// position is the same.
+#[test]
+fn autoregressive_rows_ignore_codes_drafts_and_redecodes() {
+    use std::collections::HashMap;
+    let (model, cfg, h, device) = tiny_model(26);
+    let l = h.block;
+    let v = cfg.vocab_size as i32;
+    let n = h.codebook as i32;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 4 * l, 27));
+    let mut seen: HashMap<(Vec<i32>, usize), Vec<f32>> = HashMap::new();
+    let mut compared = 0;
+    for case in 0..6u64 {
+        let mut session = HybridSession::new(&model, 4 * l, &device);
+        session.prefill(&model, &stream[..2 * l + 3]);
+        let mut draft = |pass: usize, d: &mut Vec<i32>| {
+            if case % 2 == 1 {
+                d.iter_mut().enumerate().for_each(|(i, t)| *t = (*t + (i + pass) as i32) % v);
+            }
+        };
+        let mut codes = |level: usize, c: &mut Vec<i32>| {
+            c.iter_mut().for_each(|x| *x = (*x + (case as i32) * (level as i32 + 1)) % n);
+        };
+        let mut rows = |prefix: &[i32], i: usize, row: &[f32]| {
+            let key = (prefix.to_vec(), i);
+            match seen.get(&key) {
+                Some(old) => {
+                    assert_eq!(old.as_slice(), row, "row {i} after {prefix:?}");
+                    compared += 1;
+                }
+                None => {
+                    seen.insert(key, row.to_vec());
+                }
+            }
+        };
+        let mut hooks = Hooks {
+            draft: Some(&mut draft),
+            codes: Some(&mut codes),
+            ar_rows: Some(&mut rows),
+            ..Hooks::default()
+        };
+        let opts =
+            DecodeOptions { redecode_min: Some(if case < 3 { 1 } else { l + 1 }), ..greedy(true) };
+        session.decode_block(&model, l, &opts, &mut hooks);
+    }
+    assert!(compared > 0, "some rows were seen twice");
+}
+
+/// A reply that reaches an offset by decoding continues as one whose prompt ends there; and a
+/// stop mid-block followed by a new message leaves the state of prefilling the whole stream.
+#[test]
+fn offsets_and_stops_match_prefill() {
+    let (model, cfg, h, device) = tiny_model(28);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 8 * l, 29));
+    let prompt = &stream[..2 * l + 1];
+    let mut first = HybridSession::new(&model, 8 * l, &device);
+    first.prefill(&model, prompt);
+    let (reply, _) = first.generate_reply(&model, 2 * l, &greedy(true), &mut Hooks::default());
+    // Inside the first reply block (l - 1 tokens from the prompt's offset 1) the continuation
+    // reads only the block's own tokens and the memory built before it.
+    for j in [1, 3, l - 2] {
+        let mut resumed = HybridSession::new(&model, 8 * l, &device);
+        let mut p = prompt.to_vec();
+        p.extend_from_slice(&reply[..j]);
+        resumed.prefill(&model, &p);
+        let rest_len = l - 1 - j;
+        let (rest, _) =
+            resumed.generate_reply(&model, rest_len, &greedy(true), &mut Hooks::default());
+        assert_eq!(rest, reply[j..j + rest_len], "resumed at {j}");
+    }
+    // Stop at the reply's fourth token, then a new message.
+    let stop = reply[3];
+    let at = reply.iter().position(|&t| t == stop).expect("present");
+    let mut stopped = HybridSession::new(&model, 8 * l, &device);
+    stopped.prefill(&model, prompt);
+    let opts = DecodeOptions { stop: vec![stop], ..greedy(true) };
+    let (out, _) = stopped.generate_reply(&model, 2 * l, &opts, &mut Hooks::default());
+    assert_eq!(out, reply[..=at]);
+    let message = &stream[5 * l..5 * l + l + 5];
+    stopped.prefill(&model, message);
+    let mut whole = HybridSession::new(&model, 8 * l, &device);
+    let mut all = prompt.to_vec();
+    all.extend_from_slice(&out);
+    all.extend_from_slice(message);
+    whole.prefill(&model, &all);
+    assert_eq!(stopped.tokens(), whole.tokens());
+    assert_eq!(stopped.blocks(), whole.blocks());
+    assert_close(&values(stopped.condition()), &values(whole.condition()), 1e-4, 1e-3);
+    let open = stopped.tokens()[stopped.blocks() * l..].to_vec();
+    let (a, b) = (stopped.ar_logprobs(&model, &open), whole.ar_logprobs(&model, &open));
+    assert_close(&a, &b, 1e-4, 1e-3);
+}
+
+/// A switch token in a parallel-mode result: tokens through it come from parallel mode, the
+/// rest of the block from verified mode, so they equal the autoregressive path's greedy
+/// continuation of the tokens before them.
+#[test]
+fn mixed_block_switches_to_verified_mode() {
+    let (model, cfg, h, device) = tiny_model(30);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 6 * l, 31));
+    let prompt = &stream[..l + 2];
+    let parallel = DecodeOptions { tau: Some(0.0), ..DecodeOptions::default() };
+    let mut dry = HybridSession::new(&model, 6 * l, &device);
+    dry.prefill(&model, prompt);
+    let first = dry.decode_block(&model, l, &parallel, &mut Hooks::default());
+    let plain = first.tokens;
+    // Switch on the parallel result's third token (its first occurrence).
+    let switch = plain[2];
+    let s = plain.iter().position(|&t| t == switch).expect("present");
+    let mut session = HybridSession::new(&model, 6 * l, &device);
+    session.prefill(&model, prompt);
+    let opts = DecodeOptions { switch_on: vec![switch], ..parallel.clone() };
+    let block = session.decode_block(&model, l, &opts, &mut Hooks::default());
+    let got = block.tokens;
+    assert_eq!(got[..=s], plain[..=s], "parallel mode up to the switch");
+    assert_eq!(block.stats.switched, Some(block.stats.known + s));
+    let mut ar = HybridSession::new(&model, 6 * l, &device);
+    let mut p = prompt.to_vec();
+    p.extend_from_slice(&got[..=s]);
+    ar.prefill(&model, &p);
+    let rest = got.len() - s - 1;
+    let (want, _) = ar.generate_reply(&model, rest, &greedy(false), &mut Hooks::default());
+    assert_eq!(got[s + 1..], want[..], "verified after the switch");
+}
+
+/// The decode state at 1M tokens against the design's ~0.3 GiB (bf16, 8-bit indexer keys):
+/// 7 x 32,768 x 1,152 B of MLA cache, ~28 MiB of indexer keys, DeltaNet state, token ids and
+/// recent states.
+#[test]
+fn hybrid_cache_at_1m_matches_the_design() {
+    let bytes = hybrid_cache_bytes(&ncm_250m_hybrid(), 1 << 20, 2, 1) as f64 / GIB;
+    assert!((0.27..=0.33).contains(&bytes), "{bytes:.3} GiB at 1M tokens");
+}
