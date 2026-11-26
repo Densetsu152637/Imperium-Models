@@ -110,3 +110,14 @@ fn a_slot_reuses_its_kept_prefix() {
     let (_, stats) = run(&batched, &longer, 4, SamplingParams::GREEDY);
     assert!(stats.cached_tokens > 0, "the second turn starts from the first one's cache");
 }
+
+#[test]
+fn timings_report_the_batch() {
+    let batched = engine_with_slots(tiny_tok_config(), 256, 2);
+    let (_, stats) = run(&batched, "timings", 4, SamplingParams::GREEDY);
+    let timings = ncm_server::api::timings_json(&stats, 0);
+    assert_eq!(timings["decode_path"], "batched");
+    assert!(timings["queue_ms"].as_f64().is_some());
+    assert_eq!(timings["mean_batch"].as_f64(), Some(1.0));
+    assert_eq!(timings["forked"], false);
+}

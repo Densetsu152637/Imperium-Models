@@ -250,7 +250,9 @@ fn per_token_ms(count: usize, seconds: f64) -> f64 {
 /// `predicted_per_second` is the decode speed in tokens per second. Extensions: `cache_bytes`,
 /// the key/value cache allocated at launch; `graph_capture_ms`, the decode graph's capture
 /// (counted in neither `prompt_ms` nor `predicted_ms`); `decode_path`, the loop the request
-/// took (`eager`, `graphed-greedy`, `graphed-sampled`, `speculative`).
+/// took (`eager`, `graphed-greedy`, `graphed-sampled`, `speculative`, `batched`); with
+/// continuous batching, `queue_ms` (the wait for a slot), `mean_batch` (the mean rows of the
+/// decode steps it took part in) and `forked` (its prompt's prefill was another slot's).
 pub fn timings_json(stats: &GenStats, cache_bytes: usize) -> Value {
     json!({
         "cache_n": stats.cached_tokens,
@@ -265,6 +267,9 @@ pub fn timings_json(stats: &GenStats, cache_bytes: usize) -> Value {
         "cache_bytes": cache_bytes,
         "graph_capture_ms": stats.capture_s * 1000.0,
         "decode_path": stats.path.name(),
+        "queue_ms": stats.queue_s * 1000.0,
+        "mean_batch": stats.mean_batch,
+        "forked": stats.forked,
     })
 }
 
