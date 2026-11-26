@@ -409,6 +409,9 @@ pub(crate) struct Core {
 struct HybridState {
     model: HybridLm,
     session: FastSession,
+    /// Kept points of the session (prefix reuse): after the last prompt, and at the end of
+    /// its reply; a prompt that extends one restores it and prefills only the rest.
+    kept: Vec<ncm_model::hybrid::HybridSnapshot>,
 }
 
 /// Burn initialises parameters when first used, drawing from the device's generator then.
@@ -510,7 +513,7 @@ impl Core {
                 let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
                 let session = FastSession::new(&model, capacity, &device);
                 let params = HybridLm::new(cfg, &device).parts().inference();
-                hybrid = Some(Mutex::new(HybridState { model, session }));
+                hybrid = Some(Mutex::new(HybridState { model, session, kept: Vec::new() }));
                 (State::Empty, params, "hybrid")
             }
             Config::Ncm(cfg) => {
@@ -947,8 +950,9 @@ impl Core {
 }
 
 impl Core {
-    /// The NCM hybrid: the prompt prefilled from scratch (TODO: prefix reuse), then block after
-    /// block on the fast path ([`FastSession::decode_block`]), each block's tokens streamed as
+    /// The NCM hybrid: the prompt restored from the longest kept point it extends (the last
+    /// prompt, or the end of its reply, both kept at any offset in a block) and prefilled from
+    /// there, or from scratch; then block after block on the fast path ([`FastSession::decode_block`]), each block's tokens streamed as
     /// it closes. Verified mode for constrained requests, whose grammar scans every check
     /// pass's tokens and picks every autoregressive token; `<tool_call>` switches a block to
     /// verified mode until the block in which `</tool_call>` appears ends.
@@ -959,16 +963,34 @@ impl Core {
         run: &mut Run<'_>,
     ) -> Result<GenStats, EngineError> {
         use std::cell::RefCell;
-        let HybridState { model, session } = hybrid;
+        let HybridState { model, session, kept } = hybrid;
         let ids = run.ids;
         self.sync();
         let started = Instant::now();
-        session.reset(model);
         if run.cancel.load(Ordering::Relaxed) {
             return Ok(aborted(prompt.len()));
         }
         let stream: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-        session.prefill(model, &stream);
+        let hit = if self.prefix_reuse {
+            kept.iter().filter(|k| stream.starts_with(k.tokens())).max_by_key(|k| k.tokens().len())
+        } else {
+            None
+        };
+        let cached = match hit {
+            Some(k) => {
+                session.restore(k);
+                k.tokens().len()
+            }
+            None => {
+                session.reset(model);
+                0
+            }
+        };
+        session.prefill(model, &stream[cached..]);
+        let mut next = Vec::new();
+        if self.prefix_reuse {
+            next.push(session.snapshot());
+        }
         self.sync();
         let prompt_s = started.elapsed().as_secs_f64();
         let params = run.params;
@@ -1036,6 +1058,10 @@ impl Core {
                 break Finish::Length;
             }
         };
+        if self.prefix_reuse && session.tokens().len() > stream.len() {
+            next.push(session.snapshot());
+        }
+        *kept = next;
         self.sync();
         acceptance.graphed = cfg!(feature = "cuda")
             && ncm_model::fused::graphs_active(&self.device)
@@ -1054,6 +1080,7 @@ impl Core {
             mean_batch: 1.0,
             forked: false,
         })
+        .map(|stats| GenStats { cached_tokens: cached, ..stats })
     }
 
     /// The kept state a prompt `ids` can start from: the longest one whose tokens `ids`

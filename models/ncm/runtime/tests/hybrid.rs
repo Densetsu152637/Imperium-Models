@@ -72,3 +72,22 @@ fn the_hybrid_serves_one_slot() {
     let result = std::panic::catch_unwind(|| engine_with_slots(hybrid_config(), 256, 2));
     assert!(result.is_err(), "two slots are refused");
 }
+
+/// Prefix reuse: a next turn that repeats the prompt and the reply starts from the kept end of
+/// the reply (inside an open block), and repeating it gives the same reply.
+#[test]
+fn the_hybrid_reuses_kept_prefixes() {
+    let engine = engine(hybrid_config(), 256);
+    let prompt = vocab().encode("a prompt that ends mid-block").unwrap();
+    let (reply, first) = run(&engine, request(prompt.clone(), 11, SamplingParams::GREEDY));
+    assert_eq!(first.cached_tokens, 0);
+    let mut turn = prompt.clone();
+    turn.extend_from_slice(&reply);
+    turn.extend(vocab().encode(" and more").unwrap());
+    let (a, stats) = run(&engine, request(turn.clone(), 9, SamplingParams::GREEDY));
+    assert_eq!(stats.cached_tokens, prompt.len() + reply.len());
+    // The same prompt again: a whole hit on the kept prompt point.
+    let (b, again) = run(&engine, request(turn.clone(), 9, SamplingParams::GREEDY));
+    assert_eq!(again.cached_tokens, turn.len());
+    assert_eq!(a, b);
+}

@@ -156,6 +156,26 @@ pub struct BlockOut {
     pub stats: BlockStats,
 }
 
+/// A point of a [`HybridSession`] to return to ([`HybridSession::snapshot`]).
+pub struct HybridSnapshot {
+    tokens: Vec<i32>,
+    encoder: Vec<LayerSnapshot>,
+    backbone: Vec<LayerSnapshot>,
+    states: Option<Tensor<3>>,
+    states_start: usize,
+    encoded: usize,
+    pooled: Vec<Vec<f32>>,
+    cond: Tensor<3>,
+    blocks: usize,
+}
+
+impl HybridSnapshot {
+    /// The tokens the session held.
+    pub fn tokens(&self) -> &[i32] {
+        &self.tokens
+    }
+}
+
 /// Decode state of one stream at batch 1: the tokens, the encoder and backbone caches, the
 /// encoder states of the recent tokens and the open block, the backbone inputs of every block
 /// (for retrieval) and the condition of the open block.
@@ -201,6 +221,42 @@ impl HybridSession {
 
     pub fn tokens(&self) -> &[i32] {
         &self.tokens
+    }
+
+    /// What [`Self::restore`] needs to return to this point: the tokens, the encoder and
+    /// backbone caches' snapshots, the held encoder states, the retrieval history and the open
+    /// block's condition. Taken at any point (a block boundary or inside the open block).
+    pub fn snapshot(&self) -> HybridSnapshot {
+        HybridSnapshot {
+            tokens: self.tokens.clone(),
+            encoder: self.encoder.iter().map(LayerCache::snapshot).collect(),
+            backbone: self.backbone.iter().map(LayerCache::snapshot).collect(),
+            states: self.states.clone(),
+            states_start: self.states_start,
+            encoded: self.encoded,
+            pooled: self.pooled.clone(),
+            cond: self.cond.clone(),
+            blocks: self.blocks,
+        }
+    }
+
+    /// Back to a [`Self::snapshot`] of this session (taken since its caches last moved past
+    /// it on another path: append-only caches only rewind), in the caches' own buffers on CUDA.
+    pub fn restore(&mut self, snapshot: &HybridSnapshot) {
+        self.tokens = snapshot.tokens.clone();
+        for (c, s) in self.encoder.iter_mut().zip(&snapshot.encoder) {
+            c.restore(s);
+        }
+        for (c, s) in self.backbone.iter_mut().zip(&snapshot.backbone) {
+            c.restore(s);
+        }
+        self.states = snapshot.states.clone();
+        self.states_start = snapshot.states_start;
+        self.encoded = snapshot.encoded;
+        self.pooled = snapshot.pooled.clone();
+        self.cond = snapshot.cond.clone();
+        self.blocks = snapshot.blocks;
+        self.verified_span = false;
     }
 
     /// Back to an empty stream, in the caches' own buffers on CUDA (a server reuses one

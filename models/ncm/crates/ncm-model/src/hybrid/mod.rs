@@ -10,7 +10,7 @@ pub mod memory;
 pub mod model;
 pub mod vq;
 
-pub use decode::{BlockOut, BlockStats, DecodeOptions, Hooks, HybridSession};
+pub use decode::{BlockOut, BlockStats, DecodeOptions, Hooks, HybridSession, HybridSnapshot};
 pub use fast::{FastSession, PassMode, PassResult};
 pub use memory::Memory;
 pub use model::{HybridLm, HybridLoss, HybridParts, TrainOut, TrainPlan};

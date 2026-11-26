@@ -306,6 +306,18 @@ impl FastSession {
         self.session.tokens()
     }
 
+    /// The session's point to return to ([`HybridSession::snapshot`]).
+    pub fn snapshot(&self) -> super::decode::HybridSnapshot {
+        self.session.snapshot()
+    }
+
+    /// Back to a [`Self::snapshot`] of this session: the rings are projected again from the
+    /// held encoder states at the next block (slots written since may hold later tokens).
+    pub fn restore(&mut self, snapshot: &super::decode::HybridSnapshot) {
+        self.session.restore(snapshot);
+        self.rings.upto = self.session.states_start;
+    }
+
     /// Back to an empty stream, keeping every buffer (and so the captured graphs): the rings'
     /// contents are hidden by the next block's staged visibility.
     pub fn reset(&mut self, model: &HybridLm) {
