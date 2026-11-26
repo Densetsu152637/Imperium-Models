@@ -161,6 +161,19 @@ impl IndexKeys {
         }
     }
 
+    /// [`Self::write`] into the existing buffers (CUDA).
+    #[cfg(feature = "cuda")]
+    fn write_into(&self, start: usize, keys: Tensor<3>) {
+        match self {
+            Self::Float(k) => crate::inplace::write_float(k, keys, 1, start),
+            Self::Int8 { codes, scales } => {
+                let (new_codes, new_scales) = quantize_keys(keys);
+                crate::inplace::write_int(codes, new_codes, 1, start);
+                crate::inplace::write_float(scales, new_scales, 1, start);
+            }
+        }
+    }
+
     /// The first `n` positions' keys for scoring.
     fn view(&self, n: usize) -> ScoreKeys {
         match self {
@@ -237,8 +250,7 @@ impl LatentCache {
     }
 
     /// Moves the position back to `len` (entries past it are overwritten when written again).
-    #[cfg(feature = "cuda")]
-    pub(crate) fn rewind(&mut self, len: usize) {
+    pub fn rewind(&mut self, len: usize) {
         self.length = len;
     }
 
@@ -260,6 +272,14 @@ impl LatentCache {
     fn write(&mut self, kv: Tensor<3>, keys: Tensor<3>) {
         let (start, t) = (self.length, kv.dims()[1]);
         assert!(start + t <= self.capacity, "cache capacity {} exceeded", self.capacity);
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(&kv.device()) {
+            // In the cache's own buffers, which captured decode graphs keep reading.
+            crate::inplace::write_float(self.kv.as_ref().expect("cache"), kv, 1, start);
+            self.keys.as_ref().expect("cache").write_into(start, keys);
+            self.length += t;
+            return;
+        }
         let old_kv = self.kv.take().expect("cache");
         self.kv = Some(old_kv.slice_assign(s![.., start..start + t], kv));
         self.keys = Some(self.keys.take().expect("cache").write(start, keys));

@@ -284,9 +284,9 @@ pub fn graphed_step_matches(device: &Device, spec: Option<QuantSpec>) {
     }
 }
 
-/// One [`GraphedStep`] kept across [`ncm_model::NcmCache::reset`]: the reset replaces buffers
-/// the graph was captured against, so the step must capture anew and decode the same prompt to
-/// the same tokens as before (both designs).
+/// One [`GraphedStep`] kept across [`ncm_model::NcmCache::reset`]: the reset writes into the
+/// buffers the graph was captured against, so the graph keeps serving and decodes the same
+/// prompt to the same tokens as before (both designs).
 pub fn graphed_step_survives_reset(device: &Device) {
     for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
         let model = build_ncm(&cfg, None, device);

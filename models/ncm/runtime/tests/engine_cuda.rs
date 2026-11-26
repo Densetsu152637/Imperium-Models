@@ -1,7 +1,8 @@
 //! The engine's graphed decode paths on CUDA (`--features cuda`, a GPU; CI builds neither, so
 //! this file compiles to nothing there): greedy replies through the graphs equal the eager
 //! path's, sampled replies are reproducible by seed and vary with it, both architectures and
-//! designs, across requests (each resets the caches, so the graphs are captured anew).
+//! designs, across requests: the graphs are captured once and kept, as the caches keep their
+//! buffers.
 #![cfg(feature = "cuda")]
 
 mod common;
@@ -29,6 +30,7 @@ fn engine(config: Config, speculate: bool) -> Engine {
         prefill_chunk: 16,
         quant: None,
         speculate,
+        prefix_reuse: true,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
 }
@@ -52,18 +54,30 @@ fn configs() -> [Config; 4] {
 /// One test so the process-wide graph switch is never flipped under another test.
 #[test]
 fn graphed_paths_match_eager_and_sample_by_seed() {
-    let prompt = "the quick brown fox jumps over the lazy dog, twice over";
+    let prompts = ["the quick brown fox jumps over the lazy dog, twice over", "a different prompt"];
+    let prompt = prompts[0];
     for config in configs() {
         let engine = engine(config.clone(), false);
         set_cuda_graphs(false);
-        let (eager, stats) = run(&engine, prompt, SamplingParams::GREEDY);
-        assert_eq!(stats.path, DecodePath::Eager);
+        let eager: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let (tokens, stats) = run(&engine, p, SamplingParams::GREEDY);
+                assert_eq!(stats.path, DecodePath::Eager);
+                tokens
+            })
+            .collect();
         set_cuda_graphs(true);
-        for _ in 0..2 {
-            let (graphed, stats) = run(&engine, prompt, SamplingParams::GREEDY);
-            assert_eq!(stats.path, DecodePath::GraphedGreedy);
-            assert!(stats.capture_s > 0.0, "{config:?}: no graph was captured");
-            assert_eq!(graphed, eager, "{config:?}: graphed greedy differs from eager");
+        // The graph is captured once, then kept across requests (each resets or restores the
+        // caches in place): later requests replay it without recapturing.
+        for round in 0..3 {
+            for (p, want) in prompts.iter().zip(&eager) {
+                let (graphed, stats) = run(&engine, p, SamplingParams::GREEDY);
+                assert_eq!(stats.path, DecodePath::GraphedGreedy);
+                let first = round == 0 && *p == prompts[0];
+                assert_eq!(stats.capture_s > 0.0, first, "{config:?} round {round}: capture");
+                assert_eq!(&graphed, want, "{config:?}: graphed greedy differs from eager");
+            }
         }
         let sampled =
             |seed| SamplingParams { temperature: 0.9, top_k: 40, top_p: 0.95, seed: Some(seed) };
@@ -76,7 +90,12 @@ fn graphed_paths_match_eager_and_sample_by_seed() {
     let Config::Ncm(base) = tiny_ncm_v2_config() else { unreachable!() };
     let with_draft = Config::Ncm(NcmConfig { draft_layers: 1, ..base });
     let plain = run(&engine(with_draft.clone(), false), prompt, SamplingParams::GREEDY).0;
-    let (spec, stats) = run(&engine(with_draft, true), prompt, SamplingParams::GREEDY);
-    assert_eq!(stats.path, DecodePath::Speculative);
-    assert_eq!(spec, plain, "speculative greedy differs from plain greedy");
+    let speculative = engine(with_draft, true);
+    for p in [prompt, prompts[1], prompt] {
+        let (spec, stats) = run(&speculative, p, SamplingParams::GREEDY);
+        assert_eq!(stats.path, DecodePath::Speculative);
+        if p == prompt {
+            assert_eq!(spec, plain, "speculative greedy differs from plain greedy");
+        }
+    }
 }

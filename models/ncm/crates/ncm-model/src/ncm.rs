@@ -109,9 +109,20 @@ pub struct NcmCache {
     /// One-concept backbone steps of [`NcmLm::append_tokens`] as a replayed CUDA graph (on CUDA).
     #[cfg(feature = "cuda")]
     pub backbone_graph: crate::layers::GraphedStack,
-    /// Unique to this cache's buffers: a new value on every [`Self::reset`], which replaces
-    /// buffers graphs captured against (graphs check it before replaying).
+    /// Unique to this cache's buffers. [`Self::reset`] and [`Self::restore`] write into the
+    /// existing buffers on CUDA, so a graph captured against this cache stays valid across
+    /// requests; graphs check the epoch before replaying, so another cache makes them recapture.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     epoch: u64,
+}
+
+/// What [`NcmCache::restore`] needs to return a cache to an earlier position: the stacks'
+/// [`LayerSnapshot`]s, the cross-attention rings and the token count.
+pub struct NcmSnapshot {
+    backbone: Vec<crate::cache::LayerSnapshot>,
+    encoder: Vec<crate::cache::LayerSnapshot>,
+    cross: Vec<crate::cache::KvSnapshot>,
+    tokens: usize,
 }
 
 /// The source of [`NcmCache`] epochs.
@@ -134,12 +145,32 @@ impl NcmCache {
         self.backbone.iter_mut().chain(&mut self.encoder).for_each(LayerCache::reset);
         self.cross.iter_mut().chain(&mut self.dec_self).for_each(KvCache::reset);
         self.tokens = 0;
-        self.epoch = next_epoch();
-        // Resetting replaces the DeltaNet state buffers the graph was recorded against.
-        #[cfg(feature = "cuda")]
-        {
-            self.backbone_graph = Default::default();
+    }
+
+    /// Tokens the cache holds, and copies of what moving on would overwrite: [`Self::restore`]
+    /// returns here (prompt-prefix reuse across requests).
+    pub fn snapshot(&self) -> NcmSnapshot {
+        NcmSnapshot {
+            backbone: self.backbone.iter().map(LayerCache::snapshot).collect(),
+            encoder: self.encoder.iter().map(LayerCache::snapshot).collect(),
+            cross: self.cross.iter().map(KvCache::snapshot).collect(),
+            tokens: self.tokens,
         }
+    }
+
+    /// Back to a [`Self::snapshot`] of this cache, in its own buffers on CUDA.
+    pub fn restore(&mut self, snapshot: &NcmSnapshot) {
+        for (c, s) in self.backbone.iter_mut().zip(&snapshot.backbone) {
+            c.restore(s);
+        }
+        for (c, s) in self.encoder.iter_mut().zip(&snapshot.encoder) {
+            c.restore(s);
+        }
+        for (c, s) in self.cross.iter_mut().zip(&snapshot.cross) {
+            c.restore(s);
+        }
+        self.dec_self.iter_mut().for_each(KvCache::reset);
+        self.tokens = snapshot.tokens;
     }
 }
 
@@ -785,8 +816,9 @@ fn greedy(_: usize, logits: &Tensor<3>) -> Tensor<2, Int> {
 ///
 /// On other devices, with the fused kernels or graphs off, before the ring fills, or if the
 /// capture fails, [`GraphedStep::step`] runs `append_tokens` and then [`GraphedDecoder`]. A graph
-/// serves the cache it was captured against: stepping another cache, or the same one after
-/// [`NcmCache::reset`], captures anew.
+/// serves the cache it was captured against, also after [`NcmCache::reset`] or
+/// [`NcmCache::restore`] (which write into its buffers on CUDA) once the ring is full again;
+/// stepping another cache captures anew.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub struct GraphedStep {
@@ -924,6 +956,12 @@ impl GraphedStep {
         out
     }
 
+    /// New settings for a sampled step (a new request): the captured graph keeps serving, as
+    /// it reads the settings from device buffers. Panics on a greedy step.
+    pub fn set_sampling(&mut self, settings: crate::sample::SampleSettings) {
+        self.sampler.as_mut().expect("a sampled step").settings = settings;
+    }
+
     /// The pick of the next step, its device settings refreshed.
     fn pick(&self) -> Pick {
         match &self.sampler {
@@ -1024,6 +1062,10 @@ impl StepState {
         }
         self.prepare(model, tokens, cache, pick);
         let StepState::Ready(g) = self else { return None };
+        // A graph kept across requests serves only once the cross-attention ring is full again.
+        if !cache.cross.iter().all(|c| c.len() >= c.capacity()) {
+            return None;
+        }
         g.replay(model, tokens.clone(), cache);
         Some(match &g.out {
             StepOut::Cond(c) => StepOut::Cond(c.clone()),

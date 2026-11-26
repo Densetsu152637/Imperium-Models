@@ -5,7 +5,12 @@
 //! (`ncm-server`'s `sampling.rs`): the `top_k` largest logits (all for 0), then the smallest
 //! prefix of them, best first, whose probability at the temperature reaches `top_p`. Both cuts
 //! are found by bisection over the logits' order-preserving 32-bit keys (exact, ties kept
-//! together). It then draws from the kept tokens by the Gumbel-max trick: the argmax of
+//! together). With a top-k cut (up to 2,048) the kernel first bounds the candidates: one pass
+//! counts the logits in 16 bands below the largest (each half the last), the narrowest band
+//! holding `top_k` of them is gathered into shared memory, and both cuts and the draw run there,
+//! so a draw reads the row four times however wide the vocabulary; without a top-k cut (or with
+//! more candidates than fit) the bisections run over the whole row. It then draws from the kept
+//! tokens by the Gumbel-max trick: the argmax of
 //! `logit / temperature + g`, `g` standard Gumbel noise from a counter-based hash of the seed,
 //! the draw's counter and the token id. That is an exact draw from the kept tokens'
 //! distribution; the random stream differs from the host sampler's, so a seed gives the same
@@ -33,6 +38,10 @@ mod kernel {
 
     /// Units per cube (one cube per row).
     pub(super) const CUBE: usize = 256;
+    /// Most candidates the fast path gathers in shared memory (and the largest `top_k` it serves).
+    const CAP: usize = 2048;
+    /// Bands the fast path counts to bound the candidates.
+    const BANDS: usize = 16;
     /// Planes per cube at the CUDA warp width.
     const PLANES: usize = CUBE / 32;
 
@@ -133,6 +142,149 @@ mod kernel {
         }
         let hi = cube_max(hi, &mut part);
         let lo = -cube_max(-lo, &mut part);
+        let draw = u32::reinterpret(state[2]) + offset + row as u32;
+        let (s0, s1) = (u32::reinterpret(state[0]), u32::reinterpret(state[1]));
+        // Fast path: gather the candidates of the top-k cut into shared memory and finish there.
+        if top_k > 0 && (top_k as usize) <= CAP {
+            // Logits at or above `hi - range / 2^j`, j = 0..BANDS: the narrowest band holding
+            // `top_k` of them bounds the candidates (band 0 holds every logit).
+            let range = hi - lo;
+            let mut counts = Array::<f32>::new(BANDS);
+            #[unroll]
+            for j in 0..BANDS {
+                counts[j] = 0.0;
+            }
+            let mut i = tid;
+            while i < n {
+                let v = logit(x, row, i);
+                let mut width = range;
+                #[unroll]
+                for j in 0..BANDS {
+                    counts[j] += select(v >= hi - width, 1.0f32, 0.0f32);
+                    width *= 0.5f32;
+                }
+                i += CUBE;
+            }
+            let mut floor = lo;
+            let mut held = f32::cast_from(n);
+            let mut width = range;
+            #[unroll]
+            for j in 0..BANDS {
+                let c = cube_sum(counts[j], &mut part);
+                if c >= f32::cast_from(top_k) {
+                    floor = hi - width;
+                    held = c;
+                }
+                width *= 0.5f32;
+            }
+            if held <= f32::cast_from(CAP) {
+                let mut vals = Shared::<[f32]>::new_slice(CAP);
+                let mut ids = Shared::<[u32]>::new_slice(CAP);
+                let mut offs = Shared::<[u32]>::new_slice(CUBE + 1);
+                // Each unit's share, an exclusive scan, then the writes.
+                let mut mine = u32::new(0);
+                let mut i = tid;
+                while i < n {
+                    mine += select(logit(x, row, i) >= floor, 1u32, 0u32);
+                    i += CUBE;
+                }
+                offs[tid] = mine;
+                sync_cube();
+                if tid == 0 {
+                    let mut acc = u32::new(0);
+                    for u in 0..CUBE {
+                        let c = offs[u];
+                        offs[u] = acc;
+                        acc += c;
+                    }
+                    offs[CUBE] = acc;
+                }
+                sync_cube();
+                let mut at = offs[tid] as usize;
+                let mut i = tid;
+                while i < n {
+                    let v = logit(x, row, i);
+                    if v >= floor {
+                        vals[at] = v;
+                        ids[at] = i as u32;
+                        at += 1;
+                    }
+                    i += CUBE;
+                }
+                let m = offs[CUBE] as usize;
+                sync_cube();
+                // The top-k cut over the candidates (it lies within them).
+                let mut a = key(floor);
+                let mut b = key(hi);
+                while a < b {
+                    let mid = a + (b - a + 1) / 2;
+                    let t = value(mid);
+                    let mut count = 0.0f32;
+                    let mut c = tid;
+                    while c < m {
+                        count += select(vals[c] >= t, 1.0f32, 0.0f32);
+                        c += CUBE;
+                    }
+                    if cube_sum(count, &mut part) >= f32::cast_from(top_k) {
+                        a = mid;
+                    } else {
+                        b = mid - 1;
+                    }
+                }
+                let mut cut = a;
+                // Top-p over the kept candidates.
+                if top_p < 1.0 {
+                    let kept_floor = value(cut);
+                    let mut mass = 0.0f32;
+                    let mut c = tid;
+                    while c < m {
+                        let v = vals[c];
+                        mass += select(v >= kept_floor, f32::exp((v - hi) / temperature), 0.0f32);
+                        c += CUBE;
+                    }
+                    let goal = cube_sum(mass, &mut part) * top_p;
+                    let mut a = cut;
+                    let mut b = key(hi);
+                    while a < b {
+                        let mid = a + (b - a + 1) / 2;
+                        let t = value(mid);
+                        let mut kept = 0.0f32;
+                        let mut c = tid;
+                        while c < m {
+                            let v = vals[c];
+                            kept += select(v >= t, f32::exp((v - hi) / temperature), 0.0f32);
+                            c += CUBE;
+                        }
+                        if cube_sum(kept, &mut part) >= goal {
+                            a = mid;
+                        } else {
+                            b = mid - 1;
+                        }
+                    }
+                    cut = a;
+                }
+                let kept_floor = value(cut);
+                let mut best = f32::new(-3.0e38f32);
+                let mut at = u32::new(0x7FFF_FFFF);
+                let mut c = tid;
+                while c < m {
+                    let v = vals[c];
+                    let id = ids[c];
+                    if v >= kept_floor {
+                        let h = mix(s0 ^ draw, s1, id);
+                        let u = (f32::cast_from(h >> 8) + 0.5f32) / 16_777_216.0f32;
+                        let score = v / temperature - f32::ln(-f32::ln(u));
+                        if score > best || (score == best && id < at) {
+                            best = score;
+                            at = id;
+                        }
+                    }
+                    c += CUBE;
+                }
+                pick_best(best, at, &mut part, out, row);
+                terminate!();
+            }
+        }
         // Top-k: the largest key `t` with at least `top_k` logits at or above it.
         let mut cut = key(lo);
         if top_k > 0 && (top_k as usize) < n {
@@ -188,10 +340,8 @@ mod kernel {
         }
         // Gumbel-max over the kept logits.
         let floor = value(cut);
-        let draw = u32::reinterpret(state[2]) + offset + row as u32;
-        let (s0, s1) = (u32::reinterpret(state[0]), u32::reinterpret(state[1]));
         let mut best = f32::new(-3.0e38f32);
-        let mut at = u32::new(0);
+        let mut at = u32::new(0x7FFF_FFFF);
         let mut i = tid;
         while i < n {
             let v = logit(x, row, i);
@@ -206,8 +356,13 @@ mod kernel {
             }
             i += CUBE;
         }
-        // The cube's best score; ties to the lowest id.
-        let top = cube_max(best, &mut part);
+        pick_best(best, at, &mut part, out, row);
+    }
+
+    /// Writes the id of the cube's best score to `out[row]`; ties to the lowest id.
+    #[cube]
+    fn pick_best(best: f32, at: u32, part: &mut Shared<[f32]>, out: &mut Tensor<i32>, row: usize) {
+        let top = cube_max(best, part);
         let mine = select(best == top, at, u32::new(0x7FFF_FFFF));
         let mut ids = Shared::<[u32]>::new_slice(PLANES);
         let m = plane_min(mine);
@@ -215,7 +370,7 @@ mod kernel {
             ids[(UNIT_POS / PLANE_DIM) as usize] = m;
         }
         sync_cube();
-        if tid == 0 {
+        if UNIT_POS == 0 {
             let mut pick = u32::new(0x7FFF_FFFF);
             for p in 0..PLANES {
                 pick = u32::min(pick, ids[p]);

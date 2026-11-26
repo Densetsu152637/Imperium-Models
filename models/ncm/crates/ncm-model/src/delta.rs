@@ -236,33 +236,29 @@ impl DeltaCache {
     }
 
     /// Copies of the state and convolution history, to put back with [`Self::restore`].
-    #[cfg(feature = "cuda")]
-    pub(crate) fn snapshot(&self) -> (Tensor<4>, Tensor<3>, usize) {
-        let copy4 = |t: &Tensor<4>| {
-            let c = Tensor::<4>::zeros(t.dims(), &t.device());
-            crate::kernels::assign_into(&c, t.clone(), 0, 0);
-            c
-        };
-        let copy3 = |t: &Tensor<3>| {
-            let c = Tensor::<3>::zeros(t.dims(), &t.device());
-            crate::kernels::assign_into(&c, t.clone(), 0, 0);
-            c
-        };
-        (copy4(&self.state), copy3(&self.conv), self.length)
+    pub fn snapshot(&self) -> (Tensor<4>, Tensor<3>, usize) {
+        (crate::cache::copy_of(&self.state), crate::cache::copy_of(&self.conv), self.length)
     }
 
-    /// Writes a [`Self::snapshot`] back into the state's own buffers.
-    #[cfg(feature = "cuda")]
-    pub(crate) fn restore(&mut self, snapshot: (Tensor<4>, Tensor<3>, usize)) {
-        crate::kernels::assign_into(&self.state, snapshot.0, 0, 0);
-        crate::kernels::assign_into(&self.conv, snapshot.1, 0, 0);
+    /// Puts a [`Self::snapshot`] back (into the state's own buffers on CUDA, where a captured
+    /// graph keeps reading them).
+    pub fn restore(&mut self, snapshot: (Tensor<4>, Tensor<3>, usize)) {
+        self.set(snapshot.0, snapshot.1);
         self.length = snapshot.2;
     }
 
+    /// Replaces the state and convolution history: written into the existing buffers on CUDA
+    /// with the fused kernels on, so that graphs captured against them stay valid.
+    fn set(&mut self, state: Tensor<4>, conv: Tensor<3>) {
+        crate::cache::store(&mut self.state, state);
+        crate::cache::store(&mut self.conv, conv);
+    }
+
+    /// Back to the empty state, in the existing buffers on CUDA (see [`Self::set`]).
     pub fn reset(&mut self) {
         let device = self.state.device();
-        self.state = Tensor::zeros(self.state.dims(), &device);
-        self.conv = Tensor::zeros(self.conv.dims(), &device);
+        let (state, conv) = (self.state.dims(), self.conv.dims());
+        self.set(Tensor::zeros(state, &device), Tensor::zeros(conv, &device));
         self.length = 0;
     }
 
@@ -427,8 +423,7 @@ impl GatedDeltaNet {
             delta_rule_chunked(q, k, v, g, beta, state, self.chunk)
         };
         if let Some(cache) = cache {
-            cache.state = state;
-            cache.conv = conv_state;
+            cache.set(state, conv_state);
             cache.length += t;
         }
         let out = self.norm.forward(out).swap_dims(1, 2).reshape([b, t, h * hd]);

@@ -2,8 +2,11 @@
 //!
 //! One [`Engine`] owns one model and one set of caches allocated at launch for the per-request
 //! context size. Requests run one at a time (batch size 1, like the decode-speed gate); each
-//! resets the caches, prefills its prompt and decodes until a stop token, the token limit, or the
-//! end of the context.
+//! prefills its prompt and decodes until a stop token, the token limit, or the end of the
+//! context. A prompt that extends the previous request's prompt restores the cache as it stood
+//! after that prompt and prefills only the rest (the NCM's left padding must then match: both
+//! prompts' lengths agree modulo `k`); any other prompt resets the caches. Resets and restores
+//! write into the caches' own buffers on CUDA, so the decode graphs are captured once and kept.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,6 +14,8 @@ use std::time::Instant;
 
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
+use ncm_model::cache::LayerSnapshot;
+use ncm_model::ncm::NcmSnapshot;
 use ncm_model::quant::{self, QuantError, QuantSpec};
 use ncm_model::weights::{self, WeightsError};
 use ncm_model::{Config, LayerCache, NcmCache, NcmLm, TokenLm, cache_bytes};
@@ -72,8 +77,11 @@ pub struct GenStats {
     /// Tokens produced in `decode_s` (the token baseline's first token comes from the prompt
     /// pass, so it is not counted here).
     pub decode_tokens: usize,
+    /// Prompt tokens served from the previous request's cache instead of being prefilled again
+    /// (prompt-prefix reuse); `prompt_s` covers the rest.
+    pub cached_tokens: usize,
     /// Seconds spent capturing the decode graph (outside `prompt_s` and `decode_s`; 0 when
-    /// none was captured).
+    /// none was captured: the engine keeps its graphs across requests).
     pub capture_s: f64,
     /// How the reply was decoded ([`DecodePath`]).
     pub path: DecodePath,
@@ -197,12 +205,78 @@ pub struct EngineOptions {
     /// head (CUDA only). The parallel verify pass rounds differently from step-by-step decoding,
     /// so in bf16 a near tie may go the other way: off by default.
     pub speculate: bool,
+    /// Keep the previous request's cache and prefill only the new part of a prompt that extends
+    /// the previous prompt (see [`Engine`]).
+    pub prefix_reuse: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
 enum State {
-    Tok { model: TokenLm, caches: Vec<LayerCache> },
-    Ncm { model: NcmLm, cache: NcmCache },
+    Tok { model: TokenLm, caches: Vec<LayerCache>, prefix: Option<TokPrefix>, graphs: TokGraphs },
+    Ncm { model: NcmLm, cache: NcmCache, prefix: Option<NcmPrefix>, graphs: NcmGraphs },
+}
+
+/// The previous request's prompt as the token baseline's cache held it right after prefill: a
+/// later prompt that extends it restores this and prefills only its new tokens.
+struct TokPrefix {
+    tokens: Vec<i32>,
+    snapshot: Vec<LayerSnapshot>,
+    /// The logits of the prompt's last position.
+    logits: Tensor<3>,
+}
+
+/// [`TokPrefix`] for the NCM: the padded prompt (whole concepts) and the condition of the next
+/// concept.
+struct NcmPrefix {
+    tokens: Vec<i32>,
+    snapshot: NcmSnapshot,
+    cond: Tensor<3>,
+}
+
+/// The token baseline's decode graphs, kept across requests (their caches keep their buffers).
+#[derive(Default)]
+struct TokGraphs {
+    #[cfg(feature = "cuda")]
+    greedy: ncm_model::tok::GraphedTok,
+    #[cfg(feature = "cuda")]
+    sampled: Option<ncm_model::tok::GraphedTok>,
+}
+
+/// The NCM's decode graphs, kept across requests.
+struct NcmGraphs {
+    #[cfg(feature = "cuda")]
+    greedy: ncm_model::ncm::GraphedStep,
+    #[cfg(feature = "cuda")]
+    sampled: Option<ncm_model::ncm::GraphedStep>,
+    #[cfg(feature = "cuda")]
+    append: ncm_model::ncm::GraphedAppend,
+    #[cfg(feature = "cuda")]
+    speculator: ncm_model::Speculator,
+}
+
+// Derivable only without CUDA, where the struct is empty.
+#[cfg_attr(not(feature = "cuda"), allow(clippy::derivable_impls))]
+impl Default for NcmGraphs {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "cuda")]
+            greedy: Default::default(),
+            #[cfg(feature = "cuda")]
+            sampled: None,
+            #[cfg(feature = "cuda")]
+            append: Default::default(),
+            #[cfg(feature = "cuda")]
+            speculator: ncm_model::Speculator::new(ncm_model::Acceptance::Verify),
+        }
+    }
+}
+
+/// Where a prompt's prefill starts: tokens already in the cache (restored from the previous
+/// request) and, when the whole prompt is, its stored output.
+enum Start<T> {
+    Fresh,
+    Partial(usize),
+    Whole(T),
 }
 
 pub struct Engine {
@@ -212,6 +286,7 @@ pub struct Engine {
     chunk: usize,
     /// Tokens the caches hold.
     capacity: usize,
+    prefix_reuse: bool,
     /// Read by the graphed paths (CUDA builds).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     speculate: bool,
@@ -276,6 +351,7 @@ impl Engine {
             prefill_chunk,
             quant,
             speculate,
+            prefix_reuse,
         } = options;
         if vocab.len() != config.vocab_size() {
             return Err(EngineError::VocabMismatch {
@@ -298,14 +374,17 @@ impl Engine {
                 let caches = model.make_cache(capacity, 1, &device);
                 // Counted on a dense model that is never initialised: a quantised one holds codes.
                 let params = TokenLm::new(cfg, &device).parts().total();
-                (State::Tok { model, caches }, params, "tok")
+                let state =
+                    State::Tok { model, caches, prefix: None, graphs: TokGraphs::default() };
+                (state, params, "tok")
             }
             Config::Ncm(cfg) => {
                 let build = || NcmLm::new(cfg, &device);
                 let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
                 let cache = model.make_cache(capacity, 1, &device);
                 let params = NcmLm::new(cfg, &device).parts().total();
-                (State::Ncm { model, cache }, params, "ncm")
+                let state = State::Ncm { model, cache, prefix: None, graphs: NcmGraphs::default() };
+                (state, params, "ncm")
             }
         };
         let info = ModelInfo {
@@ -324,6 +403,7 @@ impl Engine {
             device,
             chunk: prefill_chunk.max(unit),
             capacity,
+            prefix_reuse,
             speculate,
             state: Mutex::new(state),
         })
@@ -453,37 +533,77 @@ impl Backend for Engine {
         };
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *state {
-            State::Tok { model, caches } => {
-                self.generate_tok(model, caches, &request.prompt, &mut run)
+            State::Tok { model, caches, prefix, graphs } => {
+                self.generate_tok(model, caches, prefix, graphs, &request.prompt, &mut run)
             }
-            State::Ncm { model, cache } => {
-                self.generate_ncm(model, cache, &request.prompt, &mut run)
+            State::Ncm { model, cache, prefix, graphs } => {
+                self.generate_ncm(model, cache, prefix, graphs, &request.prompt, &mut run)
             }
         }
     }
 }
 
 impl Engine {
+    /// Where a prompt `ids` can start from the previous one `kept`: nothing (reset), the kept
+    /// tokens when `ids` extends them, or all of `ids` when they are the kept tokens.
+    fn start<T: Clone>(&self, ids: &[i32], kept: Option<(&[i32], &T)>) -> Start<T> {
+        match kept {
+            Some((tokens, out)) if self.prefix_reuse && ids.starts_with(tokens) => {
+                if ids.len() == tokens.len() {
+                    Start::Whole(out.clone())
+                } else {
+                    Start::Partial(tokens.len())
+                }
+            }
+            _ => Start::Fresh,
+        }
+    }
+
     fn generate_tok(
         &self,
         model: &TokenLm,
         caches: &mut [LayerCache],
+        prefix: &mut Option<TokPrefix>,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] graphs: &mut TokGraphs,
         prompt: &[u32],
         run: &mut Run<'_>,
     ) -> Result<GenStats, EngineError> {
-        for cache in caches.iter_mut() {
-            cache.reset();
-        }
         let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
         self.sync();
         let started = Instant::now();
-        let logits = model
-            .prefill(self.int_tensor(&ids), caches, self.chunk)
-            .ok_or(EngineError::EmptyPrompt)?;
+        let kept = prefix.as_ref().map(|p| (&p.tokens[..], &p.logits));
+        let (logits, cached) = match self.start(&ids, kept) {
+            Start::Whole(logits) => {
+                let p = prefix.as_ref().expect("a kept prompt");
+                caches.iter_mut().zip(&p.snapshot).for_each(|(c, s)| c.restore(s));
+                (logits, ids.len())
+            }
+            Start::Partial(n) => {
+                let p = prefix.as_ref().expect("a kept prompt");
+                caches.iter_mut().zip(&p.snapshot).for_each(|(c, s)| c.restore(s));
+                let rest = self.int_tensor(&ids[n..]);
+                let logits = model.prefill(rest, caches, self.chunk).expect("a longer prompt");
+                (logits, n)
+            }
+            Start::Fresh => {
+                caches.iter_mut().for_each(LayerCache::reset);
+                let logits = model
+                    .prefill(self.int_tensor(&ids), caches, self.chunk)
+                    .ok_or(EngineError::EmptyPrompt)?;
+                (logits, 0)
+            }
+        };
+        if self.prefix_reuse {
+            let snapshot = caches.iter().map(LayerCache::snapshot).collect();
+            *prefix = Some(TokPrefix { tokens: ids.clone(), snapshot, logits: logits.clone() });
+        }
         #[cfg(feature = "cuda")]
         if self.graphs() && run.constraint.is_none() {
+            self.sync();
             let prompt_s = started.elapsed().as_secs_f64();
-            return Ok(self.graphed_tok(model, caches, logits, prompt.len(), prompt_s, run));
+            let stats =
+                self.graphed_tok(model, caches, graphs, logits, prompt.len(), prompt_s, run);
+            return Ok(GenStats { cached_tokens: cached, ..stats });
         }
         let mut row = read_logits(&logits);
         let prompt_s = started.elapsed().as_secs_f64();
@@ -511,6 +631,7 @@ impl Engine {
             prompt_s,
             decode_s: decode_started.elapsed().as_secs_f64(),
             decode_tokens: run.emitted.saturating_sub(1),
+            cached_tokens: cached,
             capture_s: 0.0,
             path: DecodePath::Eager,
         })
@@ -520,26 +641,54 @@ impl Engine {
         &self,
         model: &NcmLm,
         cache: &mut NcmCache,
+        prefix: &mut Option<NcmPrefix>,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] graphs: &mut NcmGraphs,
         prompt: &[u32],
         run: &mut Run<'_>,
     ) -> Result<GenStats, EngineError> {
         let k = model.concept_size();
         let ids = run.ids;
-        cache.reset();
         // The prompt must be whole concepts: left-pad with `<|pad|>` so that it still ends
-        // exactly where the reply starts.
+        // exactly where the reply starts. A kept prompt is reused when this padded sequence
+        // extends it, so only when the two prompts' lengths agree modulo k (the padding then
+        // matches) and the new one starts with the old one.
         let pad = (k - prompt.len() % k) % k;
         let mut padded: Vec<i32> = vec![ids.pad as i32; pad];
         padded.extend(prompt.iter().map(|&t| t as i32));
         self.sync();
         let started = Instant::now();
-        let mut cond = model.prefill(self.int_tensor(&padded), cache, self.chunk);
+        let kept = prefix.as_ref().map(|p| (&p.tokens[..], &p.cond));
+        let (mut cond, cached) = match self.start(&padded, kept) {
+            Start::Whole(cond) => {
+                cache.restore(&prefix.as_ref().expect("a kept prompt").snapshot);
+                (cond, padded.len())
+            }
+            Start::Partial(n) => {
+                cache.restore(&prefix.as_ref().expect("a kept prompt").snapshot);
+                (model.prefill(self.int_tensor(&padded[n..]), cache, self.chunk), n)
+            }
+            Start::Fresh => {
+                cache.reset();
+                (model.prefill(self.int_tensor(&padded), cache, self.chunk), 0)
+            }
+        };
+        // Prompt tokens served from the cache, padding excluded.
+        let cached = cached.saturating_sub(pad).min(prompt.len());
+        if self.prefix_reuse {
+            let snapshot = cache.snapshot();
+            *prefix = Some(NcmPrefix { tokens: padded.clone(), snapshot, cond: cond.clone() });
+        }
         self.sync();
         let prompt_s = started.elapsed().as_secs_f64();
         #[cfg(feature = "cuda")]
         if self.graphs() && run.constraint.is_none() {
-            let stats = self.graphed_ncm(model, cache, cond, padded.len(), run);
-            return Ok(GenStats { prompt_tokens: prompt.len(), prompt_s, ..stats });
+            let stats = self.graphed_ncm(model, cache, graphs, cond, padded.len(), run);
+            return Ok(GenStats {
+                prompt_tokens: prompt.len(),
+                prompt_s,
+                cached_tokens: cached,
+                ..stats
+            });
         }
         let decode_started = Instant::now();
         let mut written = padded.len();
@@ -602,6 +751,7 @@ impl Engine {
             prompt_s,
             decode_s: decode_started.elapsed().as_secs_f64(),
             decode_tokens: run.emitted,
+            cached_tokens: cached,
             capture_s: 0.0,
             path: DecodePath::Eager,
         })
@@ -613,10 +763,12 @@ impl Engine {
 #[cfg(feature = "cuda")]
 impl Engine {
     /// The token baseline after its prompt pass (`logits` of the last prompt position).
+    #[allow(clippy::too_many_arguments)]
     fn graphed_tok(
         &self,
         model: &TokenLm,
         caches: &mut [LayerCache],
+        graphs: &mut TokGraphs,
         logits: Tensor<3>,
         prompt_tokens: usize,
         prompt_s: f64,
@@ -624,16 +776,25 @@ impl Engine {
     ) -> GenStats {
         use ncm_model::tok::GraphedTok;
         let sampled = !run.params.is_greedy();
-        let mut graphed = if sampled {
-            GraphedTok::sampled(&self.device, device_sampling(run.params))
+        let graphed = if sampled {
+            let settings = device_sampling(run.params);
+            let step =
+                graphs.sampled.get_or_insert_with(|| GraphedTok::sampled(&self.device, settings));
+            step.set_sampling(settings);
+            step
         } else {
-            GraphedTok::default()
+            &mut graphs.greedy
         };
         let mut token = graphed.first(logits);
+        let fresh = !graphed.is_captured();
         let capture_started = Instant::now();
         graphed.prepare(model, &token, caches);
         self.sync();
-        let capture_s = capture_started.elapsed().as_secs_f64();
+        let capture_s = if fresh && graphed.is_captured() {
+            capture_started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
         let decode_started = Instant::now();
         let mut written = prompt_tokens;
         let finish = loop {
@@ -656,6 +817,7 @@ impl Engine {
             prompt_s,
             decode_s: decode_started.elapsed().as_secs_f64(),
             decode_tokens: run.emitted.saturating_sub(1),
+            cached_tokens: 0,
             capture_s,
             path: if sampled { DecodePath::GraphedSampled } else { DecodePath::GraphedGreedy },
         }
@@ -670,29 +832,33 @@ impl Engine {
         &self,
         model: &NcmLm,
         cache: &mut NcmCache,
+        graphs: &mut NcmGraphs,
         cond: Tensor<3>,
         written: usize,
         run: &mut Run<'_>,
     ) -> GenStats {
-        use ncm_model::ncm::{GraphedAppend, GraphedStep};
-        use ncm_model::{Acceptance, Speculator};
+        use ncm_model::ncm::GraphedStep;
         let k = model.concept_size();
         let ids = run.ids;
         let sampled = !run.params.is_greedy();
         let speculate = !sampled && self.speculate && model.has_draft_head();
-        let mut step = if sampled {
-            GraphedStep::sampled(&self.device, device_sampling(run.params))
+        let NcmGraphs { greedy, sampled: sampled_step, append, speculator } = graphs;
+        let step = if sampled {
+            let settings = device_sampling(run.params);
+            let step =
+                sampled_step.get_or_insert_with(|| GraphedStep::sampled(&self.device, settings));
+            step.set_sampling(settings);
+            step
         } else {
-            GraphedStep::default()
+            greedy
         };
-        let mut speculator = Speculator::new(Acceptance::Verify);
-        let mut append = GraphedAppend::default();
         let mut tokens = if speculate {
             speculator.decode(model, cond, cache)
         } else {
             step.first(model, cond, cache)
         };
         let (mut capture_s, mut captured) = (0.0, false);
+        let fresh = !(if speculate { append.is_captured() } else { step.is_captured() });
         let decode_started = Instant::now();
         let mut written = written;
         let mut empty_concepts = 0;
@@ -735,7 +901,7 @@ impl Engine {
                 } else {
                     step.prepare(model, &input, cache)
                 };
-                if captured {
+                if captured && fresh {
                     self.sync();
                     capture_s = capture_started.elapsed().as_secs_f64();
                 }
@@ -760,6 +926,7 @@ impl Engine {
             prompt_s: 0.0,
             decode_s: (decode_started.elapsed().as_secs_f64() - capture_s).max(0.0),
             decode_tokens: run.emitted,
+            cached_tokens: 0,
             capture_s,
             path,
         }

@@ -15,6 +15,8 @@ pub mod delta;
 pub mod fused;
 pub(crate) mod graph;
 #[cfg(feature = "cuda")]
+pub(crate) mod inplace;
+#[cfg(feature = "cuda")]
 pub mod kernels;
 pub mod layers;
 pub mod ncm;

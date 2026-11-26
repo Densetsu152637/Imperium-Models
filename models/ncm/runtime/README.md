@@ -27,7 +27,7 @@ Imperium (`imperium-local`) starts `llama-server --model <path> --host 127.0.0.1
 | `GET /props` | `default_generation_settings.n_ctx` (per request), `total_slots`, plus an `ncm` object: arch, parameters, dtype, device, `cache_bytes`, tokens per pass. |
 | `POST /tokenize`, `/detokenize`, `/apply-template` | As above. |
 
-Not implemented: `stop` strings, penalties, `response_format`, images (`--mmproj` is ignored with a note), `/slots`, `/metrics`, an API key, prompt-cache reuse across requests (`cached_tokens` is always 0), several requests at once (`--parallel N` only divides the context; requests queue and run one at a time), `tool_choice` other than `none`/auto.
+Not implemented: `stop` strings, penalties, `response_format`, images (`--mmproj` is ignored with a note), `/slots`, `/metrics`, an API key, several requests at once (`--parallel N` only divides the context; requests queue and run one at a time), `tool_choice` other than `none`/auto.
 
 ## Decode paths
 
@@ -40,9 +40,11 @@ Every request resets the caches, prefills its prompt and decodes one of four way
 | `speculative` | `--speculate`, CUDA, an NCM with a draft head, greedy, unconstrained | Draft and verify passes per concept (`ncm_model::Speculator`, graphed), each written concept appended through `GraphedAppend`. Equal to plain greedy in f32; in bf16 a near tie of the two best logits may go the other way, hence off by default. |
 | `eager` | Tool-call constrained requests (the grammar runs on the host), the CPU, CUDA with graphs off | The host picks every token from the logits (`sampling.rs`). |
 
-The graph is captured once the step can serve it (the NCM's cross-attention ring full) and replayed for the rest of the request; each request captures anew, because resetting the caches replaces buffers a graph records (`NcmCache` epochs make a stale graph recapture rather than replay). Capture takes about 40 to 80 ms at the 250M size (the first request also compiles the kernels). Each step reads its token or concept back to stream it, and a concept cut by the end-of-concept token is padded on the host before it is appended, as on the eager path. Prompts are not reused across requests.
+Each graph is captured once, on the first request that can use it (for the NCM, once the cross-attention ring is full; about 40 to 80 ms at the 250M size, more on the very first request, which also compiles the kernels), and kept: resetting and restoring the caches writes into their own buffers on CUDA (DeltaNet states, attention rings, retrieval latents and 8-bit indexer keys), so later requests replay the same graph (`graph_capture_ms` 0). A kept NCM graph waits until a request's cross-attention ring is full again before it serves. Each step reads its token or concept back to stream it, and a concept cut by the end-of-concept token is padded on the host before it is appended, as on the eager path.
 
-Short runs on an RTX 5080 (random weights, bf16, a 2,048-byte chat prompt, 256 tokens streamed, `predicted_per_second` of the second and third requests): NCM v2 about 1,170 greedy and 930 sampled, with `--quant q4` about 1,600 and 1,150; token baseline v2 about 540 greedy and 470 sampled. `ncm-bench` at the same settings: 1,244, 1,588 and 564 greedy.
+**Prompt-prefix reuse** (on by default, `--no-prefix-reuse` turns it off). After a prompt's prefill the engine keeps a snapshot of the cache (DeltaNet states and attention rings copied; append-only storage only remembers its length) and the prompt's output. A request whose prompt starts with the previous prompt restores the snapshot and prefills only the new tokens; the same prompt again prefills nothing. Agent loops hit this when the next turn appends the reply and a new message to the previous prompt. The NCM pads a prompt on the left to whole concepts, so it reuses a prefix only when the two prompts' lengths agree modulo `k` (one turn in four on average); the token baseline reuses any extension. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` count the reused prompt tokens, `timings.prompt_n` the prefilled ones. Short runs (RTX 5080, bf16, a 2k-token chat prompt extended by about 220 tokens, warm): prefill 17 ms with reuse against 49 ms without for the NCM v2, 45 against 103 ms for the token baseline v2.
+
+Short runs on an RTX 5080 (random weights, bf16, a 2,048-byte chat prompt, 256 tokens streamed, `predicted_per_second` of later requests): NCM v2 about 1,230 greedy and 1,080 sampled, with `--quant q4` about 1,430 and 1,400; token baseline v2 about 515 greedy and 495 sampled. `ncm-bench` measured 1,244, 1,588 and 564 greedy on the same card earlier.
 
 ## Command line
 
@@ -108,7 +110,7 @@ The hook is `constrain::Constraint`: `allows(token)` is asked for the candidates
 
 ## Out of scope for now
 
-Quantised weights and cache (`--cache-type-k q8_0` warns), batching or concurrent requests, prompt-cache reuse, parity tests against the training model (they need trained weights), and the 1M-context check (a launch option; the plan checks it separately).
+Quantised weights and cache (`--cache-type-k q8_0` warns), batching or concurrent requests, prompt reuse beyond the previous request's prompt, parity tests against the training model (they need trained weights), and the 1M-context check (a launch option; the plan checks it separately).
 
 ## Tests
 

@@ -205,6 +205,12 @@ impl GraphedTok {
         Self { sampler: Some((params, settings)), ..Default::default() }
     }
 
+    /// New settings for a sampled step (a new request); the captured graph keeps serving.
+    /// Panics on a greedy step.
+    pub fn set_sampling(&mut self, settings: crate::sample::SampleSettings) {
+        self.sampler.as_mut().expect("a sampled step").1 = settings;
+    }
+
     /// The token `[B, 1]` picked from `logits` `[B, 1, V]` (the prompt's last position) like
     /// every step picks: argmax, or the device sampler, advancing its counter.
     pub fn first(&mut self, logits: Tensor<3>) -> Tensor<2, Int> {

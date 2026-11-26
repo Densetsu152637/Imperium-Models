@@ -52,6 +52,7 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
         seed: 3,
         prefill_chunk: 16,
         speculate: false,
+        prefix_reuse: true,
         quant: None,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
@@ -133,6 +134,7 @@ impl Backend for Scripted {
             prompt_s: 0.002,
             decode_s: 0.004,
             decode_tokens: sent,
+            cached_tokens: 0,
             capture_s: 0.0,
             path: ncm_server::engine::DecodePath::Eager,
         })

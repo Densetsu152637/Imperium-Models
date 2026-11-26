@@ -140,6 +140,7 @@ fn contexts_too_small_for_the_model_are_refused() {
         seed: 0,
         prefill_chunk: 16,
         speculate: false,
+        prefix_reuse: true,
         quant: None,
     };
     assert!(matches!(
@@ -285,6 +286,7 @@ fn quantised_engines_load_dense_and_quantised_weight_files() {
             seed: 0,
             prefill_chunk: 16,
             speculate: false,
+            prefix_reuse: true,
             quant,
         };
         // Quantising a dense file at load and loading the quantised file give the same model.
@@ -301,4 +303,61 @@ fn quantised_engines_load_dense_and_quantised_weight_files() {
             Err(EngineError::QuantMismatch { .. })
         ));
     }
+}
+
+/// An engine of `config` that reuses prompt prefixes (`reuse`) or prefills every prompt anew.
+fn engine_with_reuse(config: ncm_model::Config, reuse: bool) -> Engine {
+    let options = ncm_server::engine::EngineOptions {
+        config,
+        ctx: 256,
+        device: ncm_server::engine::make_device(
+            ncm_server::engine::DeviceChoice::Cpu,
+            burn::tensor::FloatDType::F32,
+        )
+        .unwrap(),
+        device_name: "cpu".into(),
+        dtype: burn::tensor::FloatDType::F32,
+        weights: None,
+        seed: 3,
+        prefill_chunk: 16,
+        quant: None,
+        speculate: false,
+        prefix_reuse: reuse,
+    };
+    Engine::new(options, vocab()).unwrap()
+}
+
+/// One engine throughout: tests run in parallel and seed the shared CPU generator, so two
+/// engines of one config need not hold the same random weights.
+#[test]
+fn a_prompt_extending_the_last_one_reuses_its_prefix_and_decodes_the_same() {
+    let configs =
+        [tiny_tok_config(), tiny_tok_v2_config(), tiny_ncm_config(), tiny_ncm_v2_config()];
+    for config in configs {
+        let engine = engine_with_reuse(config.clone(), true);
+        // 40 and 56 tokens: the same length modulo the NCM's k, so its padding matches.
+        let first = prompt("the first turn of a conversation, forty.");
+        let mut second = first.clone();
+        second.extend(prompt(" and a follow-up"));
+        assert_eq!((first.len(), second.len() % 4), (40, first.len() % 4));
+        let greedy = SamplingParams::GREEDY;
+        run(&engine, request(first.clone(), 12, greedy));
+        let (extended, stats) = run(&engine, request(second.clone(), 12, greedy));
+        assert_eq!(stats.cached_tokens, first.len(), "{config:?}: the prefix is reused");
+        // The same prompt again: nothing to prefill.
+        let (again, stats) = run(&engine, request(second.clone(), 12, greedy));
+        assert_eq!(stats.cached_tokens, second.len());
+        // A prompt that does not extend the last one starts afresh: the full prefill.
+        let (_, stats) = run(&engine, request(prompt("something else"), 4, greedy));
+        assert_eq!(stats.cached_tokens, 0);
+        let (want, stats) = run(&engine, request(second.clone(), 12, greedy));
+        assert_eq!(stats.cached_tokens, 0);
+        assert_eq!(extended, want, "{config:?}: prefix reuse changes the reply");
+        assert_eq!(again, want, "{config:?}: a whole-prompt hit changes the reply");
+    }
+    // Turned off, nothing is reused.
+    let engine = engine_with_reuse(tiny_ncm_config(), false);
+    run(&engine, request(prompt("abcd"), 4, SamplingParams::GREEDY));
+    let (_, stats) = run(&engine, request(prompt("abcdefgh"), 4, SamplingParams::GREEDY));
+    assert_eq!(stats.cached_tokens, 0);
 }
