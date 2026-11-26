@@ -1,6 +1,6 @@
 # Plan: CPU offload for the NCM runtime
 
-Revision: 2026-11-26, written against `b1f20c6` (feat/ncm-review-fixes tip), last updated 2026-11-26 (rev 2: plan-gate review of `9eb3b68`). Nothing in it is implemented or measured yet. Every number marked *est.* is an estimate.
+Revision: 2026-11-26, written against `b1f20c6` (feat/ncm-review-fixes tip), last updated 2026-11-26 (rev 2: plan-gate review of `9eb3b68`; rev 3: footprint types and Stage 1/5 ordering aligned with docs/plans/npu.md). Nothing in it is implemented or measured yet. Every number marked *est.* is an estimate.
 
 > **Note, 2026-11-26: NCM numbers are provisional.** The user chose a hybrid NCM. The 4-token local decoder is replaced by the Stanford NCM paper's coarse-to-fine parallel decoder over blocks of about 32–64 tokens, and the backbone runs once per block. The design is in progress in `Imperium-Research/docs/next-concept-modelling/architecture.md`.
 >
@@ -231,7 +231,9 @@ Rejected: running host layers on burn-flex.
 - per backbone layer: weights `Device` or `Streamed`;
 - per retrieval cache: `Resident` or `Tiered`;
 - the prefill chunk;
-- a `Footprint` broken down by tier (device / pinned host) and by part.
+- a `Footprint` broken down by tier and by part.
+
+The footprint types (`Footprint`, `Tier`, `Part`, `FootprintRequest` with `tokens_per_position`, and `Placement`) live in the Burn-free `ncm-exec` crate, which the NPU backend-interface plan (`docs/plans/npu.md`, decision 2) creates in its Stage 1a. The tiers are `Device`, `PinnedHost`, `SystemRam` and `NpuCompileCache`. `ncm-model` depends on `ncm-exec` unconditionally, and the planner itself stays in `ncm_model::placement`.
 
 How `--fit` (default `on`) chooses:
 1. Everything resident, if it fits under `free VRAM − --fit-target` (MiB, default 1024).
@@ -292,7 +294,7 @@ New flags:
 - **Single engine thread.**
   - Placement, pinned allocation (at `Core` construction) and spills all run on `ncm-engine`, so no new OS threads are added.
   - Pinning 11 GiB is expected to take about 1–3 s at launch *est.*; it is logged.
-- **Footprint reporting.** `--print-footprint` and the start-up line print device bytes, pinned-host bytes and the placement, from the same `placement::Footprint` the planner uses, so the report and the allocation cannot disagree.
+- **Footprint reporting.** `--print-footprint` and the start-up line print device bytes, pinned-host bytes and the placement, from the same `ncm_exec::Footprint` the planner returns, so the report and the allocation cannot disagree.
 - **Backend-agnostic.**
   - Placement and footprint carry no backend types.
   - The cold store sits behind a `ColdStore` trait with three implementations:
@@ -370,11 +372,11 @@ New flags:
 
 ## Stage 1: Placement model, footprint and flags (no behaviour change)
 - **Objective:**
-  - Add `placement.rs`: `Placement`, `Footprint` (device / host by part), the planner from the decision record, and RAM and VRAM inputs passed in as plain numbers.
+  - Add `placement.rs`: the planner from the decision record. It fills the `ncm_exec` `Placement` and `Footprint` types created by NPU Stage 1a, and takes RAM and VRAM inputs as plain numbers.
   - Parse `-ngl` (N / `all` / `auto` / 999), `--fit`, `--fit-target`, `--cache-offload`, `-nkvo` and `--vram-budget`, and normalise `-fit` and `-fitt`.
   - Extend `--print-footprint` with the tier breakdown.
   - With an offload decision not yet backed by code, print the plan and fall back to resident with a warning.
-- **Depends on:** stage 0. It does not wait for the block decoder: `tokens_per_position` keeps the planner shape-agnostic. The queued `--print-footprint` should merge first or be folded in here.
+- **Depends on:** stage 0 and NPU plan Stage 1a, which creates `ncm-exec`. This stage runs before NPU Stage 1b, which owns `engine.rs` after it. It does not wait for the block decoder: `tokens_per_position` keeps the planner shape-agnostic. The queued `--print-footprint` should merge first or be folded in here.
 - **Owned paths:**
   - `crates/ncm-model/src/{placement.rs, lib.rs}`
   - `crates/ncm-model/src/ncm.rs` (`ncm_cache_bytes`) and `tok.rs`: per-tier splits
@@ -473,13 +475,15 @@ New flags:
 
 ## Stage 5: Automatic fit at launch
 - **Objective:**
-  - Wire the planner into `engine.rs` `Core` construction: query free VRAM and RAM, apply `--fit`, `--fit-target` and `--vram-budget`, allocate per `Placement`, and log the decision.
+  - Wire the planner into `BurnBackend` construction (`crates/ncm-model/src/exec.rs`, created by NPU Stage 1b): query free VRAM and RAM, apply `--fit`, `--fit-target` and `--vram-budget`, allocate per `Placement`, and log the decision.
+  - `engine.rs` only passes the flags through.
   - Replace the estimated constants for prefill transients and the CUDA context with measured ones.
   - Document the flags in `runtime/README.md`.
-- **Depends on:** stages 3 and 4. Cases b and c below need only the token-baseline path; case a waits for stage 0b.
+- **Depends on:** stages 3 and 4, and NPU plan Stage 1b. Cases b and c below need only the token-baseline path; case a waits for stage 0b.
 - **Owned paths:**
-  - `runtime/src/{engine.rs, cli.rs, app.rs, server.rs (props/footprint in health, if exposed)}`
-  - `runtime/README.md`, `crates/ncm-model/src/placement.rs`
+  - `crates/ncm-model/src/{exec.rs (BurnBackend construction), placement.rs}`
+  - `runtime/src/{cli.rs, app.rs, server.rs (props/footprint in health, if exposed)}`; `engine.rs` gets flag pass-through only, coordinated with the NPU plan, which owns `engine.rs`
+  - `runtime/README.md`
 - **Acceptance checks:**
   - End to end, the server starts, picks tiering, and its completions match a resident run of the same model on a short prompt, in each case below. All use `--random-weights` and `--fit-target 512`. Command: `cargo test -p ncm-server --features cuda --test offload_e2e`.
 
