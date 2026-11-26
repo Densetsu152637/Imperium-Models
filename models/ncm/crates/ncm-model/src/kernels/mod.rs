@@ -1333,3 +1333,56 @@ pub fn qmatmul(
     );
     x.matmul(Tensor::from_dispatch(w))
 }
+
+/// Version directory of the on-disk kernel cache: the crate version, the CubeCL release and a
+/// hash of this crate's sources (cached kernels are keyed by name and launch settings, not by
+/// their code, so another build's cache must never be read).
+pub fn kernel_cache_version() -> String {
+    format!("ncm-{}-cubecl-0.11.4-{}", env!("CARGO_PKG_VERSION"), env!("NCM_SOURCE_HASH"))
+}
+
+/// The default root of the on-disk kernel cache: the user's cache directory (`LOCALAPPDATA` on
+/// Windows, `XDG_CACHE_HOME` or `~/.cache` elsewhere), under `ncm/kernels`.
+pub fn default_kernel_cache_root() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))?;
+    Some(base.join("ncm").join("kernels"))
+}
+
+/// Keeps compiled CUDA kernels on disk across processes, under `root` (default
+/// [`default_kernel_cache_root`]) in a directory for this build ([`kernel_cache_version`]), so
+/// a second process skips CubeCL's code generation for every kernel the first one compiled.
+/// Call it before the first CUDA device is used: CubeCL's configuration is set once per process,
+/// so after that (or after an earlier call) it does nothing. Returns the cache directory when it
+/// took effect.
+pub fn enable_kernel_cache(root: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    use burn_cubecl::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig, cache::CacheConfig};
+    let dir = root.or_else(default_kernel_cache_root)?.join(kernel_cache_version());
+    std::fs::create_dir_all(&dir).ok()?;
+    // Whatever cubecl.toml and the CUBECL_* variables say, with the cache turned on there.
+    let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
+    config.compilation.cache = true;
+    config.environment.path = CacheConfig::Directory(dir.clone());
+    CubeClRuntimeConfig::try_set(config).then_some(dir)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    #[test]
+    fn kernel_cache_version_names_this_build() {
+        let version = super::kernel_cache_version();
+        assert!(version.starts_with(&format!("ncm-{}-cubecl-0.11.4-", env!("CARGO_PKG_VERSION"))));
+        let hash = version.rsplit('-').next().expect("a hash");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn default_kernel_cache_root_is_under_ncm_kernels() {
+        if let Some(root) = super::default_kernel_cache_root() {
+            assert!(root.ends_with(std::path::Path::new("ncm").join("kernels")));
+        }
+    }
+}
