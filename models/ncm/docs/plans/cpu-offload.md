@@ -55,7 +55,8 @@ Goals (each one passes or fails):
   - shape-stable prefill, the persistent compile cache and top-k select (touch `cache.rs`, `layers.rs` attention and `retrieval.rs`);
   - the fused norm/GEMV/MLP work (touches `kernels/gemv.rs`, `kernels/quant.rs`, `kernels/norm.rs` and the `layers.rs` MLP).
 
-  The hybrid NCM block decoder has also landed (see the note above). Stage 0 rebases this plan's paths and numbers onto the result.
+  Stage 0 rebases this plan's paths onto the result.
+- Only the NCM-specific work waits for the hybrid NCM block decoder (see the note above); Stage 0b re-derives those items once it lands. Stage 1 and the token-baseline path of Stages 2–5 depend only on the optimisation branches and Stage 0a.
 - Burn 0.22.1 with burn-cuda/cubecl 0.11.4. A CUDA build sits on a PCIe 4.0 or 5.0 x16 link.
 - Effective bandwidth over PCIe *est.*:
   - PCIe 5.0 x16: about 40 GB/s for zero-copy kernel reads and about 50 GB/s for pinned memcpy.
@@ -334,23 +335,38 @@ New flags:
 - **Outcome:**
 - **Handoff notes:** picks the fallback order in Risks. It also fixes the decode path that Stages 2 and 3 build.
 
-## Stage 0: Rebase onto the landed optimisation round and block decoder
-- **Objective:**
-  - Confirm that the optimisation branches and the hybrid NCM block decoder have merged.
-  - Update this plan's owned paths, kernel names and speed baselines to what landed.
-  - Re-derive the provisional NCM numbers, including the goal 4 threshold and the Stage 4 versus Stage 6 order for the NCM.
-- **Depends on:** the optimisation branches being merged to `main`; the block decoder having landed.
+## Stage 0: Rebase onto the landed optimisation round
+- **Objective:** confirm that the optimisation branches have merged, then update this plan's owned paths, kernel names and token-baseline speed baselines to what landed.
+- **Depends on:** the optimisation branches being merged to `main`.
 - **Owned paths:** `models/ncm/docs/plans/cpu-offload.md`
 - **Acceptance checks:**
   - Every path and kernel named below exists on `main`: `rg -n "ret_attend_kernel|ret_prefill_attend_kernel|LatentCache" models/ncm/crates`.
-  - The baselines are re-recorded from `ncm-bench --model ncm --design v2 --context 2048 131072`.
-  - The note at the top is replaced by settled NCM numbers.
+  - The token-baseline speed baselines are re-recorded with `ncm-bench --model tok --design v2 --context 2048 131072`.
 - **Status:** pending
 - **Outcome:**
 - **Handoff notes:**
-  - No code.
+  - Docs only.
   - If top-k select moved out of `kernels/retrieval.rs`, re-point Stage 3.
-  - Settle which stage owns `GraphedStep` and `speculative.rs` after the decoder change.
+
+## Stage 0b: Re-derive the NCM numbers after the block decoder
+- **Objective:** once the hybrid NCM block decoder has landed, re-derive every NCM-specific number and ownership item, then replace the provisional note at the top with the settled values. The items to re-derive:
+  - NCM cache sizes at 1M tokens, and whether the NCM needs tiering at all;
+  - the token thresholds where retrieval traffic starts and goes flat;
+  - goal 1's NCM bound, and goal 4's threshold (35 GB/s at the current shape);
+  - the NCM estimates in Stage 3, the NCM prefill estimate in Stage 4's handoff, and Stage 6's per-token cost;
+  - Stage 5's budget table, especially case a: at 16k–32k backbone positions the NCM at 1M may fit resident in 3 GiB and stop exercising tiering, in which case raise the context or lower the budget;
+  - which stage owns `GraphedStep` and `speculative.rs`;
+  - for the NCM, whether Stage 6 comes before Stage 4.
+- **Depends on:** stage 0; the block decoder having landed.
+- **Owned paths:** `models/ncm/docs/plans/cpu-offload.md`
+- **Acceptance checks:**
+  - The NCM speed baselines are re-recorded with `ncm-bench --model ncm --design v2 --context 2048 131072`.
+  - No NCM number in the plan is still marked provisional.
+- **Status:** pending
+- **Outcome:**
+- **Handoff notes:**
+  - Docs only.
+  - The NCM-specific parts of Stages 3–6 wait for this stage; the token-baseline parts do not.
 
 ## Stage 1: Placement model, footprint and flags (no behaviour change)
 - **Objective:**
@@ -358,7 +374,7 @@ New flags:
   - Parse `-ngl` (N / `all` / `auto` / 999), `--fit`, `--fit-target`, `--cache-offload`, `-nkvo` and `--vram-budget`, and normalise `-fit` and `-fitt`.
   - Extend `--print-footprint` with the tier breakdown.
   - With an offload decision not yet backed by code, print the plan and fall back to resident with a warning.
-- **Depends on:** stage 0. The queued `--print-footprint` should merge first or be folded in here.
+- **Depends on:** stage 0. It does not wait for the block decoder: `tokens_per_position` keeps the planner shape-agnostic. The queued `--print-footprint` should merge first or be folded in here.
 - **Owned paths:**
   - `crates/ncm-model/src/{placement.rs, lib.rs}`
   - `crates/ncm-model/src/ncm.rs` (`ncm_cache_bytes`) and `tok.rs`: per-tier splits
@@ -402,7 +418,7 @@ New flags:
   - Teach `ret_attend_kernel` to read selected cold blocks through the cold binding and the window from the ring.
   - Make the reference path (`attend_selected`) do the same, so CPU tests cover the logic with the `Resident` store.
   - Apply all of this to the NCM backbone and the token baseline (shared `LatentCache`) and to `GraphedStep`/`GraphedTok`.
-- **Depends on:** stage 2.
+- **Depends on:** stage 2. The NCM `GraphedStep` part also waits for stage 0b.
 - **Owned paths:** `crates/ncm-model/src/`:
   - `retrieval.rs`, `kernels/retrieval.rs` (prep, attend)
   - `cache.rs` (`LayerCache` snapshot/restore)
@@ -429,7 +445,7 @@ New flags:
   5. after the chunk, spill the blocks completed inside it from staging to the cold store, and copy the last 1,088 positions back into the ring.
 
   On slab overflow, split the query chunk.
-- **Depends on:** stage 3.
+- **Depends on:** stage 3. NCM numbers wait for stage 0b.
 - **Owned paths:**
   - `crates/ncm-model/src/{retrieval.rs (prefill), kernels/retrieval.rs (prep target, select, prefill attend, new union/gather kernels)}`
   - `crates/ncm-model/src/cache.rs` (staging buffer in `LatentCache`)
@@ -443,11 +459,16 @@ New flags:
 
     Command: `cargo test -p ncm-model --features cuda --test offload prefill`.
   - The footprint of staging plus slab matches the allocated bytes: `cargo test -p ncm-model --features cuda --test offload prefill_footprint`.
-  - The 1M-token token-baseline prefill completes under a 6 GiB `--vram-budget`, and the time is recorded: `ncm-bench --model tok --design v2 --context 1048576 --vram-budget 6144`.
+  - The 1M-token token-baseline prefill completes under a 6 GiB `--vram-budget`, and both the time and the number of union-overflow sub-chunks are logged: `ncm-bench --model tok --design v2 --context 1048576 --vram-budget 6144`.
 - **Status:** pending
 - **Outcome:**
 - **Handoff notes:**
-  - Worst-case PCIe traffic for a full 1M prefill *est.*: NCM 144 GB, about 3 s; token baseline about 700 GB, about 14 s at 50 GB/s. The union is usually far smaller.
+  - Worst-case PCIe traffic for a full 1M prefill *est.*:
+    - NCM: 144 GB, about 3 s. Provisional: Stage 0b re-derives it.
+    - Token baseline: about 700 GB, about 14 s at 50 GB/s.
+  - Both estimates hold only when the slab is close to the union size, so that each block crosses PCIe once per chunk and layer.
+  - With the minimum 1,024-block slab, an overflowing union splits the chunk into sub-chunks, and blocks shared between sub-chunks cross PCIe again. That is why the 1M test logs the sub-chunk count.
+  - The union is usually far smaller than the worst case.
   - The same slab-and-remap variant is what a wgpu `StagedHost` would use.
 
 ## Stage 5: Automatic fit at launch
@@ -455,7 +476,7 @@ New flags:
   - Wire the planner into `engine.rs` `Core` construction: query free VRAM and RAM, apply `--fit`, `--fit-target` and `--vram-budget`, allocate per `Placement`, and log the decision.
   - Replace the estimated constants for prefill transients and the CUDA context with measured ones.
   - Document the flags in `runtime/README.md`.
-- **Depends on:** stages 3 and 4.
+- **Depends on:** stages 3 and 4. Cases b and c below need only the token-baseline path; case a waits for stage 0b.
 - **Owned paths:**
   - `runtime/src/{engine.rs, cli.rs, app.rs, server.rs (props/footprint in health, if exposed)}`
   - `runtime/README.md`, `crates/ncm-model/src/placement.rs`
@@ -481,7 +502,7 @@ New flags:
   - In decode, the fused GEMV and quant GEMV kernels read those weights zero-copy.
   - In prefill, each layer is copied into a double-buffered device slab ahead of its GEMMs.
   - The planner's step 4 is enabled. Only backbone layers are streamed; the encoder, decoder, draft and head stay on the device.
-- **Depends on:** stage 5; the fused GEMV work landed.
+- **Depends on:** stage 5; the fused GEMV work landed; stage 0b, for the NCM order and estimates.
 - **Owned paths:** `crates/ncm-model/src/`:
   - `quant/linear.rs` (`QLinear` storage tier), `kernels/{gemv.rs, quant.rs}`
   - `layers.rs` (`Stack` placement), `delta.rs` (projections only), `weights.rs`/`quant/convert.rs` (load into host buffers)
