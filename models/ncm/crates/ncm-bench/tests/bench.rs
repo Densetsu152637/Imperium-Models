@@ -219,3 +219,34 @@ fn train_memory_estimates_every_model() {
         assert!(models[i + 3]["params"].as_f64() > models[i]["params"].as_f64());
     }
 }
+
+/// The latency model reproduces the plan's checks: the 250M token baseline about 724 tok/s and
+/// the k = 4 NCM about 1,450 in bf16 at 2k; hybrid speed rises with acceptance, and its
+/// autoregressive path alone sits between full rejection and full acceptance.
+#[test]
+fn predict_matches_the_plans_checks() {
+    use ncm_bench::predict::{PredictCli, run};
+    let cli = PredictCli::parse_from(["predict", "--size", "250m", "--context", "2048"]);
+    let rows = run(&cli)["rows"].as_array().unwrap().clone();
+    let rate = |format: &str, model: &str| {
+        rows.iter()
+            .find(|r| r["format"] == format && r["model"] == model)
+            .and_then(|r| r["tok_s"].as_f64())
+            .unwrap_or_else(|| panic!("{format} {model}"))
+    };
+    let tok = rate("bf16", "token baseline");
+    assert!((tok / 724.0 - 1.0).abs() < 0.05, "token baseline {tok}");
+    let ncm = rate("bf16", "ncm k=4");
+    assert!((ncm / 1449.0 - 1.0).abs() < 0.1, "k = 4 {ncm}");
+    let (full, p95, zero) = (
+        rate("bf16", "hybrid, p = 1"),
+        rate("bf16", "hybrid, p = 0.95"),
+        rate("bf16", "hybrid, p = 0"),
+    );
+    let ar = rate("bf16", "hybrid, AR path only");
+    assert!(full > p95 && p95 > zero);
+    assert!(full > ar && ar > zero);
+    // Quantised weights read fewer bytes.
+    assert!(rate("q4", "token baseline") > rate("q8", "token baseline"));
+    assert!(rate("q8", "token baseline") > tok);
+}
