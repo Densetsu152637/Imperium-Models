@@ -384,7 +384,7 @@ impl Samplers {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn set(&self, settings: &DrawSettings) {
         #[cfg(feature = "cuda")]
-        {
+        if crate::fused::active(&self.tokens.device()) {
             for (p, s) in self.codes.iter().zip(&settings.codes) {
                 if !s.is_empty() {
                     p.set_rows(s);
@@ -640,8 +640,9 @@ fn ar_pass(
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 fn pick_tokens(logp: Tensor<3>, sampled: bool, samplers: &Samplers) -> Tensor<2, Int> {
     let [b, l, v] = logp.dims();
+    // The device sampler is a CUDA kernel: other devices (a CUDA build on the CPU) argmax.
     #[cfg(feature = "cuda")]
-    if sampled {
+    if sampled && crate::fused::active(&logp.device()) {
         return crate::sample::sample(logp.reshape([b * l, v]), &samplers.tokens, 0)
             .reshape([b, l]);
     }
@@ -653,7 +654,7 @@ fn pick_tokens(logp: Tensor<3>, sampled: bool, samplers: &Samplers) -> Tensor<2,
 fn pick_codes(k: usize, logits: Tensor<3>, mode: PassMode, samplers: &Samplers) -> Tensor<2, Int> {
     let [b, n, e] = logits.dims();
     #[cfg(feature = "cuda")]
-    if mode.sampled_codes() {
+    if mode.sampled_codes() && crate::fused::active(&logits.device()) {
         return crate::sample::sample(logits.reshape([b * n, e]), &samplers.codes[k], 0)
             .reshape([b, n]);
     }

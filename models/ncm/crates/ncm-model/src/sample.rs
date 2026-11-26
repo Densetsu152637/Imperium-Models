@@ -482,6 +482,11 @@ impl SampleParams {
         Self { params, state }
     }
 
+    /// The device the buffers live on.
+    pub fn device(&self) -> burn::tensor::Device {
+        self.params.device()
+    }
+
     /// Copies one settings set per row into [`Self::rows`]' buffers (in place). A greedy row
     /// takes `top_k` 1.
     pub fn set_rows(&self, settings: &[SampleSettings]) {
