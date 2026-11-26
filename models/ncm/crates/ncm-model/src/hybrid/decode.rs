@@ -135,22 +135,22 @@ pub struct BlockOut {
 /// encoder states of the recent tokens and the open block, the backbone inputs of every block
 /// (for retrieval) and the condition of the open block.
 pub struct HybridSession {
-    tokens: Vec<i32>,
+    pub(crate) tokens: Vec<i32>,
     encoder: Vec<LayerCache>,
     backbone: Vec<LayerCache>,
     /// Encoder states `[1, n, d]` of tokens `states_start..tokens.len()` minus any not yet
     /// encoded (see `encoded`).
     states: Option<Tensor<3>>,
-    states_start: usize,
+    pub(crate) states_start: usize,
     /// Tokens the encoder has consumed.
-    encoded: usize,
-    pooled: Vec<Vec<f32>>,
+    pub(crate) encoded: usize,
+    pub(crate) pooled: Vec<Vec<f32>>,
     cond: Tensor<3>,
     blocks: usize,
-    rng: u64,
+    pub(crate) rng: u64,
     /// Verified mode carried across blocks after a switch token; ends with the block in which a
     /// switch-off token appears.
-    verified_span: bool,
+    pub(crate) verified_span: bool,
     device: Device,
 }
 
@@ -206,7 +206,7 @@ impl HybridSession {
     }
 
     /// Encodes the tokens not yet encoded, in pieces of [`ENCODER_CHUNK`].
-    fn encode_pending(&mut self, model: &HybridLm) {
+    pub(crate) fn encode_pending(&mut self, model: &HybridLm) {
         while self.encoded < self.tokens.len() {
             let len = ENCODER_CHUNK.min(self.tokens.len() - self.encoded);
             let ids = self.tokens[self.encoded..self.encoded + len].to_vec();
@@ -222,7 +222,7 @@ impl HybridSession {
 
     /// Backbone steps for every complete block, then drops states older than the next block's
     /// recent window.
-    fn step_complete_blocks(&mut self, model: &HybridLm) {
+    pub(crate) fn step_complete_blocks(&mut self, model: &HybridLm) {
         let l = model.config().block;
         let complete = self.encoded / l;
         if complete > self.blocks {
@@ -247,7 +247,7 @@ impl HybridSession {
         }
     }
 
-    fn uniform(&mut self) -> f64 {
+    pub(crate) fn uniform(&mut self) -> f64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
@@ -262,7 +262,7 @@ impl HybridSession {
         fixed: &[i32],
     ) -> (Memory, Vec<LayerKv>, Memory, Vec<LayerKv>) {
         let h = model.config();
-        let (l, d) = (h.block, model.local_dim);
+        let l = h.block;
         let start = self.blocks * l;
         let lo = start.saturating_sub(h.recent).max(self.states_start);
         let seq = self.states(lo, start);
@@ -276,26 +276,8 @@ impl HybridSession {
             self.cond.clone().into_data().convert::<f32>().try_to_vec::<f32>().expect("f32");
         let picked = model.select_retrieved(&cond_host, &self.pooled, self.blocks);
         let retrieved = [retrieved_tokens(&self.tokens, &picked, l)];
-        // The known prefix's states: encoded ones from the buffer, the rest (this block's
-        // emitted tokens) by a throwaway encoder run.
         let j = fixed.len();
-        let have = self.encoded.min(start + j).saturating_sub(start);
-        let mut parts = Vec::new();
-        if let Some(s) = self.states(start, start + have) {
-            parts.push(s);
-        }
-        if j > have {
-            let saved: Vec<LayerSnapshot> = self.encoder.iter().map(LayerCache::snapshot).collect();
-            let x = model.embed(ids_tensor(&fixed[have..], &self.device));
-            parts.push(model.encoder().forward(x, Some(&mut self.encoder)));
-            for (c, s) in self.encoder.iter_mut().zip(&saved) {
-                c.restore(s);
-            }
-        }
-        if j < l - 1 {
-            parts.push(Tensor::zeros([1, l - 1 - j, d], &self.device));
-        }
-        let known = Tensor::cat(parts, 1);
+        let known = self.known_states(model, fixed);
         let entries =
             [model.block_entries(self.cond.clone(), &retrieved, Some((known, &[j])), start)];
         let memory = |with_known| {
@@ -313,6 +295,32 @@ impl HybridSession {
         let (memory_g, dec) = (memory(true), memory(false));
         let (gk, dk) = (model.generator_kv(&memory_g), model.decoder_kv(&dec));
         (memory_g, gk, dec, dk)
+    }
+
+    /// The open block's known prefix `fixed` as encoder states `[1, L - 1, d]`, zero-padded:
+    /// the encoded ones from the buffer, the rest (this block's emitted tokens, not yet
+    /// encoded) by a throwaway encoder run.
+    pub(crate) fn known_states(&mut self, model: &HybridLm, fixed: &[i32]) -> Tensor<3> {
+        let (l, d) = (model.config().block, model.local_dim);
+        let start = self.blocks * l;
+        let j = fixed.len();
+        let have = self.encoded.min(start + j).saturating_sub(start);
+        let mut parts = Vec::new();
+        if let Some(s) = self.states(start, start + have) {
+            parts.push(s);
+        }
+        if j > have {
+            let saved: Vec<LayerSnapshot> = self.encoder.iter().map(LayerCache::snapshot).collect();
+            let x = model.embed(ids_tensor(&fixed[have..], &self.device));
+            parts.push(model.encoder().forward(x, Some(&mut self.encoder)));
+            for (c, s) in self.encoder.iter_mut().zip(&saved) {
+                c.restore(s);
+            }
+        }
+        if j < l - 1 {
+            parts.push(Tensor::zeros([1, l - 1 - j, d], &self.device));
+        }
+        Tensor::cat(parts, 1)
     }
 
     /// The autoregressive path's log-probabilities `[L * V]` over the open block, input
@@ -571,9 +579,24 @@ impl HybridSession {
                 stopped = true;
             }
         }
-        // Close: encode what was written, and step the backbone over a complete block.
         let emitted = fixed[known..].to_vec();
-        self.tokens.extend_from_slice(&emitted);
+        self.close_block(model, start, &emitted, stopped, close_span);
+        BlockOut { tokens: emitted, stopped, stats }
+    }
+
+    /// After a block's decode: encodes what was written, and steps the backbone over the block
+    /// once it is complete; the verified span ends with a stop, or with the block in which a
+    /// switch-off token appeared.
+    pub(crate) fn close_block(
+        &mut self,
+        model: &HybridLm,
+        start: usize,
+        emitted: &[i32],
+        stopped: bool,
+        close_span: bool,
+    ) {
+        let l = model.config().block;
+        self.tokens.extend_from_slice(emitted);
         self.encode_pending(model);
         if self.tokens.len() - start >= l {
             self.step_complete_blocks(model);
@@ -584,7 +607,6 @@ impl HybridSession {
         if stopped {
             self.verified_span = false;
         }
-        BlockOut { tokens: emitted, stopped, stats }
     }
 
     /// Decodes up to `max_tokens` tokens of a reply, block after block, until a stop token.
@@ -729,4 +751,19 @@ fn sample(scores: &[f32], t: f64, top_p: f64, uniform: &mut dyn FnMut() -> f64) 
     }
     let p = distribution(scores, t, top_p);
     draw(&p, 1.0, uniform())
+}
+
+/// [`argmax`] for the fast path.
+pub(crate) fn argmax_row(row: &[f32]) -> usize {
+    argmax(row)
+}
+
+/// [`sample`] for the fast path.
+pub(crate) fn sample_row(
+    row: &[f32],
+    t: f64,
+    top_p: f64,
+    uniform: &mut dyn FnMut() -> f64,
+) -> usize {
+    sample(row, t, top_p, uniform)
 }

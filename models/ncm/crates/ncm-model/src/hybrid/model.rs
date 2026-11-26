@@ -83,7 +83,43 @@ pub struct PassShape<'a> {
     pub rope_base: f64,
 }
 
+/// One block's memory as the fast decode path holds it, per layer: the token states' keys and
+/// values (the recent ring, projected once when the states entered it) and the per-block
+/// entries' keys and values, with additive biases shared by the layers (0 visible, -inf
+/// hidden).
+pub struct FastMemory<'a> {
+    pub seq: Option<&'a [(Tensor<4>, Tensor<4>)]>,
+    pub seq_bias: &'a Tensor<2>,
+    pub extra: &'a [(Tensor<4>, Tensor<4>)],
+    pub extra_bias: &'a Tensor<2>,
+    /// The queries' tables (one row per query).
+    pub q_rope: &'a Rope,
+}
+
 impl MemBlock {
+    /// One block's pass of `x` `[1, q, d]` over a [`FastMemory`] (layer `layer`), with the
+    /// fused norm and MLP kernels where they apply (decode-sized runs on CUDA).
+    fn forward_fast(
+        &self,
+        x: Tensor<3>,
+        self_rope: &Rope,
+        self_mask: Option<Tensor<2, Bool>>,
+        memory: &FastMemory,
+        layer: usize,
+    ) -> Tensor<3> {
+        let h = crate::fused::rms_norm(&self.n1, x.clone());
+        let attn = self.attn.forward_masked(h, self_rope, self_mask);
+        let (x, h) = crate::fused::add_rms_norm(&self.n2, x, attn);
+        let seq = memory.seq.map(|s| (&s[layer].0, &s[layer].1, memory.seq_bias));
+        let (ek, ev) = &memory.extra[layer];
+        let crossed = self.cross.forward_biased(h, memory.q_rope, seq, (ek, ev, memory.extra_bias));
+        if let Some(x) = self.mlp.residual_step(&self.n3, &x, Some(&crossed)) {
+            return x;
+        }
+        let (x, h) = crate::fused::add_rms_norm(&self.n3, x, crossed);
+        x + self.mlp.forward(h)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         d: usize,
@@ -580,6 +616,105 @@ impl HybridLm {
         let pos: Vec<i32> = (0..l as i32).collect();
         let rope = Rope::new(0, l, self.head_dim, self.rope_base, 1.0, device);
         (rope, build_mask(device, &pos, &pos, None))
+    }
+
+    // ------------------------------------------------------------------ fast decode path
+
+    /// The generator layers' memory attentions.
+    pub fn generator_cross(&self) -> Vec<&MemoryAttention> {
+        self.gen_blocks.iter().map(|b| &b.cross).collect()
+    }
+
+    /// The token-decoder layers' memory attentions.
+    pub fn decoder_cross(&self) -> Vec<&MemoryAttention> {
+        self.dec_blocks.iter().map(|b| &b.cross).collect()
+    }
+
+    pub fn copy_head(&self) -> &CopyHead {
+        &self.copy
+    }
+
+    /// The backbone slots `[1, S, d]` of a condition `[1, 1, bb]`.
+    pub fn slot_vectors(&self, cond: Tensor<3>) -> Tensor<3> {
+        let (s, d) = (self.h.slots, self.local_dim);
+        self.slots.forward(cond).reshape([1, s, d])
+    }
+
+    /// Retrieved-token entries `[1, Rt, d]` of their ids `[1, Rt]` (block-major, L per block).
+    pub fn retrieved_vectors(&self, ids: Tensor<2, Int>) -> Tensor<3> {
+        let (l, d) = (self.h.block, self.local_dim);
+        let rt = ids.dims()[1];
+        let pos = self.retrieved_pos.val().reshape([1, 1, l, d]).expand([1, rt / l, l, d]);
+        self.emb.forward(ids) + pos.reshape([1, rt, d])
+    }
+
+    /// Known-prefix entries `[1, L - 1, d]` of encoder states `[1, L - 1, d]`.
+    pub fn known_vectors(&self, states: Tensor<3>) -> Tensor<3> {
+        states + self.known_seg.val().reshape([1, 1, self.local_dim])
+    }
+
+    /// [`Self::level_input`] with the tokenizer's tables `r`.
+    pub fn level_input_with(
+        &self,
+        k: usize,
+        zhat: Option<Tensor<3>>,
+        r: &super::vq::Resampler,
+    ) -> Tensor<3> {
+        let d = self.local_dim;
+        let level = self.level_emb.val().narrow(0, k, 1).reshape([1, 1, d]);
+        match (k, zhat) {
+            (0, _) | (_, None) => self.first_query.val().reshape([1, 1, d]) + level,
+            (_, Some(z)) => {
+                let x = self.gen_in.forward(self.tokenizer.pool_with(k, z, r));
+                let n = x.dims()[1];
+                x + level.expand([1, n, d])
+            }
+        }
+    }
+
+    /// The generator over one level's inputs `[1, q, d]` and a [`FastMemory`]: `[1, q, C]`.
+    pub fn generator_fast(&self, x: Tensor<3>, self_rope: &Rope, memory: &FastMemory) -> Tensor<3> {
+        let mut x = x;
+        for (l, blk) in self.gen_blocks.iter().enumerate() {
+            x = blk.forward_fast(x, self_rope, None, memory, l);
+        }
+        self.gen_head.forward(crate::fused::rms_norm(&self.gen_norm, x))
+    }
+
+    /// The token decoder over inputs `[1, L, d]` (causal) and a [`FastMemory`], with the copy
+    /// head over `copy` ([`CopyHead::mix_biased`]): log-probabilities `[1, L, V]`.
+    #[allow(clippy::type_complexity)]
+    pub fn decoder_fast(
+        &self,
+        x: Tensor<3>,
+        self_rope: &Rope,
+        causal: Tensor<2, Bool>,
+        memory: &FastMemory,
+        copy: (
+            Option<(&Tensor<3>, &Tensor<2, Int>, &Tensor<2>)>,
+            Option<(Tensor<3>, &Tensor<2, Int>, &Tensor<2>)>,
+        ),
+    ) -> Tensor<3> {
+        let mut x = x;
+        for (l, blk) in self.dec_blocks.iter().enumerate() {
+            x = blk.forward_fast(x, self_rope, Some(causal.clone()), memory, l);
+        }
+        let h = crate::fused::rms_norm(&self.dec_norm, x);
+        let logits = crate::fused::linear_transposed(self.emb.weight.val(), h.clone());
+        self.copy.mix_biased(h, logits, copy.0, copy.1)
+    }
+
+    /// Token-decoder inputs `[1, L, d]` of block tokens `[1, L]` (position i reads token
+    /// i - 1), plus the projected reconstruction `[1, L, C]` when given.
+    pub fn decoder_input_fast(&self, tokens: Tensor<2, Int>, zhat: Option<Tensor<3>>) -> Tensor<3> {
+        let [_, l] = tokens.dims();
+        let d = self.local_dim;
+        let start = self.dec_start.val().reshape([1, 1, d]);
+        let x = Tensor::cat(vec![start, self.emb.forward(tokens.narrow(1, 0, l - 1))], 1);
+        match zhat {
+            Some(z) => x + self.z_in.forward(z),
+            None => x,
+        }
     }
 
     // ------------------------------------------------------------------ training

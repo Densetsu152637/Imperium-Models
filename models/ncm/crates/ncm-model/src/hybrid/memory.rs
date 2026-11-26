@@ -116,18 +116,69 @@ impl MemoryAttention {
         }
     }
 
+    /// Keys (rotated by `rope`, one row per entry) and values `[B, KVH, n, D]` of memory
+    /// entries `x` `[B, n, d]`.
+    pub fn project_rows(&self, x: Tensor<3>, rope: &Rope) -> (Tensor<4>, Tensor<4>) {
+        let hd = self.head_dim;
+        let [b, t, _] = x.dims();
+        let kv = self.kv.forward(x);
+        let k = kv.clone().narrow(2, 0, self.kv_heads * hd);
+        let v = kv.narrow(2, self.kv_heads * hd, self.kv_heads * hd);
+        let k = apply_rope(k.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2), rope);
+        (k, v.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2))
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    /// The fast decode path's attention over one block's memory: `x` `[1, q, d]` with query
+    /// tables `q_rope` (q rows), token-state keys and values `seq` `[1, KVH, N, D]` with an
+    /// additive bias `[1, N]` (0 visible, -inf hidden), and per-block entries `extra` likewise
+    /// with a bias `[1, E]`. No host data: every input is a device buffer, so it can run inside
+    /// a captured graph.
+    pub fn forward_biased(
+        &self,
+        x: Tensor<3>,
+        q_rope: &Rope,
+        seq: Option<(&Tensor<4>, &Tensor<4>, &Tensor<2>)>,
+        extra: (&Tensor<4>, &Tensor<4>, &Tensor<2>),
+    ) -> Tensor<3> {
+        let [b, nq, _] = x.dims();
+        let (h, hd) = (self.heads, self.head_dim);
+        let groups = h / self.kv_heads;
+        let expand = |t: &Tensor<4>| {
+            let [b, kvh, n, d] = t.dims();
+            t.clone().unsqueeze_dim::<5>(2).expand([b, kvh, groups, n, d]).reshape([b, h, n, d])
+        };
+        let q = apply_rope(self.q.forward(x).reshape([b, nq, h, hd]).swap_dims(1, 2), q_rope);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let (ek, ev, ebias) = extra;
+        let e = ebias.dims()[1];
+        let s_extra = q.clone().matmul(expand(ek).swap_dims(2, 3)) * scale
+            + ebias.clone().reshape([1, 1, 1, e]);
+        let out = match seq {
+            None => softmax(s_extra, 3).matmul(expand(ev)),
+            Some((sk, sv, sbias)) => {
+                let n = sbias.dims()[1];
+                let s_seq = q.matmul(expand(sk).swap_dims(2, 3)) * scale
+                    + sbias.clone().reshape([1, 1, 1, n]);
+                let p = softmax(Tensor::cat(vec![s_seq, s_extra], 3), 3);
+                p.clone().narrow(3, 0, n).matmul(expand(sv)) + p.narrow(3, n, e).matmul(expand(ev))
+            }
+        };
+        self.o.forward(out.swap_dims(1, 2).reshape([b, nq, h * hd]))
+    }
+
     /// Keys (with RoPE at `rope_base`) and values of `memory` for this layer.
     pub fn project(&self, memory: &Memory, rope_base: f64) -> LayerKv {
         let device = memory.extra.device();
         let hd = self.head_dim;
-        let split = |x: Tensor<3>, rope: Rope| {
-            let [b, t, _] = x.dims();
-            let kv = self.kv.forward(x);
-            let k = kv.clone().narrow(2, 0, self.kv_heads * hd);
-            let v = kv.narrow(2, self.kv_heads * hd, self.kv_heads * hd);
-            let k = apply_rope(k.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2), &rope);
-            (k, v.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2))
-        };
+        let split = |x: Tensor<3>, rope: Rope| self.project_rows(x, &rope);
         let seq = memory.seq.as_ref().map(|s| {
             let n = s.dims()[1];
             split(s.clone(), Rope::new(memory.seq_start, n, hd, rope_base, 1.0, &device))
@@ -214,6 +265,63 @@ impl CopyHead {
             gate: linear(d, 1, device),
             dim,
         }
+    }
+
+    /// Copy keys `[B, n, dim]` of memory token entries `[B, n, d]`.
+    pub fn keys(&self, entries: Tensor<3>) -> Tensor<3> {
+        self.k.forward(entries)
+    }
+
+    /// The fast decode path's [`Self::mix`] for one block: copy keys `seq` `[1, N, dim]`
+    /// (projected when the states entered the ring) with the tokens following them `[1, N]`
+    /// and an additive bias `[1, N]`, and the retrieved tokens' entries `[1, Rt, d]` likewise.
+    /// No host data (see [`MemoryAttention::forward_biased`]).
+    pub fn mix_biased(
+        &self,
+        h: Tensor<3>,
+        logits: Tensor<3>,
+        seq: Option<(&Tensor<3>, &Tensor<2, Int>, &Tensor<2>)>,
+        retrieved: Option<(Tensor<3>, &Tensor<2, Int>, &Tensor<2>)>,
+    ) -> Tensor<3> {
+        let [b, nq, v] = logits.dims();
+        let device = h.device();
+        let gate = burn::tensor::activation::sigmoid(self.gate.forward(h.clone()));
+        let cq = self.q.forward(h);
+        let scale = 1.0 / (self.dim as f64).sqrt();
+        let mut scores = Vec::new();
+        let mut ids = Vec::new();
+        if let Some((keys, next, bias)) = seq {
+            let n = bias.dims()[1];
+            scores.push(
+                cq.clone().matmul(keys.clone().swap_dims(1, 2)) * scale
+                    + bias.clone().reshape([1, 1, n]),
+            );
+            ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
+        }
+        if let Some((entries, next, bias)) = retrieved {
+            let n = bias.dims()[1];
+            let keys = self.k.forward(entries);
+            scores.push(
+                cq.clone().matmul(keys.swap_dims(1, 2)) * scale + bias.clone().reshape([1, 1, n]),
+            );
+            ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
+        }
+        let p_vocab = softmax(logits, 2);
+        if scores.is_empty() {
+            return p_vocab.clamp_min(1e-30).log();
+        }
+        scores.push(Tensor::zeros([b, nq, 1], &device));
+        let a = softmax(Tensor::cat(scores, 2), 2);
+        let entries = a.dims()[2] - 1;
+        let null = a.clone().narrow(2, entries, 1);
+        let copy = Tensor::<3>::zeros([b, nq, v], &device).scatter(
+            2,
+            Tensor::cat(ids, 2),
+            a.narrow(2, 0, entries),
+            burn::tensor::IndexingUpdateOp::Add,
+        );
+        let keep = gate.clone().neg() + 1.0 + gate.clone() * null;
+        (p_vocab * keep + copy * gate).clamp_min(1e-30).log()
     }
 
     /// Log-probabilities `[B, nb * q, V]` of decoder states `h` `[B, nb * q, d]` with vocabulary

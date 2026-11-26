@@ -391,6 +391,76 @@ impl BlockTokenizer {
     }
 }
 
+/// The resampling matrices of every level, built once (for the fast decode path, whose
+/// passes must not upload host data): area pooling `[ℓ, L]` and linear upsampling `[L, ℓ]`,
+/// None for the finest level (the identity); and each codebook's squared norms `[1, n]` and
+/// their mean `[1, 1]` for the tied code logits.
+pub struct Resampler {
+    down: Vec<Option<Tensor<2>>>,
+    up: Vec<Option<Tensor<2>>>,
+    norms: Vec<(Tensor<2>, Tensor<2>)>,
+}
+
+impl BlockTokenizer {
+    /// The tables of [`Resampler`] for this tokenizer's codebooks as they are now.
+    pub fn resampler(&self, device: &Device) -> Resampler {
+        let l = self.block;
+        let (mut down, mut up, mut norms) = (Vec::new(), Vec::new(), Vec::new());
+        for (k, &n) in self.levels.iter().enumerate() {
+            down.push((n != l).then(|| matrix(area_matrix(n, l), n, l, device)));
+            up.push((n != l).then(|| matrix(linear_matrix(l, n), l, n, device)));
+            let e = self.codebook(k);
+            let entries = e.dims()[0];
+            let sq = e.powf_scalar(2.0).sum_dim(1).reshape([1, entries]);
+            let mean = sq.clone().mean().reshape([1, 1]);
+            norms.push((sq, mean));
+        }
+        Resampler { down, up, norms }
+    }
+
+    /// [`Self::contribution`] with the tables of `r`.
+    pub fn contribution_with(&self, k: usize, codes: Tensor<2, Int>, r: &Resampler) -> Tensor<3> {
+        let entries = burn::tensor::module::embedding(self.codebook(k), codes);
+        let up = match &r.up[k] {
+            Some(m) => resample(m.clone(), entries),
+            None => entries,
+        };
+        self.phi(k, up)
+    }
+
+    /// [`Self::pool`] with the tables of `r`.
+    pub fn pool_with(&self, k: usize, x: Tensor<3>, r: &Resampler) -> Tensor<3> {
+        match &r.down[k] {
+            Some(m) => resample(m.clone(), x),
+            None => x,
+        }
+    }
+
+    /// [`Self::code_logits`] with the codebook norms of `r`.
+    pub fn code_logits_with(&self, k: usize, z: Tensor<3>, r: &Resampler) -> Tensor<3> {
+        let [b, n, c] = z.dims();
+        let e = self.codebook(k);
+        let entries = e.dims()[0];
+        let (norms, scale) = r.norms[k].clone();
+        let scores = (z.reshape([b * n, c]).matmul(e.transpose()) * 2.0 - norms) / scale;
+        scores.reshape([b, n, entries])
+    }
+
+    /// [`Self::decode`] with the self-attention tables `rope` (positions 0..L) given.
+    pub fn decode_with(&self, zhat: Tensor<3>, emb: Tensor<2>, rope: &Rope) -> Tensor<3> {
+        let x = zhat.clone()
+            + self.attn.forward_masked(crate::fused::rms_norm(&self.n1, zhat), rope, None);
+        let x = x.clone() + self.mlp.forward(crate::fused::rms_norm(&self.n2, x));
+        let h = self.head.forward(crate::fused::rms_norm(&self.norm, x));
+        crate::fused::linear_transposed(emb, h)
+    }
+
+    /// The decoder's self-attention tables (positions 0..L).
+    pub fn decoder_rope(&self, device: &Device) -> Rope {
+        Rope::new(0, self.block, self.head_dim, 10_000.0, 1.0, device)
+    }
+}
+
 /// The tokenizer's training loss: token cross-entropy of the decoder plus the quantiser loss.
 pub fn tokenizer_loss(out: &TokenizerOut, tokens: Tensor<2, Int>) -> Tensor<1> {
     let nll = log_softmax(out.logits.clone(), 2).gather(2, tokens.unsqueeze_dim::<3>(2)).neg();

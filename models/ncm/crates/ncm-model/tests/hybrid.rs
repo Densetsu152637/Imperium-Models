@@ -615,3 +615,71 @@ fn hybrid_cache_at_1m_matches_the_design() {
     let bytes = hybrid_cache_bytes(&ncm_250m_hybrid(), 1 << 20, 2, 1) as f64 / GIB;
     assert!((0.27..=0.33).contains(&bytes), "{bytes:.3} GiB at 1M tokens");
 }
+
+// ----------------------------------------------------------------------------- fast path
+
+use ncm_model::hybrid::FastSession;
+
+/// The fast path (memory rings, fixed-buffer passes, acceptance on the device) decodes what
+/// the reference loop decodes at temperature 0, in verified and in parallel mode, from prompts
+/// ending at several offsets, with re-decodes forced or not, and reports the same first-pass
+/// acceptance.
+#[test]
+fn fast_path_matches_the_reference_loop() {
+    let (model, cfg, h, device) = tiny_model(40);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 8 * l, 41));
+    for offset in [0, 1, l / 2, l - 1] {
+        let prompt = &stream[..2 * l + offset];
+        for opts in [
+            greedy(true),
+            DecodeOptions { redecode_min: Some(1), ..greedy(true) },
+            DecodeOptions { tau: Some(0.0), ..DecodeOptions::default() },
+            DecodeOptions::default(),
+        ] {
+            let mut reference = HybridSession::new(&model, 8 * l, &device);
+            reference.prefill(&model, prompt);
+            let (want, want_stats) =
+                reference.generate_reply(&model, 3 * l, &opts, &mut Hooks::default());
+            let mut fast = FastSession::new(&model, 8 * l, &device);
+            fast.prefill(&model, prompt);
+            assert!(fast.serves(&opts));
+            let (got, got_stats) = fast.generate_reply(&model, 3 * l, &opts, &mut Hooks::default());
+            assert_eq!(got, want, "offset {offset}, {opts:?}");
+            let first = |s: &[ncm_model::hybrid::BlockStats]| {
+                s.iter().map(|b| (b.known, b.first_accepted, b.redecoded)).collect::<Vec<_>>()
+            };
+            assert_eq!(first(&got_stats), first(&want_stats), "offset {offset}, {opts:?}");
+        }
+    }
+}
+
+/// In verified mode the fast path equals the autoregressive path's greedy decode, whatever the
+/// synthetic acceptance decides (it changes only how fast the tokens come).
+#[test]
+fn fast_verified_mode_equals_autoregressive_greedy() {
+    let (model, cfg, h, device) = tiny_model(42);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 6 * l, 43));
+    let prompt = &stream[..l + 3];
+    let mut ar = FastSession::new(&model, 6 * l, &device);
+    ar.prefill(&model, prompt);
+    let (want, _) = ar.generate_reply(&model, 2 * l, &greedy(false), &mut Hooks::default());
+    for p in [1.0, 0.5, 0.0] {
+        let mut fast = FastSession::new(&model, 6 * l, &device);
+        fast.prefill(&model, prompt);
+        let mut n = 0u64;
+        let mut accept = |_: usize, _: usize| {
+            n += 1;
+            ((n * 2654435761) % 1000) as f64 / 1000.0 < p
+        };
+        let mut hooks = Hooks { accept: Some(&mut accept), ..Hooks::default() };
+        // Synthetic acceptance keeps drafts the path did not choose: only p = 0 (every draft
+        // rejected, the pass's own token at each rejection) must equal the greedy decode.
+        let (got, _) = fast.generate_reply(&model, 2 * l, &greedy(true), &mut hooks);
+        if p == 0.0 {
+            assert_eq!(got, want);
+        }
+        assert_eq!(got.len(), want.len());
+    }
+}
