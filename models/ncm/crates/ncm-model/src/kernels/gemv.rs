@@ -240,8 +240,10 @@ fn vec_store<F: Float, L: Size>(
 /// `y = x L` for a packed row-major `L` `[K, L]` read as vectors of `L`'s columns (16 bytes per
 /// load). Cube `(tile, split)`: column unit `u` owns the vector of columns `(tile * VEC_COLS +
 /// u) * v ..`, its `VEC_LANES` units stride `K` in `split * k_split ..`, and a shared-memory sum
-/// merges them. With one split it writes `y` `[rows, L]`, otherwise f32 partials `part`
-/// `[splits, rows, L]` for [`gemv_sum_kernel`].
+/// merges them. With one split it writes `y` `[rows, L]`. Otherwise it writes f32 partials
+/// `part` `[splits, rows, L]`, publishes them (a device fence) and counts its arrival in
+/// `counters[tile]`; the last cube of the tile to arrive adds the splits in order (as
+/// [`gemv_sum_kernel`] would) and resets the counter, so no second launch is needed.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemv_vec_kernel<F: Float, L: Size>(
@@ -249,6 +251,7 @@ pub(crate) fn gemv_vec_kernel<F: Float, L: Size>(
     w: &Tensor<Vector<F, L>>,
     y: &mut Tensor<F>,
     part: &mut Tensor<f32>,
+    counters: &mut Tensor<Atomic<i32>>,
     k: usize,
     n: usize,
     k_split: usize,
@@ -305,5 +308,34 @@ pub(crate) fn gemv_vec_kernel<F: Float, L: Size>(
     }
     if comptime!(rows > 3) {
         vec_store::<F, L>(&mut red, a3, y, part, 3, rows, n, split);
+    }
+    if comptime!(split) {
+        let splits = CUBE_COUNT_Y as usize;
+        let tile = CUBE_POS_X as usize;
+        sync_storage();
+        sync_cube();
+        let mut arrived = Shared::<[i32]>::new_slice(1usize);
+        if tid == 0 {
+            arrived[0] = counters[tile].fetch_add(1i32);
+        }
+        sync_cube();
+        if arrived[0] == i32::cast_from(splits) - 1 {
+            sync_storage();
+            let width = VEC_COLS * v;
+            let col = tile * width + tid;
+            if tid < width && col < n {
+                #[unroll]
+                for r in 0..rows {
+                    let mut total = 0.0f32;
+                    for s in 0..splits {
+                        total += part[(s * rows + r) * n + col];
+                    }
+                    y[r * n + col] = F::cast_from(total);
+                }
+            }
+            if tid == 0 {
+                counters[tile].store(0i32);
+            }
+        }
     }
 }

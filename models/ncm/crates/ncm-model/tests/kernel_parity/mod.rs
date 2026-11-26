@@ -60,10 +60,15 @@ pub fn gemv_matches(device: &Device, tol: f32) {
         (1, 1024, 3780),
         (3, 37, 70),
         (2, 5000, 64),
+        (1, 2048, 77),
     ] {
         let x = Tensor::<3>::random([1, rows, k], normal, device);
         let w = Tensor::<2>::random([k, n], normal, device);
         let got = values(ncm_model::kernels::gemv(x.clone(), w.clone()));
+        // Split-K combines in the last cube to arrive, which resets its counter: a second call
+        // of the same shape gives the same result.
+        let again = values(ncm_model::kernels::gemv(x.clone(), w.clone()));
+        assert_eq!(got, again, "gemv {rows}x{k}x{n}: a repeated call differs");
         let want = values(to_cpu(&x).matmul(to_cpu(&w).unsqueeze::<3>()));
         let err = rel_error(&got, &want);
         eprintln!("gemv {rows}x{k}x{n}: error over scale {err:.2e}");

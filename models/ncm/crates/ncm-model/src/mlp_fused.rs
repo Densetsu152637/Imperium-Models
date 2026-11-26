@@ -650,14 +650,15 @@ impl NcmFusedMlp for CubeBackend {
 
 thread_local! {
     /// Per thread (cubecl streams are per thread, and launches on one stream never overlap):
-    /// the dense kernel's arrival counters, each left at 0 by the cube that used it.
+    /// the split-K arrival counters of the dense fused MLP kernel and `kernels::gemv`, each
+    /// left at 0 by the cube that used it.
     static COUNTERS: RefCell<Option<Tensor<1, Int>>> = const { RefCell::new(None) };
 }
 
 /// Column tiles a dense launch may count (far more than any of the models' widths needs).
 const MAX_TILES: usize = 4096;
 
-fn counters(device: &burn::tensor::Device) -> Tensor<1, Int> {
+pub(crate) fn counters(device: &burn::tensor::Device) -> Tensor<1, Int> {
     COUNTERS.with(|c| {
         c.borrow_mut()
             .get_or_insert_with(|| Tensor::<1, Int>::zeros([MAX_TILES], device).cast(IntDType::I32))

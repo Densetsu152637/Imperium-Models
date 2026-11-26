@@ -59,29 +59,6 @@ fn launch_rms_norm(
 /// Cubes per SM the GEMV grids aim for.
 const GEMV_WAVES: usize = 4;
 
-/// Adds the `splits` f32 partials `part` `[splits, count]` into `y` (`count` elements).
-fn gemv_sum(
-    client: &cubecl::client::Client,
-    part: CubeTensor,
-    y: CubeTensor,
-    count: usize,
-    splits: usize,
-    dtype: ElemType,
-) {
-    unsafe {
-        gemv::gemv_sum_kernel::launch_unchecked(
-            client,
-            CubeCount::Static(count.div_ceil(gemv::CUBE) as u32, 1, 1),
-            CubeDim::new_1d(gemv::CUBE as u32),
-            part.into_tensor_arg(),
-            y.into_tensor_arg(),
-            count,
-            splits,
-            dtype,
-        );
-    }
-}
-
 /// The element type a kernel is defined for, from a tensor's dtype.
 fn elem(dtype: DType) -> ElemType {
     match dtype {
@@ -172,7 +149,11 @@ pub trait NcmKernels: Backend {
     fn ncm_argmax(x: FloatTensor<Self>) -> IntTensor<Self>;
 
     /// See [`gemv`].
-    fn ncm_gemv(x: FloatTensor<Self>, w: FloatTensor<Self>) -> FloatTensor<Self>;
+    fn ncm_gemv(
+        x: FloatTensor<Self>,
+        w: FloatTensor<Self>,
+        counters: IntTensor<Self>,
+    ) -> FloatTensor<Self>;
 
     /// See [`qmatmul`]; `x` `[rows, d_in]` with `rows <= GEMV_ROWS`.
     fn ncm_qgemv(
@@ -324,7 +305,7 @@ pub trait NcmKernels: Backend {
 }
 
 impl NcmKernels for CubeBackend {
-    fn ncm_gemv(x: CubeTensor, w: CubeTensor) -> CubeTensor {
+    fn ncm_gemv(x: CubeTensor, w: CubeTensor, counters: CubeTensor) -> CubeTensor {
         use gemv::{COLS, CUBE};
         let [rows, k] = x.meta.shape().dims::<2>();
         let [_, n] = w.meta.shape().dims::<2>();
@@ -355,7 +336,8 @@ impl NcmKernels for CubeBackend {
         // (else 8 or 4).
         let widest = 16 / x.dtype.size();
         let fits = |v: usize| n.is_multiple_of(v) && strides[0].is_multiple_of(v);
-        let v = [widest, widest / 2, widest / 4].into_iter().find(|&v| v >= 2 && fits(v));
+        let v =
+            [widest, widest / 2, widest / 4, widest / 8].into_iter().find(|&v| v >= 1 && fits(v));
         if let (1, Some(v)) = (strides[1], v) {
             use gemv::{VEC_COLS, VEC_K, VEC_LANES};
             let sms = client.properties().hardware.num_streaming_multiprocessors.unwrap_or(84);
@@ -378,6 +360,7 @@ impl NcmKernels for CubeBackend {
                     w.into_tensor_arg(),
                     y.clone().into_tensor_arg(),
                     part.clone().into_tensor_arg(),
+                    counters.into_tensor_arg(),
                     k,
                     n,
                     k_split,
@@ -386,9 +369,7 @@ impl NcmKernels for CubeBackend {
                     dtype,
                 );
             }
-            if splits > 1 {
-                gemv_sum(&client, part, y.clone(), rows * n, splits, dtype);
-            }
+            // With splits, the last cube of each tile combined them (no second launch).
             return y;
         }
         // Enough cubes to keep every SM reading: split K when N alone gives too few tiles.
@@ -1287,8 +1268,12 @@ pub fn gemv<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
     let rows = shape.iter().product::<usize>() / k;
     debug_assert!(rows <= gemv::MAX_ROWS, "gemv takes at most {} rows", gemv::MAX_ROWS);
     shape[D - 1] = w.dims()[1];
-    let y =
-        <Dispatch as NcmKernels>::ncm_gemv(x.reshape([rows, k]).into_dispatch(), w.into_dispatch());
+    let counters = crate::mlp_fused::counters(&x.device()).into_dispatch();
+    let y = <Dispatch as NcmKernels>::ncm_gemv(
+        x.reshape([rows, k]).into_dispatch(),
+        w.into_dispatch(),
+        counters,
+    );
     Tensor::<2>::from_dispatch(y).reshape(shape)
 }
 
