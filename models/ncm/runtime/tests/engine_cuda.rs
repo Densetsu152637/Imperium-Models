@@ -31,6 +31,7 @@ fn engine(config: Config, speculate: bool) -> Engine {
         quant: None,
         speculate,
         prefix_reuse: true,
+        warmup: false,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
 }

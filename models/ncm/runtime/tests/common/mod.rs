@@ -53,6 +53,7 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
         prefill_chunk: 16,
         speculate: false,
         prefix_reuse: true,
+        warmup: false,
         quant: None,
     };
     Engine::new(options, vocab()).expect("a tiny engine")

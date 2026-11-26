@@ -246,6 +246,10 @@ pub struct EngineOptions {
     /// Keep the previous request's cache and prefill only the new part of a prompt that extends
     /// the previous prompt (see [`Engine`]).
     pub prefix_reuse: bool,
+    /// Run a short greedy and a short sampled request at launch (`Engine::new` returns after
+    /// them), so that the first real request does not pay for compiling the kernels and
+    /// capturing the decode graphs.
+    pub warmup: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -380,6 +384,7 @@ impl Core {
             quant,
             speculate,
             prefix_reuse,
+            warmup,
         } = options;
         if vocab.len() != config.vocab_size() {
             return Err(EngineError::VocabMismatch {
@@ -426,7 +431,7 @@ impl Core {
             vocab_size: config.vocab_size(),
             unit,
         };
-        Ok(Self {
+        let core = Self {
             info,
             vocab,
             device,
@@ -435,7 +440,46 @@ impl Core {
             prefix_reuse,
             speculate,
             state: Mutex::new(state),
-        })
+        };
+        if warmup {
+            core.warm_up();
+        }
+        Ok(core)
+    }
+
+    /// Serves two throwaway requests (greedy, then sampled) long enough for the decode graphs
+    /// to be captured (past the NCM's cross-attention ring), compiling every kernel on the way,
+    /// then forgets them. Errors are ignored: a real request would meet them again.
+    // TODO: also call ncm-model's shape warm-up (prefill chunk shapes) once it exists.
+    fn warm_up(&self) {
+        let ids = self.vocab.ids;
+        let unit = self.info.unit;
+        let len = (self.capacity / 2).clamp(unit, 1024);
+        let never = AtomicBool::new(false);
+        for sampling in [
+            SamplingParams::GREEDY,
+            SamplingParams { temperature: 0.8, top_k: 40, top_p: 0.95, seed: Some(0) },
+        ] {
+            let request = GenRequest {
+                prompt: vec![ids.pad; len],
+                max_tokens: 4 * unit,
+                sampling,
+                constraint: None,
+                cancel: Default::default(),
+            };
+            self.generate(request, &never, &mut |_| true).ok();
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match &mut *state {
+            State::Tok { caches, kept, .. } => {
+                caches.iter_mut().for_each(LayerCache::reset);
+                kept.clear();
+            }
+            State::Ncm { cache, kept, .. } => {
+                cache.reset();
+                kept.clear();
+            }
+        }
     }
 
     fn int_tensor(&self, ids: &[i32]) -> Tensor<2, Int> {

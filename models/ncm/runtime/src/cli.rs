@@ -116,6 +116,10 @@ pub struct Cli {
     /// the prompt extends the previous prompt.
     #[arg(long)]
     pub no_prefix_reuse: bool,
+    /// Skip the warm-up requests at launch (the first request then compiles the kernels and
+    /// captures the decode graphs).
+    #[arg(long)]
+    pub no_warmup: bool,
     /// Quantise the linear layers' weights at load. A quantised weight file loads as it is.
     #[arg(long, value_enum, default_value = "none")]
     pub quant: QuantArg,
