@@ -431,63 +431,132 @@ pub(crate) fn ret_index_kernel<F: Float>(
     }
 }
 
-/// Units per cube of [`ret_topk_kernel`]: one candidate block each.
-pub(crate) const TOPK_CUBE: usize = 64;
-/// Scores staged in shared memory at a time by [`ret_topk_kernel`].
-const TOPK_TILE: usize = 256;
+/// A score's bits as a key that orders like the score: flip every bit of a negative float, only
+/// the sign bit of a positive one.
+#[cube]
+fn order_key(x: f32) -> u32 {
+    let bits = u32::reinterpret(x);
+    select(bits >> 31u32 == 1u32, !bits, bits | 0x8000_0000u32)
+}
 
-/// One cube per (batch row, slice of `TOPK_CUBE` candidate blocks): `picked[b, r]` is the
-/// candidate block of rank `r < k` by score (ties to the lower block), each unit counting the
-/// rank of its block against every candidate's score, staged in shared memory a tile at a time.
-/// Nothing to pick on a dense step (at most `k` candidates). `scores` has `blocks` columns, of
-/// which the first `n` are this step's candidates.
+/// One cube per batch row: `picked[b, ..k]` gets the `k` candidate blocks with the highest
+/// scores (ties to the lower block), in block order. Nothing to pick on a dense step (at most
+/// `k` candidates). `scores` has `blocks` columns, of which the first `n` are this step's
+/// candidates.
+///
+/// A radix select on the scores' order keys: four passes over 8-bit digits, most significant
+/// first, each a shared-memory histogram of the candidates matching the digits chosen so far,
+/// find the `k`-th highest key `T` and how many of the keys equal to it make the cut. Then each
+/// unit takes a contiguous range of blocks, counts its keys above `T` and equal to it, and two
+/// prefix sums over the units give every unit its share of the tied keys (the lowest blocks
+/// first) and where its picks go. About `4 + 2` reads of each score instead of one per pair.
 #[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn ret_topk_kernel(
     scores: &Tensor<f32>,
     picked: &mut Tensor<u32>,
     position: &Tensor<i32>,
     blocks: usize,
     k: usize,
-    slices: usize,
     #[comptime] block: usize,
     #[comptime] local: usize,
 ) {
-    let b = CUBE_POS / slices;
-    let slice = CUBE_POS % slices;
+    let b = CUBE_POS;
     let row = b * blocks;
     let n = candidate_blocks(usize::cast_from(position[0]), block, local);
-    if n <= k || slice * TOPK_CUBE >= n {
+    if n <= k {
         terminate!();
     }
     let tid = UNIT_POS as usize;
-    let e = slice * TOPK_CUBE + tid;
-    let mine = e < n;
-    let v = scores[row + select(mine, e, 0usize)];
-    let mut tile = Shared::<[f32]>::new_slice(TOPK_TILE);
-    let mut rank = 0usize;
-    let mut base = 0usize;
-    while base < n {
-        let mut i = tid;
-        while i < TOPK_TILE {
-            let o = base + i;
-            tile[i] = scores[row + select(o < n, o, 0usize)];
-            i += TOPK_CUBE;
-        }
+    let hist = Shared::<[Atomic<u32>]>::new_slice(256usize);
+    let mut state = Shared::<[u32]>::new_slice(2usize);
+    let mut gt_counts = Shared::<[u32]>::new_slice(CUBE);
+    let mut eq_counts = Shared::<[u32]>::new_slice(CUBE);
+    let mut prefix = 0u32;
+    let mut mask = 0u32;
+    let mut remaining = u32::cast_from(k);
+    #[unroll]
+    for pass in 0..4u32 {
+        let shift = comptime!(24u32 - 8u32 * pass);
+        hist[tid].store(0u32);
         sync_cube();
-        let m = select(n - base < TOPK_TILE, n - base, TOPK_TILE);
-        for i in 0..m {
-            let w = tile[i];
-            let o = base + i;
-            if w > v || (w == v && o < e) {
-                rank += 1;
+        let mut e = tid;
+        while e < n {
+            let key = order_key(scores[row + e]);
+            if key & mask == prefix {
+                hist[((key >> shift) & 255u32) as usize].fetch_add(1u32);
             }
+            e += CUBE;
         }
         sync_cube();
-        base += TOPK_TILE;
+        if tid == 0 {
+            // The highest digit whose bin, added to the bins above it, reaches `remaining`.
+            let mut left = remaining;
+            let mut digit = 255u32;
+            let mut found = false;
+            for i in 0..256u32 {
+                let d = 255u32 - i;
+                let count = hist[d as usize].load();
+                if !found {
+                    if count >= left {
+                        digit = d;
+                        found = true;
+                    } else {
+                        left -= count;
+                    }
+                }
+            }
+            state[0] = digit;
+            state[1] = left;
+        }
+        sync_cube();
+        prefix |= state[0] << shift;
+        mask |= 255u32 << shift;
+        remaining = state[1];
+        sync_cube();
     }
-    if mine && rank < k {
-        picked[b * k + rank] = u32::cast_from(e);
+    // `prefix` is now the k-th highest key; `remaining` of the keys equal to it are picked.
+    let per = n.div_ceil(CUBE);
+    let lo = select(tid * per < n, tid * per, n);
+    let hi = select(lo + per < n, lo + per, n);
+    let mut gt = 0u32;
+    let mut eq = 0u32;
+    for e in lo..hi {
+        let key = order_key(scores[row + e]);
+        gt += select(key > prefix, 1u32, 0u32);
+        eq += select(key == prefix, 1u32, 0u32);
+    }
+    gt_counts[tid] = gt;
+    eq_counts[tid] = eq;
+    sync_cube();
+    if tid == 0 {
+        // Exclusive prefix sums: first of the tied keys before each range (then how many of
+        // them the range takes), then of the picks before each range.
+        let mut ties_before = 0u32;
+        let mut picks_before = 0u32;
+        for u in 0..CUBE {
+            let ties = eq_counts[u];
+            let needed = select(ties_before < remaining, remaining - ties_before, 0u32);
+            let take = select(ties < needed, ties, needed);
+            ties_before += ties;
+            let picks = gt_counts[u] + take;
+            eq_counts[u] = take;
+            gt_counts[u] = picks_before;
+            picks_before += picks;
+        }
+    }
+    sync_cube();
+    let mut at = gt_counts[tid] as usize;
+    let mut take = eq_counts[tid];
+    for e in lo..hi {
+        let key = order_key(scores[row + e]);
+        let tied = key == prefix && take > 0u32;
+        if key > prefix || tied {
+            picked[b * k + at] = u32::cast_from(e);
+            at += 1;
+        }
+        if tied {
+            take -= 1u32;
+        }
     }
 }
 

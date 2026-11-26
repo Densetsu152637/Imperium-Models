@@ -900,17 +900,15 @@ impl NcmKernels for CubeBackend {
                     d.index_8bit,
                     dtype,
                 );
-                let slices = blocks.div_ceil(retrieval::TOPK_CUBE);
                 retrieval::ret_topk_kernel::launch_unchecked(
                     &client,
-                    CubeCount::Static((b * slices) as u32, 1, 1),
-                    CubeDim::new_1d(retrieval::TOPK_CUBE as u32),
+                    CubeCount::Static(b as u32, 1, 1),
+                    CubeDim::new_1d(CUBE as u32),
                     scores.into_tensor_arg(),
                     picked.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
                     blocks,
                     d.topk,
-                    slices,
                     d.block,
                     d.local,
                 );
