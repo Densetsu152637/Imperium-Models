@@ -1,9 +1,9 @@
 //! Fused gated DeltaNet step: short convolution, SiLU, L2 norms, gates, the delta-rule update,
 //! the read-out, the per-head RMSNorm and the output gate in one kernel, token by token.
 //!
-//! One cube per (batch, head) with one unit per state column (`head_dim` units). Unit `j` owns
-//! column `j` of the head's `[dk, dv]` state and the convolution channels `j` of q, k and v. All
-//! arithmetic is in f32; tensors are read and written at the run dtype.
+//! One cube per (batch, head), `STEP_SPLIT` units per state column, the state in registers for
+//! the whole call (see [`delta_step_kernel`]). All arithmetic is in f32; tensors are read and
+//! written at the run dtype.
 
 use burn_cubecl::cubecl;
 use cubecl::prelude::*;
@@ -34,11 +34,38 @@ fn conv_silu<F: Float>(
     acc / (1.0 + (-acc).exp())
 }
 
+/// Units per state column of [`delta_step_kernel`]: each takes a quarter of the column's rows.
+pub(crate) const STEP_SPLIT: usize = 4;
+
+/// Sum of `v` over the cube's first `n` units (the others pass 0) through `red`, one slot per
+/// plane; every unit gets the result.
+#[cube]
+fn head_sum(red: &mut Shared<[f32]>, v: f32) -> f32 {
+    let total = plane_sum(v);
+    let planes = CUBE_DIM / PLANE_DIM;
+    if UNIT_POS_PLANE == 0 {
+        red[(UNIT_POS / PLANE_DIM) as usize] = total;
+    }
+    sync_cube();
+    let mut sum = 0.0f32;
+    for p in 0..planes {
+        sum += red[p as usize];
+    }
+    sync_cube();
+    sum
+}
+
 /// `proj` `[B, T, 4 H hd + 2 H]` (q, k, v, gate, decay logits a, write logits b), `conv_w`
 /// `[width, 3 H hd]`, `a_log`, `dt_bias` `[H]`, `norm_w` `[hd]` (all read through their strides).
 /// Writes `out` `[B, T, H hd]` (normed and gated read-out, before the output projection) and
 /// updates the contiguous cache `conv` `[B, width - 1, 3 H hd]` and `state` `[B, H, hd, hd]` in
 /// place.
+///
+/// One cube per (batch, head) with `STEP_SPLIT` units per state column: unit `(j, r)` (`r` the
+/// low bits of the unit index, so a column's units share a plane) holds rows
+/// `r * hd / STEP_SPLIT ..` of column `j` in registers for the whole run, and the column's partial
+/// products meet by plane shuffles. The first unit of each column owns its convolution channels
+/// and its outputs. The state is read once and written once per call.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn delta_step_kernel<F: Float>(
@@ -59,15 +86,21 @@ pub(crate) fn delta_step_kernel<F: Float>(
     #[comptime] width: usize,
     #[define(F)] _dtype: ElemType,
 ) {
+    let rows = comptime!(hd / STEP_SPLIT);
     let bh = CUBE_POS;
     let b = bh / heads;
     let h = bh % heads;
-    let j = UNIT_POS as usize;
+    let tid = UNIT_POS as usize;
+    let j = tid / STEP_SPLIT;
+    let r = tid % STEP_SPLIT;
+    let lead = r == 0;
     let hk = heads * hd;
     let channels = 3 * hk;
     let mut q_sh = Shared::<[f32]>::new_slice(hd);
     let mut k_sh = Shared::<[f32]>::new_slice(hd);
+    let mut v_sh = Shared::<[f32]>::new_slice(hd);
     let mut o_sh = Shared::<[f32]>::new_slice(hd);
+    let mut red = Shared::<[f32]>::new_slice(comptime!(hd * STEP_SPLIT / 32 + 1));
 
     let s_base = bh * hd * hd;
     let c_base = b * (width - 1) * channels;
@@ -75,44 +108,52 @@ pub(crate) fn delta_step_kernel<F: Float>(
     let rate = f32::cast_from(a_log[h * a_log.stride(0)]).exp();
     let bias = f32::cast_from(dt_bias[h * dt_bias.stride(0)]);
     let gamma = f32::cast_from(norm_w[j * norm_w.stride(0)]);
+    // This unit's rows of column j, kept in registers across the tokens.
+    let mut s = Array::<f32>::new(rows);
+    #[unroll]
+    for m in 0..rows {
+        s[m] = f32::cast_from(state[s_base + (r * rows + m) * hd + j]);
+    }
 
     for t in 0..steps {
         let row = b * proj.stride(0) + t * proj.stride(1);
         let pc = proj.stride(2);
-        let q = conv_silu::<F>(proj[row + cq * pc], conv_w, conv, c_base, channels, cq, width);
-        let k = conv_silu::<F>(
-            proj[row + (hk + cq) * pc],
-            conv_w,
-            conv,
-            c_base,
-            channels,
-            hk + cq,
-            width,
-        );
-        let v = conv_silu::<F>(
-            proj[row + (2 * hk + cq) * pc],
-            conv_w,
-            conv,
-            c_base,
-            channels,
-            2 * hk + cq,
-            width,
-        );
-        q_sh[j] = q;
-        k_sh[j] = k;
+        if lead {
+            q_sh[j] =
+                conv_silu::<F>(proj[row + cq * pc], conv_w, conv, c_base, channels, cq, width);
+            k_sh[j] = conv_silu::<F>(
+                proj[row + (hk + cq) * pc],
+                conv_w,
+                conv,
+                c_base,
+                channels,
+                hk + cq,
+                width,
+            );
+            v_sh[j] = conv_silu::<F>(
+                proj[row + (2 * hk + cq) * pc],
+                conv_w,
+                conv,
+                c_base,
+                channels,
+                2 * hk + cq,
+                width,
+            );
+        }
         sync_cube();
-
+        // L2 norms (eps 1e-6 inside the root, as the reference); q also takes 1/sqrt(hd).
         let mut qq = 0.0f32;
         let mut kk = 0.0f32;
         let mut qk = 0.0f32;
-        for i in 0..hd {
-            let qi = q_sh[i];
-            let ki = k_sh[i];
-            qq += qi * qi;
-            kk += ki * ki;
-            qk += qi * ki;
+        if tid < hd {
+            let (qi, ki) = (q_sh[tid], k_sh[tid]);
+            qq = qi * qi;
+            kk = ki * ki;
+            qk = qi * ki;
         }
-        // L2 norms (eps 1e-6 inside the root, as the reference); q also takes 1/sqrt(hd).
+        let qq = head_sum(&mut red, qq);
+        let kk = head_sum(&mut red, kk);
+        let qk = head_sum(&mut red, qk);
         let qn = q_scale / (qq + 1e-6).sqrt();
         let kn = 1.0 / (kk + 1e-6).sqrt();
 
@@ -123,33 +164,46 @@ pub(crate) fn delta_step_kernel<F: Float>(
 
         let mut ks = 0.0f32;
         let mut qs = 0.0f32;
-        for i in 0..hd {
-            let s = f32::cast_from(state[s_base + i * hd + j]);
-            ks += k_sh[i] * s;
-            qs += q_sh[i] * s;
+        #[unroll]
+        for m in 0..rows {
+            let i = r * rows + m;
+            ks += k_sh[i] * s[m];
+            qs += q_sh[i] * s[m];
+        }
+        // The column's quarters meet (adjacent lanes of one plane).
+        #[unroll]
+        for bit in 0..comptime!(STEP_SPLIT.trailing_zeros() as usize) {
+            let mask = comptime!(1u32 << bit);
+            ks += plane_shuffle_xor(ks, mask);
+            qs += plane_shuffle_xor(qs, mask);
         }
         // S' = decay S + k u^T with u = beta (v - decay S^T k); o = S'^T q.
-        let u = beta * (v - decay * ks * kn);
+        let u = beta * (v_sh[j] - decay * ks * kn);
         let o = decay * qs * qn + u * qk * qn * kn;
         let ku = kn * u;
-        for i in 0..hd {
-            let at = s_base + i * hd + j;
-            let s = f32::cast_from(state[at]);
-            state[at] = F::cast_from(decay * s + k_sh[i] * ku);
+        #[unroll]
+        for m in 0..rows {
+            s[m] = decay * s[m] + k_sh[r * rows + m] * ku;
         }
-
-        o_sh[j] = o;
+        if lead {
+            o_sh[j] = o;
+        }
         sync_cube();
         let mut oo = 0.0f32;
-        for i in 0..hd {
-            let oi = o_sh[i];
-            oo += oi * oi;
+        if tid < hd {
+            let oi = o_sh[tid];
+            oo = oi * oi;
         }
-        let gate = f32::cast_from(proj[row + (3 * hk + cq) * pc]);
-        let y = o / (oo * inv_hd + eps).sqrt() * gamma / (1.0 + (-gate).exp());
-        out[(b * steps + t) * hk + cq] = F::cast_from(y);
-        // Every unit is done with this token's shared values before the next overwrites them.
-        sync_cube();
+        let oo = head_sum(&mut red, oo);
+        if lead {
+            let gate = f32::cast_from(proj[row + (3 * hk + cq) * pc]);
+            let y = o / (oo * inv_hd + eps).sqrt() * gamma / (1.0 + (-gate).exp());
+            out[(b * steps + t) * hk + cq] = F::cast_from(y);
+        }
+    }
+    #[unroll]
+    for m in 0..rows {
+        state[s_base + (r * rows + m) * hd + j] = F::cast_from(s[m]);
     }
 }
 

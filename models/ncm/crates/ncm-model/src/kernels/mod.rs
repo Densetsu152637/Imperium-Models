@@ -7,15 +7,16 @@
 
 mod argmax;
 mod assign;
+mod attend;
 mod delta;
 mod gemv;
 mod norm;
 mod quant;
 mod retrieval;
 
-use burn::backend::tensor::{FloatTensor, IntTensor};
+use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
 use burn::backend::{Backend, Dispatch, backend_extension};
-use burn::tensor::{DType, Int, Tensor};
+use burn::tensor::{Bool, DType, Int, Tensor};
 use burn_cubecl::cubecl::prelude::*;
 use burn_cubecl::cubecl::{CubeCount, CubeDim};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
@@ -56,7 +57,7 @@ fn launch_rms_norm(
 }
 
 /// Cubes per SM the GEMV grids aim for.
-const GEMV_WAVES: usize = 2;
+const GEMV_WAVES: usize = 4;
 
 /// Adds the `splits` f32 partials `part` `[splits, count]` into `y` (`count` elements).
 fn gemv_sum(
@@ -132,15 +133,37 @@ impl RetrievalDims {
     }
 
     /// Grid sizes that serve every position of a cache of `capacity`: the most candidate
-    /// blocks and the most chunks of attended slots (dense steps see `pos + 1` slots, which is
-    /// at most `local + topk * block` until a step turns sparse).
-    fn grids(&self, capacity: usize) -> (usize, usize) {
+    /// blocks; the query heads per attention cube; and the attention chunks and tiles per chunk
+    /// covering the most attended slots (dense steps see `pos + 1` slots, which is at most
+    /// `local + topk * block` until a step turns sparse). Short steps spread over many cubes
+    /// (fewer heads each); long ones read each cached row once for every head and take two
+    /// tiles per cube, so the combine merges half the partials (measured best on an RTX 5080).
+    fn grids(&self, capacity: usize) -> RetrievalGrid {
         let last = capacity.saturating_sub(1);
         let blocks = if last >= self.local { (last - self.local) / self.block + 1 } else { 0 };
         let slots =
             if self.dense { capacity } else { capacity.min(self.topk * self.block + self.local) };
-        (blocks.max(1), slots.div_ceil(retrieval::CHUNK).max(1))
+        let tiles = slots.div_ceil(retrieval::CHUNK).max(1);
+        let long = tiles >= retrieval::LONG_TILES;
+        let want = if long { retrieval::HEAD_GROUP_LONG } else { retrieval::HEAD_GROUP };
+        // The largest head group up to `want` that splits the heads evenly.
+        let heads_per =
+            (1..=want.min(self.heads)).rev().find(|g| self.heads.is_multiple_of(*g)).unwrap_or(1);
+        let per = if long { 2 } else { 1 };
+        RetrievalGrid { blocks: blocks.max(1), chunks: tiles.div_ceil(per), tiles: per, heads_per }
     }
+}
+
+/// Launch shape of one retrieval decode step (see [`RetrievalDims::grids`]).
+struct RetrievalGrid {
+    /// Candidate blocks the indexer may score.
+    blocks: usize,
+    /// Attention cubes per head group.
+    chunks: usize,
+    /// Tiles of `retrieval::CHUNK` slots per attention cube.
+    tiles: usize,
+    /// Query heads per attention cube.
+    heads_per: usize,
 }
 
 #[backend_extension(Cube)]
@@ -261,6 +284,22 @@ pub trait NcmKernels: Backend {
         count: IntTensor<Self>,
         start: usize,
         dims: RetrievalDims,
+    ) -> FloatTensor<Self>;
+
+    /// See [`attend_decode`].
+    fn ncm_attend_decode(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
+    /// See [`attend_decode`], with a mask.
+    fn ncm_attend_decode_masked(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: BoolTensor<Self>,
+        t: usize,
     ) -> FloatTensor<Self>;
 
     /// See [`retrieval_decode`].
@@ -600,7 +639,7 @@ impl NcmKernels for CubeBackend {
             delta::delta_step_kernel::launch_unchecked(
                 &client,
                 CubeCount::Static((b * heads) as u32, 1, 1),
-                CubeDim::new_1d(hd as u32),
+                CubeDim::new_1d((hd * delta::STEP_SPLIT) as u32),
                 proj.into_tensor_arg(),
                 conv_w.into_tensor_arg(),
                 a_log.into_tensor_arg(),
@@ -755,6 +794,20 @@ impl NcmKernels for CubeBackend {
         out
     }
 
+    fn ncm_attend_decode(q: CubeTensor, k: CubeTensor, v: CubeTensor) -> CubeTensor {
+        launch_attend_decode(q, k, v, None, 1)
+    }
+
+    fn ncm_attend_decode_masked(
+        q: CubeTensor,
+        k: CubeTensor,
+        v: CubeTensor,
+        mask: CubeTensor,
+        t: usize,
+    ) -> CubeTensor {
+        launch_attend_decode(q, k, v, Some(mask), t)
+    }
+
     fn ncm_retrieval_decode(
         proj: CubeTensor,
         q_gamma: CubeTensor,
@@ -778,9 +831,7 @@ impl NcmKernels for CubeBackend {
         let d = dims;
         let (h, dr, l) = (d.heads, d.rope_dim, d.latent);
         let (gate, index_q, index_k) = d.offsets();
-        let (blocks, chunks) = d.grids(capacity);
-        // Heads per attention cube: a pair when they split evenly, else one.
-        let hg = if h.is_multiple_of(retrieval::HEAD_GROUP) { retrieval::HEAD_GROUP } else { 1 };
+        let RetrievalGrid { blocks, chunks, tiles, heads_per: hg } = d.grids(capacity);
         let plane = proj.client.properties().hardware.plane_size_max as usize;
         assert_eq!(plane, retrieval::LANES, "the decode kernels take 32-lane planes");
         let dtype = elem(proj.dtype);
@@ -883,6 +934,7 @@ impl NcmKernels for CubeBackend {
                 part_acc.clone().into_tensor_arg(),
                 position.into_tensor_arg(),
                 chunks,
+                tiles,
                 d.topk,
                 h,
                 dr,
@@ -895,8 +947,8 @@ impl NcmKernels for CubeBackend {
             );
             retrieval::ret_combine_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * h * d.v_dim.div_ceil(retrieval::LANES)) as u32, 1, 1),
-                CubeDim::new_1d(CUBE as u32),
+                CubeCount::Static((b * h * d.v_dim.div_ceil(retrieval::COMBINE_COLS)) as u32, 1, 1),
+                CubeDim::new_1d(retrieval::COMBINE_CUBE as u32),
                 proj.into_tensor_arg(),
                 wuv.into_tensor_arg(),
                 part_max.into_tensor_arg(),
@@ -978,6 +1030,73 @@ pub fn delta_scan(
 pub fn scratch_i32<const D: usize>(like: &Tensor<3>, shape: [usize; D]) -> Tensor<D, Int> {
     let t = <Dispatch as NcmKernels>::ncm_scratch_i32(like.clone().into_dispatch(), shape.to_vec());
     Tensor::from_dispatch(t)
+}
+
+/// Launches [`attend::attend_decode_kernel`] (see [`attend_decode`]).
+fn launch_attend_decode(
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    mask: Option<CubeTensor>,
+    t: usize,
+) -> CubeTensor {
+    let [b, kvh, rows, d] = q.meta.shape().dims::<4>();
+    let masked = mask.is_some();
+    // Without a mask the kernel reads none: any u8 tensor stands in.
+    let mask = mask.unwrap_or_else(|| scratch(&q, vec![1, 1], DType::U8));
+    let keys = k.meta.shape().dims::<4>()[2];
+    let out = empty_like(&q, vec![b, kvh, rows, d]);
+    let dtype = elem(q.dtype);
+    let client = q.client.clone();
+    unsafe {
+        attend::attend_decode_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static((b * kvh * rows) as u32, 1, 1),
+            CubeDim::new_1d(attend::CUBE as u32),
+            q.into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            mask.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            kvh,
+            rows,
+            keys,
+            t,
+            1.0 / (d as f32).sqrt(),
+            d,
+            masked,
+            dtype,
+        );
+    }
+    out
+}
+
+/// Whether [`attend_decode`] takes `rows` query rows per key/value head of width `d` against
+/// `keys` cached positions.
+pub fn attend_decode_fits(rows: usize, d: usize, keys: usize) -> bool {
+    rows <= 16 && d <= attend::CUBE && (1..=attend::MAX_KEYS).contains(&keys)
+}
+
+/// Attention of a decode step in one kernel: `q` `[B, KVH, R, d]` (a group's query heads
+/// folded into the rows, `R = G t`), `k`, `v` `[B, KVH, S, d]`, and optionally the `[t, S]`
+/// mask (`true` hides a key) shared by the group's heads; returns
+/// `softmax(q k^T / sqrt(d)) v` `[B, KVH, R, d]`. Only for shapes [`attend_decode_fits`]
+/// accepts.
+pub fn attend_decode(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    t: usize,
+) -> Tensor<4> {
+    let (q, k, v) = (q.into_dispatch(), k.into_dispatch(), v.into_dispatch());
+    let out = match mask {
+        None => <Dispatch as NcmKernels>::ncm_attend_decode(q, k, v),
+        Some(m) => {
+            <Dispatch as NcmKernels>::ncm_attend_decode_masked(q, k, v, m.into_dispatch(), t)
+        }
+    };
+    Tensor::from_dispatch(out)
 }
 
 /// Block selection of prefill queries `t0 .. t0 + q` of a chunk whose first query sits at

@@ -30,14 +30,22 @@ use cubecl::prelude::*;
 pub(crate) const CUBE: usize = 256;
 /// Units per cube of the indexer kernel (a power of two, whole planes).
 pub(crate) const INDEX_CUBE: usize = 256;
-/// Positions per attention chunk (one cube's share of a decode step).
+/// Positions per attention tile; a decode attention cube takes one or more tiles.
 pub(crate) const CHUNK: usize = 32;
+/// Steps attending over at least this many tiles count as long (see `RetrievalDims::grids`).
+pub(crate) const LONG_TILES: usize = 64;
 /// Lanes per plane the decode attention and combine kernels are written for (NVIDIA warps).
 pub(crate) const LANES: usize = 32;
 /// Planes per cube of the decode attention and combine kernels.
 pub(crate) const PLANES: usize = CUBE / LANES;
-/// Query heads per cube of the decode attention kernel (more cubes in flight for short steps).
-pub(crate) const HEAD_GROUP: usize = 2;
+/// Units per cube of [`ret_combine_kernel`].
+pub(crate) const COMBINE_CUBE: usize = 512;
+/// Value columns per cube of [`ret_combine_kernel`].
+pub(crate) const COMBINE_COLS: usize = 16;
+/// Query heads per cube of the decode attention kernel on short steps (more cubes in flight).
+pub(crate) const HEAD_GROUP: usize = 4;
+/// Query heads per cube on long steps (each cached row read once for all of them).
+pub(crate) const HEAD_GROUP_LONG: usize = 8;
 /// Cubes per query head of the prep kernel, each computing a slice of the absorbed query.
 pub(crate) const PREP_SLICES: usize = 16;
 // Hidden positions score -1e30 (finite, so no inf - inf); anything below -1e29 counts as hidden.
@@ -483,17 +491,19 @@ pub(crate) fn ret_topk_kernel(
     }
 }
 
-/// One cube per (batch row, chunk of `CHUNK` slots, group of `hg` query heads). A step is sparse
-/// when it has more than `k` candidate blocks (never in `dense` mode); then slot `u` is
-/// position `picked[u / block] * block + u % block` for `u < k * block` (visible when at most
-/// `pos - local`) and window position `pos + 1 - local + (u - k * block)` after that; in the
-/// dense layout slot `u` is position `u`. Writes the chunk's max, sum of exponentials and
-/// unnormalised latent sum for each of its heads.
+/// One cube per (batch row, chunk of `tiles` tiles of `CHUNK` slots, group of `hg` query
+/// heads). A step is sparse when it has more than `k` candidate blocks (never in `dense` mode);
+/// then slot `u` is position `picked[u / block] * block + u % block` for `u < k * block`
+/// (visible when at most `pos - local`) and window position `pos + 1 - local + (u - k * block)`
+/// after that; in the dense layout slot `u` is position `u`. Writes the chunk's max, sum of
+/// exponentials and unnormalised latent sum for each of its heads.
 ///
-/// Scores: each plane takes `CHUNK / 8` slots and its lanes split the row width (coalesced, the
-/// loads unrolled), every lane keeping the partial dot products of those slots and the group's
-/// heads in registers, then one plane sum each. Softmax: one plane per head, one lane per slot.
-/// Weighted sums: each unit owns latent columns, one cached value feeding every head.
+/// Per tile, scores: each plane takes `CHUNK / 8` slots and its lanes split the row width
+/// (coalesced, the loads unrolled), every lane keeping the partial dot products of those slots
+/// and the group's heads in registers, then one plane sum each. Softmax: one plane per head,
+/// one lane per slot, a running max carried from tile to tile. Weighted sums: each unit owns
+/// latent columns, one cached value feeding every head. Several tiles per cube at long contexts
+/// keep the partials the combine merges few.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ret_attend_kernel<F: Float>(
@@ -506,6 +516,7 @@ pub(crate) fn ret_attend_kernel<F: Float>(
     part_acc: &mut Tensor<f32>,
     position: &Tensor<i32>,
     chunks: usize,
+    tiles: usize,
     k: usize,
     #[comptime] heads: usize,
     #[comptime] dr: usize,
@@ -538,6 +549,10 @@ pub(crate) fn ret_attend_kernel<F: Float>(
     let mut sc = Shared::<[f32]>::new_slice(hg * CHUNK);
     let mut at = Shared::<[u32]>::new_slice(CHUNK);
     let mut ok = Shared::<[u32]>::new_slice(CHUNK);
+    // Per head: running max and sum, and this tile's rescale of the sums so far.
+    let mut run_m = Shared::<[f32]>::new_slice(hg);
+    let mut run_l = Shared::<[f32]>::new_slice(hg);
+    let mut corr = Shared::<[f32]>::new_slice(hg);
     let mut i = tid;
     while i < hg * width {
         let h = h0 + i / width;
@@ -549,116 +564,150 @@ pub(crate) fn ret_attend_kernel<F: Float>(
         }
         i += CUBE;
     }
-    // Map the chunk's slots to cache positions.
-    if tid < CHUNK {
-        let u = chunk * CHUNK + tid;
-        let mut position = 0usize;
-        let mut visible = u < slots;
-        if visible {
-            if sparse {
-                if u < k * block {
-                    let blk = usize::cast_from(picked[b * k + u / block]);
-                    position = blk * block + u % block;
-                    visible = position + local <= pos;
-                } else {
-                    position = pos + 1 - local + (u - k * block);
-                }
-            } else {
-                position = u;
-            }
-        }
-        // Hidden slots read position 0 and weigh zero.
-        at[tid] = u32::cast_from(select(visible, position, 0usize));
-        ok[tid] = select(visible, 1u32, 0u32);
+    if tid < hg {
+        run_m[tid] = f32::new(-1.0e30f32);
+        run_l[tid] = 0.0f32;
     }
-    sync_cube();
+    let mut acc = Array::<f32>::new(comptime!(hg * cols));
+    #[unroll]
+    for a in 0..hg * cols {
+        acc[a] = 0.0f32;
+    }
     let (k0, k1, k2) = (kv.stride(0), kv.stride(1), kv.stride(2));
     let row0 = b * k0;
-    let mut rows = Array::<usize>::new(per);
-    #[unroll]
-    for j in 0..per {
-        rows[j] = row0 + usize::cast_from(at[plane * per + j]) * k1;
-    }
-    let mut part = Array::<f32>::new(comptime!(per * hg));
-    #[unroll]
-    for a in 0..per * hg {
-        part[a] = 0.0f32;
-    }
-    #[unroll]
-    for m in 0..steps {
-        let d = lane + m * LANES;
-        if d < width {
-            let mut qv = Array::<f32>::new(hg);
-            #[unroll]
-            for h in 0..hg {
-                qv[h] = q_sh[h * width + d];
+    let first = chunk * tiles * CHUNK;
+    // Tiles past the step's slots are skipped (uniform over the cube).
+    let mut t = 0usize;
+    while t < tiles && first + t * CHUNK < slots {
+        // Map the tile's slots to cache positions.
+        if tid < CHUNK {
+            let u = first + t * CHUNK + tid;
+            let mut position = 0usize;
+            let mut visible = u < slots;
+            if visible {
+                if sparse {
+                    if u < k * block {
+                        let blk = usize::cast_from(picked[b * k + u / block]);
+                        position = blk * block + u % block;
+                        visible = position + local <= pos;
+                    } else {
+                        position = pos + 1 - local + (u - k * block);
+                    }
+                } else {
+                    position = u;
+                }
             }
-            #[unroll]
-            for j in 0..per {
-                let x = f32::cast_from(kv[rows[j] + d * k2]);
+            // Hidden slots read position 0 and weigh zero.
+            at[tid] = u32::cast_from(select(visible, position, 0usize));
+            ok[tid] = select(visible, 1u32, 0u32);
+        }
+        sync_cube();
+        let mut rows = Array::<usize>::new(per);
+        #[unroll]
+        for j in 0..per {
+            rows[j] = row0 + usize::cast_from(at[plane * per + j]) * k1;
+        }
+        let mut part = Array::<f32>::new(comptime!(per * hg));
+        #[unroll]
+        for a in 0..per * hg {
+            part[a] = 0.0f32;
+        }
+        #[unroll]
+        for m in 0..steps {
+            let d = lane + m * LANES;
+            if d < width {
+                let mut qv = Array::<f32>::new(hg);
                 #[unroll]
                 for h in 0..hg {
-                    part[j * hg + h] += qv[h] * x;
+                    qv[h] = q_sh[h * width + d];
+                }
+                #[unroll]
+                for j in 0..per {
+                    let x = f32::cast_from(kv[rows[j] + d * k2]);
+                    #[unroll]
+                    for h in 0..hg {
+                        part[j * hg + h] += qv[h] * x;
+                    }
                 }
             }
         }
-    }
-    #[unroll]
-    for j in 0..per {
-        let s = plane * per + j;
         #[unroll]
-        for h in 0..hg {
-            let total = plane_sum(part[j * hg + h]);
-            if lane == 0 {
-                sc[h * CHUNK + s] = select(ok[s] == 1, total, f32::new(-1.0e30f32));
+        for j in 0..per {
+            let s = plane * per + j;
+            #[unroll]
+            for h in 0..hg {
+                let total = plane_sum(part[j * hg + h]);
+                if lane == 0 {
+                    sc[h * CHUNK + s] = select(ok[s] == 1, total, f32::new(-1.0e30f32));
+                }
             }
         }
-    }
-    sync_cube();
-    // Per head: the chunk's max, then exponentials in place and their sum.
-    if plane < hg {
-        let v = sc[plane * CHUNK + lane];
-        let top = plane_max(v);
-        let e = select(v > -1.0e29f32, (v - top).exp(), 0.0f32);
-        sc[plane * CHUNK + lane] = e;
-        let total = plane_sum(e);
-        if lane == 0 {
-            let o = (b * chunks + chunk) * heads + h0 + plane;
-            part_max[o] = top;
-            part_sum[o] = total;
+        sync_cube();
+        // Per head: the new running max, exponentials in place, the running sum.
+        if plane < hg {
+            let v = sc[plane * CHUNK + lane];
+            let old = run_m[plane];
+            let tile_top = plane_max(v);
+            let top = select(tile_top > old, tile_top, old);
+            let e = select(v > -1.0e29f32, (v - top).exp(), 0.0f32);
+            sc[plane * CHUNK + lane] = e;
+            let total = plane_sum(e);
+            if lane == 0 {
+                let factor = (old - top).exp();
+                run_l[plane] = run_l[plane] * factor + total;
+                run_m[plane] = top;
+                corr[plane] = factor;
+            }
         }
+        sync_cube();
+        // Unnormalised weighted latent sums.
+        #[unroll]
+        for j in 0..cols {
+            let c = tid + j * CUBE;
+            if c < latent {
+                #[unroll]
+                for h in 0..hg {
+                    acc[h * cols + j] *= corr[h];
+                }
+                #[unroll]
+                for s in 0..CHUNK {
+                    let x = f32::cast_from(kv[row0 + usize::cast_from(at[s]) * k1 + c * k2]);
+                    #[unroll]
+                    for h in 0..hg {
+                        acc[h * cols + j] += sc[h * CHUNK + s] * x;
+                    }
+                }
+            }
+        }
+        sync_cube();
+        t += 1;
     }
-    sync_cube();
-    // Unnormalised weighted latent sums.
+    if tid < hg {
+        let o = (b * chunks + chunk) * heads + h0 + tid;
+        part_max[o] = run_m[tid];
+        part_sum[o] = run_l[tid];
+    }
     #[unroll]
     for j in 0..cols {
         let c = tid + j * CUBE;
         if c < latent {
-            let mut acc = Array::<f32>::new(hg);
             #[unroll]
             for h in 0..hg {
-                acc[h] = 0.0f32;
-            }
-            #[unroll]
-            for s in 0..CHUNK {
-                let x = f32::cast_from(kv[row0 + usize::cast_from(at[s]) * k1 + c * k2]);
-                #[unroll]
-                for h in 0..hg {
-                    acc[h] += sc[h * CHUNK + s] * x;
-                }
-            }
-            #[unroll]
-            for h in 0..hg {
-                part_acc[((b * chunks + chunk) * heads + h0 + h) * latent + c] = acc[h];
+                part_acc[((b * chunks + chunk) * heads + h0 + h) * latent + c] = acc[h * cols + j];
             }
         }
     }
 }
 
-/// One cube per (batch row, head, tile of 32 value columns): merges the chunks' partial softmax
-/// (chunks without a visible slot skipped), then the tile's columns of the value up-projection
-/// `wuv` `[l, heads * dv]` (one lane per column, the planes splitting the latent, coalesced
-/// rows) and the sigmoid output gate from `p`. Writes `out` `[B, 1, heads * dv]`.
+/// One cube of `COMBINE_CUBE` units per (batch row, head, tile of `COMBINE_COLS` value
+/// columns): merges the chunks' partial softmax, then the tile's columns of the value
+/// up-projection `wuv` `[l, heads * dv]` and the sigmoid output gate from `p`. Writes `out`
+/// `[B, 1, heads * dv]`.
+///
+/// Every plane finds the overall max and normaliser itself (lanes striding the chunks: no
+/// cube-wide reduction), each unit merges latent columns over the chunks (four per round, the
+/// loads overlapping), and the projection gives each unit a column and every
+/// `COMBINE_CUBE / COMBINE_COLS`-th latent row (two rows of contiguous columns per plane load).
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ret_combine_kernel<F: Float>(
@@ -675,111 +724,107 @@ pub(crate) fn ret_combine_kernel<F: Float>(
     #[comptime] gate_offset: usize,
     #[define(F)] _dtype: ElemType,
 ) {
-    let tiles = comptime!(dv.div_ceil(LANES));
+    let tiles = comptime!(dv.div_ceil(COMBINE_COLS));
+    let groups = comptime!(COMBINE_CUBE / COMBINE_COLS);
+    let cols = comptime!(latent.div_ceil(COMBINE_CUBE));
     let bh = CUBE_POS / tiles;
     let tile = CUBE_POS % tiles;
     let b = bh / heads;
     let hh = bh % heads;
     let tid = UNIT_POS as usize;
     let lane = UNIT_POS_PLANE as usize;
-    let plane = tid / LANES;
-    let cols = comptime!(latent.div_ceil(CUBE));
     let mut o = Shared::<[f32]>::new_slice(latent);
-    let mut red = Shared::<[f32]>::new_slice(CUBE);
-    let mut wsh = Shared::<[f32]>::new_slice(CUBE);
-    // The overall max and normaliser, the chunks spread over the cube.
+    let mut red = Shared::<[f32]>::new_slice(COMBINE_CUBE);
     let mut m = f32::new(-1.0e30f32);
-    let mut ch = tid;
+    let mut ch = lane;
     while ch < chunks {
         let v = part_max[(b * chunks + ch) * heads + hh];
         m = select(v > m, v, m);
-        ch += CUBE;
+        ch += LANES;
     }
-    let m = cube_max(&mut red, m);
+    let m = plane_max(m);
     let mut total = 0.0f32;
-    let mut ch = tid;
+    let mut ch = lane;
     while ch < chunks {
         let i = (b * chunks + ch) * heads + hh;
         total += part_sum[i] * (part_max[i] - m).exp();
-        ch += CUBE;
+        ch += LANES;
     }
-    let total = cube_sum(&mut red, total);
-    // Merged latent sums: chunk weights staged CUBE at a time, four chunks per round so their
-    // loads overlap (chunks without a visible slot weigh zero and hold zeros).
+    let inv = 1.0f32 / plane_sum(total);
     let mut acc = Array::<f32>::new(cols);
     #[unroll]
     for j in 0..cols {
         acc[j] = 0.0f32;
     }
-    let mut base = 0usize;
-    while base < chunks {
-        let n = select(chunks - base < CUBE, chunks - base, CUBE);
-        if tid < n {
-            let pm = part_max[(b * chunks + base + tid) * heads + hh];
-            wsh[tid] = select(pm > -1.0e29f32, (pm - m).exp(), 0.0f32);
+    let stride = heads * latent;
+    let mut j = 0usize;
+    while j < chunks {
+        let quad = j + 4 <= chunks;
+        let i0 = (b * chunks + j) * heads + hh;
+        let w0 = (part_max[i0] - m).exp();
+        let mut w1 = 0.0f32;
+        let mut w2 = 0.0f32;
+        let mut w3 = 0.0f32;
+        if quad {
+            w1 = (part_max[i0 + heads] - m).exp();
+            w2 = (part_max[i0 + 2 * heads] - m).exp();
+            w3 = (part_max[i0 + 3 * heads] - m).exp();
         }
-        sync_cube();
-        let mut j = 0usize;
-        while j < n {
-            let i0 = ((b * chunks + base + j) * heads + hh) * latent;
-            let stride = heads * latent;
-            let quad = j + 4 <= n;
-            #[unroll]
-            for cc in 0..cols {
-                let c = tid + cc * CUBE;
-                if c < latent {
-                    if quad {
-                        acc[cc] += part_acc[i0 + c] * wsh[j]
-                            + part_acc[i0 + stride + c] * wsh[j + 1]
-                            + part_acc[i0 + 2 * stride + c] * wsh[j + 2]
-                            + part_acc[i0 + 3 * stride + c] * wsh[j + 3];
-                    } else {
-                        acc[cc] += part_acc[i0 + c] * wsh[j];
-                    }
+        let base = i0 * latent;
+        #[unroll]
+        for cc in 0..cols {
+            let c = tid + cc * COMBINE_CUBE;
+            if c < latent {
+                if quad {
+                    acc[cc] += part_acc[base + c] * w0
+                        + part_acc[base + stride + c] * w1
+                        + part_acc[base + 2 * stride + c] * w2
+                        + part_acc[base + 3 * stride + c] * w3;
+                } else {
+                    acc[cc] += part_acc[base + c] * w0;
                 }
             }
-            j += select(quad, 4usize, 1usize);
         }
-        sync_cube();
-        base += CUBE;
+        j += select(quad, 4usize, 1usize);
     }
     #[unroll]
     for j in 0..cols {
-        let c = tid + j * CUBE;
+        let c = tid + j * COMBINE_CUBE;
         if c < latent {
-            o[c] = acc[j] / total;
+            o[c] = acc[j] * inv;
         }
     }
     sync_cube();
-    let v = tile * LANES + lane;
+    let col = tid % COMBINE_COLS;
+    let group = tid / COMBINE_COLS;
+    let v = tile * COMBINE_COLS + col;
     let (w0, w1) = (wuv.stride(0), wuv.stride(1));
-    let col = (hh * dv + v) * w1;
-    let mut acc = 0.0f32;
+    let at = (hh * dv + v) * w1;
+    let mut sum = 0.0f32;
     if v < dv {
-        // Four rows per round, so their loads overlap.
-        let mut c = plane;
-        while c + 3 * PLANES < latent {
-            acc += o[c] * f32::cast_from(wuv[c * w0 + col])
-                + o[c + PLANES] * f32::cast_from(wuv[(c + PLANES) * w0 + col])
-                + o[c + 2 * PLANES] * f32::cast_from(wuv[(c + 2 * PLANES) * w0 + col])
-                + o[c + 3 * PLANES] * f32::cast_from(wuv[(c + 3 * PLANES) * w0 + col]);
-            c += 4 * PLANES;
+        let mut c = group;
+        while c + 3 * groups < latent {
+            sum += o[c] * f32::cast_from(wuv[c * w0 + at])
+                + o[c + groups] * f32::cast_from(wuv[(c + groups) * w0 + at])
+                + o[c + 2 * groups] * f32::cast_from(wuv[(c + 2 * groups) * w0 + at])
+                + o[c + 3 * groups] * f32::cast_from(wuv[(c + 3 * groups) * w0 + at]);
+            c += 4 * groups;
         }
         while c < latent {
-            acc += o[c] * f32::cast_from(wuv[c * w0 + col]);
-            c += PLANES;
+            sum += o[c] * f32::cast_from(wuv[c * w0 + at]);
+            c += groups;
         }
     }
-    red[tid] = acc;
+    red[tid] = sum;
     sync_cube();
-    if plane == 0 && v < dv {
-        let mut sum = 0.0f32;
-        for q in 0..PLANES {
-            sum += red[q * LANES + lane];
+    if tid < COMBINE_COLS && v < dv {
+        let mut total = 0.0f32;
+        for g in 0..groups {
+            total += red[g * COMBINE_COLS + tid];
         }
         let ps = p.stride(2);
         let gate = f32::cast_from(p[b * p.stride(0) + (gate_offset + hh * dv + v) * ps]);
-        out[b * heads * dv + hh * dv + v] = F::cast_from(sum / (1.0 + (-gate).exp()));
+        out[b * heads * dv + hh * dv + v] = F::cast_from(total / (1.0 + (-gate).exp()));
     }
 }
 
