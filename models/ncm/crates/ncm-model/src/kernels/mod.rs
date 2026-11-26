@@ -132,15 +132,37 @@ impl RetrievalDims {
     }
 
     /// Grid sizes that serve every position of a cache of `capacity`: the most candidate
-    /// blocks and the most chunks of attended slots (dense steps see `pos + 1` slots, which is
-    /// at most `local + topk * block` until a step turns sparse).
-    fn grids(&self, capacity: usize) -> (usize, usize) {
+    /// blocks; the query heads per attention cube; and the attention chunks and tiles per chunk
+    /// covering the most attended slots (dense steps see `pos + 1` slots, which is at most
+    /// `local + topk * block` until a step turns sparse). Short steps spread over many cubes
+    /// (fewer heads each); long ones read each cached row once for every head and take two
+    /// tiles per cube, so the combine merges half the partials (measured best on an RTX 5080).
+    fn grids(&self, capacity: usize) -> RetrievalGrid {
         let last = capacity.saturating_sub(1);
         let blocks = if last >= self.local { (last - self.local) / self.block + 1 } else { 0 };
         let slots =
             if self.dense { capacity } else { capacity.min(self.topk * self.block + self.local) };
-        (blocks.max(1), slots.div_ceil(retrieval::CHUNK).max(1))
+        let tiles = slots.div_ceil(retrieval::CHUNK).max(1);
+        let long = tiles >= retrieval::LONG_TILES;
+        let want = if long { retrieval::HEAD_GROUP_LONG } else { retrieval::HEAD_GROUP };
+        // The largest head group up to `want` that splits the heads evenly.
+        let heads_per =
+            (1..=want.min(self.heads)).rev().find(|g| self.heads.is_multiple_of(*g)).unwrap_or(1);
+        let per = if long { 2 } else { 1 };
+        RetrievalGrid { blocks: blocks.max(1), chunks: tiles.div_ceil(per), tiles: per, heads_per }
     }
+}
+
+/// Launch shape of one retrieval decode step (see [`RetrievalDims::grids`]).
+struct RetrievalGrid {
+    /// Candidate blocks the indexer may score.
+    blocks: usize,
+    /// Attention cubes per head group.
+    chunks: usize,
+    /// Tiles of `retrieval::CHUNK` slots per attention cube.
+    tiles: usize,
+    /// Query heads per attention cube.
+    heads_per: usize,
 }
 
 #[backend_extension(Cube)]
@@ -778,9 +800,7 @@ impl NcmKernels for CubeBackend {
         let d = dims;
         let (h, dr, l) = (d.heads, d.rope_dim, d.latent);
         let (gate, index_q, index_k) = d.offsets();
-        let (blocks, chunks) = d.grids(capacity);
-        // Heads per attention cube: a pair when they split evenly, else one.
-        let hg = if h.is_multiple_of(retrieval::HEAD_GROUP) { retrieval::HEAD_GROUP } else { 1 };
+        let RetrievalGrid { blocks, chunks, tiles, heads_per: hg } = d.grids(capacity);
         let plane = proj.client.properties().hardware.plane_size_max as usize;
         assert_eq!(plane, retrieval::LANES, "the decode kernels take 32-lane planes");
         let dtype = elem(proj.dtype);
@@ -883,6 +903,7 @@ impl NcmKernels for CubeBackend {
                 part_acc.clone().into_tensor_arg(),
                 position.into_tensor_arg(),
                 chunks,
+                tiles,
                 d.topk,
                 h,
                 dr,
@@ -895,8 +916,8 @@ impl NcmKernels for CubeBackend {
             );
             retrieval::ret_combine_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * h * d.v_dim.div_ceil(retrieval::LANES)) as u32, 1, 1),
-                CubeDim::new_1d(CUBE as u32),
+                CubeCount::Static((b * h * d.v_dim.div_ceil(retrieval::COMBINE_COLS)) as u32, 1, 1),
+                CubeDim::new_1d(retrieval::COMBINE_CUBE as u32),
                 proj.into_tensor_arg(),
                 wuv.into_tensor_arg(),
                 part_max.into_tensor_arg(),
