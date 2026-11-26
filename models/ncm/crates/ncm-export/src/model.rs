@@ -172,12 +172,12 @@ impl Names<'_> {
         self.w.get(name)
     }
 
-    /// A mixer weight: with or without the enum variant in the path.
+    /// A mixer weight. `Mixer` is a Burn module enum and the weight files are written with
+    /// `skip_enum_variants` off (`ncm_model::weights::save_weights`), so the variant name is a
+    /// path segment (burn-derive `codegen_enum` enters the module under the variant): exactly
+    /// `stack.blocks.{block}.attn.{Variant}.{leaf}`. `ncm-export --list-tensors` prints a file's.
     fn mixer(&self, block: usize, variant: &str, leaf: &str) -> Result<F32Tensor, ExportError> {
-        self.w.find(&[
-            format!("stack.blocks.{block}.attn.{variant}.{leaf}"),
-            format!("stack.blocks.{block}.attn.{leaf}"),
-        ])
+        self.w.get(&format!("stack.blocks.{block}.attn.{variant}.{leaf}"))
     }
 
     /// The weight key a mixer weight is stored under in the graphs (variant-free, so the
@@ -562,8 +562,13 @@ mod tests {
             add(format!("{b}.mlp.down.weight"), vec![ff, d], 0.05, false);
             if let LayerKind::Attention { .. } = kind {
                 let (h, kvh, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
-                add(format!("{b}.attn.qkv.weight"), vec![d, (h + 2 * kvh) * hd], 0.05, false);
-                add(format!("{b}.attn.o.weight"), vec![h * hd, d], 0.05, false);
+                add(
+                    format!("{b}.attn.Attention.qkv.weight"),
+                    vec![d, (h + 2 * kvh) * hd],
+                    0.05,
+                    false,
+                );
+                add(format!("{b}.attn.Attention.o.weight"), vec![h * hd, d], 0.05, false);
             }
         }
         let refs: Vec<(&str, &[usize], &[f32])> =

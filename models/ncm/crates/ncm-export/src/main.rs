@@ -19,7 +19,7 @@ struct Cli {
     #[arg(long)]
     model: PathBuf,
     /// The export directory (created).
-    #[arg(long, required_unless_present = "describe")]
+    #[arg(long, required_unless_present_any = ["describe", "list_tensors"])]
     out: Option<PathBuf>,
     /// Prefill bucket lengths.
     #[arg(long, value_delimiter = ',', default_value = "128,1024")]
@@ -36,12 +36,23 @@ struct Cli {
     /// cpu, intel, qualcomm or amd (the NPU profiles wait for their smoke tests).
     #[arg(long, default_value = "cpu")]
     target: String,
+    /// Print the tensors (name, dtype, shape) of the weight file's header and exit.
+    #[arg(long)]
+    list_tensors: bool,
     /// Print the phase graphs and their status, write nothing.
     #[arg(long)]
     describe: bool,
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if cli.list_tensors {
+        for (name, dtype, shape) in
+            ncm_export::weights::list_tensors(&cli.model).map_err(|e| e.to_string())?
+        {
+            println!("{name}	{dtype}	{shape:?}");
+        }
+        return Ok(());
+    }
     let config = read_config(&cli.model)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{} has no model config in its header", cli.model.display()))?;

@@ -229,6 +229,12 @@ pub trait ExecSession {
         Err(ExecError::Unsupported("host-chosen concepts need the NCM".into()))
     }
 
+    /// NCM: appends a concept just written (`unit` tokens) and holds the new condition, without
+    /// decoding the next concept (the eager path's order; graphed steps append and decode in one).
+    fn append(&mut self, _tokens: &[i32]) -> Result<(), ExecError> {
+        Err(ExecError::Unsupported("appending a concept needs the NCM".into()))
+    }
+
     /// Seconds the last steps spent capturing a decode graph (read once; 0 when none).
     fn take_capture_s(&mut self) -> f64 {
         0.0

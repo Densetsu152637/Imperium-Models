@@ -526,6 +526,11 @@ impl ExecSession for BurnSession {
         Ok(read_ids(&tokens))
     }
 
+    fn append(&mut self, tokens: &[i32]) -> Result<(), ExecError> {
+        let (m, s, device) = self.ncm()?;
+        ncm_cond(m, s, device, tokens).map(|_| ())
+    }
+
     fn take_capture_s(&mut self) -> f64 {
         match &mut self.inner {
             Inner::Tok(s) => std::mem::take(&mut s.capture_s),

@@ -57,6 +57,7 @@ exactly equal to a kept prefix resumes without a prefill.
   (1/1 for the token baseline, 1/block for hybrid backbone positions).
 - `BurnBackend::footprint` reports the cache as one `LatentCache` figure per slot: the per-part
   split (rings, indexer keys, DeltaNet state) belongs to the offload planner.
+- `ExecSession::append` adds a concept without decoding (the NCM's eager path appends at once, as it always did, so a cancel keeps that concept in the kept prefix; graphed steps append and decode together).
 - The hybrid session now calls `begin_request(opts.seed)` per request, as the batcher already
   did (the sequential engine never did, so seeded sampled requests were not reproducible).
 
@@ -69,6 +70,8 @@ hands its model and first session's caches to the continuous batcher
 (`into_batcher_parts`), which is unchanged.
 
 ## The exporter (`ncm-export`)
+
+Weight names are exact Burn module paths. `Mixer` is a module enum and `save_weights` leaves `skip_enum_variants` off, so the variant is a path segment (`stack.blocks.0.attn.DeltaNet.proj.weight`, `...attn.Attention.qkv.weight`); this follows burn-derive's `codegen_enum` and burn-store 0.22.1 but was not checked against a real file. `ncm-export --model f.safetensors --list-tensors` prints a header's names, dtypes and shapes to check it.
 
 ```
 ncm-export --model weights.safetensors --out dir --buckets 128,1024 --ctx 4096 \

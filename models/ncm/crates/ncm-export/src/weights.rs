@@ -133,6 +133,32 @@ impl Weights {
     }
 }
 
+/// One tensor of a file's header: (name, dtype, shape), sorted by name.
+pub type TensorInfo = (String, String, Vec<usize>);
+
+/// Lists a safetensors file's tensors from its header alone (no tensor data is read).
+pub fn list_tensors(path: &Path) -> Result<Vec<TensorInfo>, ExportError> {
+    use std::io::Read;
+    let io = |e: std::io::Error| ExportError::Io(format!("{}: {e}", path.display()));
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).map_err(io)?;
+    let len = u64::from_le_bytes(len);
+    if len > (64 << 20) {
+        return Err(ExportError::Weights(format!("{}: implausible header length", path.display())));
+    }
+    let mut header = vec![0u8; len as usize];
+    file.read_exact(&mut header).map_err(io)?;
+    let mut bytes = len.to_le_bytes().to_vec();
+    bytes.extend(header);
+    // The same parser, over a file with no data section.
+    let w = Weights::from_bytes(bytes, &path.display().to_string())?;
+    let mut out: Vec<TensorInfo> =
+        w.entries.iter().map(|(n, e)| (n.clone(), e.dtype.clone(), e.shape.clone())).collect();
+    out.sort();
+    Ok(out)
+}
+
 /// IEEE half to single.
 pub fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
@@ -202,6 +228,22 @@ mod tests {
         assert!(w.get("missing").is_err());
         let found = w.find(&["nope".into(), "b".into()]).unwrap();
         assert_eq!(found.data.len(), 3);
+    }
+
+    #[test]
+    fn a_header_lists_without_the_data() {
+        let dir = std::env::temp_dir().join(format!("ncm-list-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.safetensors");
+        std::fs::write(
+            &path,
+            safetensors_bytes(&[("b", &[2], &[1.0, 2.0]), ("a", &[1, 1], &[3.0])], &[]),
+        )
+        .unwrap();
+        let listed = list_tensors(&path).unwrap();
+        assert_eq!(listed[0], ("a".to_owned(), "F32".to_owned(), vec![1, 1]));
+        assert_eq!(listed.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

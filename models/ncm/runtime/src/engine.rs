@@ -1429,7 +1429,6 @@ impl<B: ExecBackend> Core<B> {
         let host_sampling = !run.params.is_greedy() || run.constraint.is_some();
         let mut forced: Vec<i32> = pending.to_vec();
         // The concept written last, appended by the next step.
-        let mut feed: Vec<i32> = Vec::new();
         let finish = 'generate: loop {
             if run.cancel.load(Ordering::Relaxed) {
                 break Finish::Stop;
@@ -1451,11 +1450,10 @@ impl<B: ExecBackend> Core<B> {
                     }
                     token as i32
                 };
-                session.decode_concept_host(&feed, &forced, &mut choose)?
+                session.decode_concept_host(&[], &forced, &mut choose)?
             } else {
-                picked(session.decode_step(&feed, &PickSpec::greedy())?)?
+                picked(session.decode_step(&[], &PickSpec::greedy())?)?
             };
-            history.extend_from_slice(&feed);
             let skip = forced.len();
             forced.clear();
             let before = run.emitted;
@@ -1470,7 +1468,10 @@ impl<B: ExecBackend> Core<B> {
             if history.len() + k > capacity {
                 break Finish::Length;
             }
-            feed = concept;
+            // Appended at once, as the eager path always did, so that a cancel at the top of
+            // the loop still keeps this concept in the cache and the kept prefix.
+            session.append(&concept)?;
+            history.extend_from_slice(&concept);
         };
         let decode_s = decode_started.elapsed().as_secs_f64();
         if self.cfg.prefix_reuse && history.len() > whole {
