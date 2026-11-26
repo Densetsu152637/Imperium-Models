@@ -59,7 +59,7 @@ mod kernel {
     pub(super) const PLANES: usize = 8;
     /// Lanes per plane.
     pub(super) const PLANE: usize = 32;
-    /// Most staged `x` slots of a quantised cube (eight rows of a 1,024-wide input).
+    /// Most staged `x` slots of a quantised cube (36 KiB); wider row sets stage in K tiles.
     pub(super) const QX: usize = 9216;
 
     /// Sum of `v` over the cube (`CUBE` units, planes of 32).
@@ -353,16 +353,20 @@ mod kernel {
         }
     }
 
-    /// The dot product of one feature's packed row (`row`, `srow` offsets) with staged row `r`.
+    /// One lane's share of the dot product of one feature's packed row with staged row `r` over
+    /// words `w_start..w_end` (the staged tile starting at input `k_base`); summed over the plane
+    /// by the caller.
     #[cube]
     #[allow(clippy::too_many_arguments)]
-    fn qdot<Q: Size>(
+    fn qdot_part<Q: Size>(
         packed: &Tensor<Vector<i32, Q>>,
         scales: &Tensor<f32>,
         xs: &Shared<[f32]>,
         feature: usize,
         k_len: usize,
-        words: usize,
+        k_base: usize,
+        w_start: usize,
+        w_end: usize,
         stride: usize,
         r: usize,
         #[comptime] bits: u32,
@@ -376,8 +380,8 @@ mod kernel {
         let row = feature * packed.stride(0);
         let srow = feature * scales.stride(0);
         let mut acc = 0.0f32;
-        let mut w = lane * v;
-        while w < words {
+        let mut w = w_start + lane * v;
+        while w < w_end {
             let block = packed[(row + w) / v];
             let scale = scales[srow + w / group_words];
             let mut sum = 0.0f32;
@@ -387,8 +391,9 @@ mod kernel {
                 let k0 = (w + i) * per;
                 #[unroll]
                 for j in 0..per {
-                    let kk = k0 + j;
-                    if kk < k_len {
+                    let k = k0 + j;
+                    if k < k_len {
+                        let kk = k - k_base;
                         let code =
                             f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
                         sum += (code - offset) * xs[r * stride + kk + kk / 32];
@@ -398,12 +403,13 @@ mod kernel {
             acc += sum * scale;
             w += PLANE * v;
         }
-        plane_sum(acc)
+        acc
     }
 
     /// Quantised fused GEMV: plane `p` of cube `c` computes output feature `c * PLANES + p`
-    /// (with `glu`, from packed features `f` and `f + n`). The row is staged whole in shared
-    /// memory (skewed as in `kernels::quant`), normed with `norm`; `out` as for `dense_kernel`.
+    /// (with `glu`, from packed features `f` and `f + n`). The rows are staged in shared memory
+    /// `tile_k` inputs at a time (skewed as in `kernels::quant`; `tile_k` is all of `k_len` or a
+    /// multiple of 512), normed with `norm`; `out` as for `dense_kernel`.
     #[cube(launch_unchecked)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn quant_kernel<F: Float, Q: Size>(
@@ -418,6 +424,7 @@ mod kernel {
         k_len: usize,
         n: usize,
         words: usize,
+        tile_k: usize,
         eps: f32,
         #[comptime] bits: u32,
         #[comptime] rows: usize,
@@ -432,64 +439,106 @@ mod kernel {
     ) {
         let tid = UNIT_POS as usize;
         let feature = CUBE_POS_X as usize * PLANES + UNIT_POS_Y as usize;
+        // Planes past the last feature still stage and wait with the others.
+        let active = feature < n;
+        let f = select(active, feature, 0usize);
+        let per = comptime!(32 / bits) as usize;
         let mut part_red = Shared::<[f32]>::new_slice(CUBE / 32);
         let mut xs = Shared::<[f32]>::new_slice(QX);
-        let stride = k_len + k_len / 32 + 1;
+        let stride = tile_k + tile_k / 32 + 1;
+        let mut rms = Array::<f32>::new(rows);
+        let mut g = Array::<f32>::new(rows);
+        let mut u = Array::<f32>::new(rows);
         #[unroll]
         for r in 0..rows {
-            let mut rms = 1.0f32;
+            rms[r] = 1.0;
             if comptime!(norm) {
-                rms = row_rms::<F>(x, delta, r, k_len, eps, &mut part_red, add);
+                rms[r] = row_rms::<F>(x, delta, r, k_len, eps, &mut part_red, add);
             }
-            let mut kk = tid;
-            while kk < k_len {
-                let sv = input(x, delta, r, kk, add);
-                let mut val = f32::cast_from(sv);
-                if comptime!(norm) {
-                    val = normed::<F>(sv, rms, gamma[kk * gamma.stride(0)]);
+            g[r] = 0.0;
+            u[r] = 0.0;
+        }
+        let mut k_base = 0usize;
+        while k_base < k_len {
+            let tk = select(k_base + tile_k < k_len, tile_k, k_len - k_base);
+            #[unroll]
+            for r in 0..rows {
+                let mut kk = tid;
+                while kk < tk {
+                    let k = k_base + kk;
+                    let sv = input(x, delta, r, k, add);
+                    let mut val = f32::cast_from(sv);
+                    if comptime!(norm) {
+                        val = normed::<F>(sv, rms[r], gamma[k * gamma.stride(0)]);
+                    }
+                    if comptime!(mul) {
+                        let m = f32::cast_from(mulby[r * mulby.stride(0) + k * mulby.stride(1)]);
+                        val = f32::cast_from(F::cast_from(val * m));
+                    }
+                    xs[r * stride + kk + kk / 32] = val;
+                    if comptime!(add) {
+                        if CUBE_POS_X == 0 {
+                            out[rows * n + r * k_len + k] = sv;
+                        }
+                    }
+                    kk += CUBE;
                 }
-                if comptime!(mul) {
-                    let m = f32::cast_from(mulby[r * mulby.stride(0) + kk * mulby.stride(1)]);
-                    val = f32::cast_from(F::cast_from(val * m));
-                }
-                xs[r * stride + kk + kk / 32] = val;
-                if comptime!(add) {
-                    if CUBE_POS_X == 0 {
-                        out[rows * n + r * k_len + kk] = sv;
+            }
+            sync_cube();
+            if active {
+                let end = (k_base + tk).div_ceil(per);
+                let w_end = select(end < words, end, words);
+                let w_start = k_base / per;
+                #[unroll]
+                for r in 0..rows {
+                    g[r] += qdot_part::<Q>(
+                        packed,
+                        scales,
+                        &xs,
+                        f,
+                        k_len,
+                        k_base,
+                        w_start,
+                        w_end,
+                        stride,
+                        r,
+                        bits,
+                        group_words,
+                    );
+                    if comptime!(glu) {
+                        u[r] += qdot_part::<Q>(
+                            packed,
+                            scales,
+                            &xs,
+                            f + n,
+                            k_len,
+                            k_base,
+                            w_start,
+                            w_end,
+                            stride,
+                            r,
+                            bits,
+                            group_words,
+                        );
                     }
                 }
-                kk += CUBE;
             }
-        }
-        sync_cube();
-        if feature >= n {
-            terminate!();
+            sync_cube();
+            k_base += tile_k;
         }
         #[unroll]
         for r in 0..rows {
-            let g =
-                qdot::<Q>(packed, scales, &xs, feature, k_len, words, stride, r, bits, group_words);
-            let mut u = 0.0f32;
+            let gs = plane_sum(g[r]);
+            let mut us = 0.0f32;
             if comptime!(glu) {
-                u = qdot::<Q>(
-                    packed,
-                    scales,
-                    &xs,
-                    feature + n,
-                    k_len,
-                    words,
-                    stride,
-                    r,
-                    bits,
-                    group_words,
-                );
+                us = plane_sum(u[r]);
             }
-            if UNIT_POS_X == 0 {
+            if active && UNIT_POS_X == 0 {
                 let mut rv = 0.0f32;
                 if comptime!(residual) {
                     rv = f32::cast_from(resid[r * resid.stride(0) + feature * resid.stride(1)]);
                 }
-                out[r * n + feature] = epilogue::<F>(g, u, rv, glu, sigmoid, residual);
+                out[r * n + feature] = epilogue::<F>(gs, us, rv, glu, sigmoid, residual);
             }
         }
     }
@@ -668,6 +717,7 @@ impl NcmFusedMlp for CubeBackend {
                 k,
                 f.n,
                 words,
+                crate::kernels::quant::staged_tile(rows, k, kernel::QX),
                 f.eps as f32,
                 f.bits,
                 rows,
@@ -725,9 +775,8 @@ fn weight(layer: &QLinear, rows: usize, d_in: usize, out_cols: usize) -> Option<
             let words = packed.dims()[1];
             let group_words = format.group_len(k) / format.per_word();
             let vec = if format.bits == 4 { 2 } else { 4 };
-            let fits = rows * (k + k / 32 + 1) <= kernel::QX
-                && words.is_multiple_of(vec)
-                && group_words.is_multiple_of(vec);
+            // Any width: the kernel stages the rows a tile at a time.
+            let fits = words.is_multiple_of(vec) && group_words.is_multiple_of(vec);
             fits.then_some(Weight::Quant { packed, scales, bits: format.bits, group_words })
         }
     }

@@ -23,8 +23,8 @@ pub(crate) const PLANES: usize = 4;
 pub(crate) const PLANE: usize = 32;
 /// Output features per cube of [`qgemv_vec_kernel`].
 pub(crate) const QPLANES: usize = 8;
-/// Most `x` slots [`qgemv_vec_kernel`] stages (36 KiB: eight rows of a 1,024-wide input with
-/// its skew, so batched slot steps of eight rows keep the vector kernel).
+/// Most `x` slots [`qgemv_vec_kernel`] stages at once (36 KiB); wider inputs go through in
+/// tiles ([`staged_tile`]).
 pub(crate) const QX: usize = 9216;
 /// Units per dequantisation cube.
 pub(crate) const DEQUANT_CUBE: usize = 256;
@@ -100,10 +100,12 @@ pub(crate) fn qgemv_kernel<F: Float>(
     }
 }
 
-/// [`qgemv_kernel`] with `x` staged in shared memory (f32, skewed, `rows * (k_len + k_len / 32 + 1) <= QX`) and each lane's
-/// words read as one vector of `v` when the word count and the group length are multiples of
-/// `v`: lane `l` takes words `(l + 32 i) * v .. + v`, which share one scale. `QPLANES` features
-/// per cube share the staged `x`.
+/// [`qgemv_kernel`] with `x` staged in shared memory (f32, skewed) a tile of `tile_k` inputs
+/// at a time (`rows * (tile_k + tile_k / 32 + 1) <= QX`, a multiple of 512 unless it is all of
+/// `k_len`), so inputs of any width keep it, and each lane's words read as one vector of `v`
+/// when the word count and the group length are multiples of `v`: lane `l` takes words
+/// `(l + 32 i) * v .. + v` of the tile, which share one scale. `QPLANES` features per cube
+/// share the staged `x`.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
@@ -114,6 +116,7 @@ pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
     k_len: usize,
     n_len: usize,
     words: usize,
+    tile_k: usize,
     #[comptime] bits: u32,
     #[comptime] rows: usize,
     #[comptime] group_words: usize,
@@ -122,71 +125,97 @@ pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
     let v = packed.vector_size().comptime();
     let lane = UNIT_POS_X as usize;
     let n = CUBE_POS_X as usize * QPLANES + UNIT_POS_Y as usize;
+    // Planes past the last feature still stage and wait with the others.
+    let active = n < n_len;
     let mut xs = Shared::<[f32]>::new_slice(QX);
     let (x0, x1) = (x.stride(0), x.stride(1));
     let tid = UNIT_POS as usize;
     // Skewed by one slot every 32 values: lanes reading every 4th to 32nd value hit distinct
     // banks.
-    let stride = k_len + k_len / 32 + 1;
-    let mut i = tid;
-    while i < rows * k_len {
-        let (r, k) = (i / k_len, i % k_len);
-        xs[r * stride + k + k / 32] = f32::cast_from(x[r * x0 + k * x1]);
-        i += PLANE * QPLANES;
-    }
-    sync_cube();
-    if n >= n_len {
-        terminate!();
-    }
+    let stride = tile_k + tile_k / 32 + 1;
     let per = comptime!(32 / bits) as usize;
     let mask = comptime!((1u32 << bits) - 1) as i32;
     let offset = comptime!(1u32 << (bits - 1)) as f32;
-    let row = n * packed.stride(0);
-    let srow = n * scales.stride(0);
+    let row = select(active, n, 0usize) * packed.stride(0);
+    let srow = select(active, n, 0usize) * scales.stride(0);
     let mut acc = Array::<f32>::new(rows);
     #[unroll]
     for r in 0..rows {
         acc[r] = 0.0;
     }
-    let mut w = lane * v;
-    while w < words {
-        let block = packed[(row + w) / v];
-        let scale = scales[srow + w / group_words];
-        let mut part = Array::<f32>::new(rows);
-        #[unroll]
-        for r in 0..rows {
-            part[r] = 0.0;
+    let mut k_base = 0usize;
+    while k_base < k_len {
+        let tk = select(k_base + tile_k < k_len, tile_k, k_len - k_base);
+        let mut i = tid;
+        while i < rows * tk {
+            let (r, kk) = (i / tk, i % tk);
+            xs[r * stride + kk + kk / 32] = f32::cast_from(x[r * x0 + (k_base + kk) * x1]);
+            i += PLANE * QPLANES;
         }
-        #[unroll]
-        for i in 0..v {
-            let word = block.extract(i);
-            let k0 = (w + i) * per;
-            #[unroll]
-            for j in 0..per {
-                let k = k0 + j;
-                if k < k_len {
-                    let code = f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
-                    let q = code - offset;
+        sync_cube();
+        if active {
+            let w_end =
+                select((k_base + tk).div_ceil(per) < words, (k_base + tk).div_ceil(per), words);
+            let mut w = k_base / per + lane * v;
+            while w < w_end {
+                let block = packed[(row + w) / v];
+                let scale = scales[srow + w / group_words];
+                let mut part = Array::<f32>::new(rows);
+                #[unroll]
+                for r in 0..rows {
+                    part[r] = 0.0;
+                }
+                #[unroll]
+                for i in 0..v {
+                    let word = block.extract(i);
+                    let k0 = (w + i) * per;
                     #[unroll]
-                    for r in 0..rows {
-                        part[r] += q * xs[r * stride + k + k / 32];
+                    for j in 0..per {
+                        let k = k0 + j;
+                        if k < k_len {
+                            let kk = k - k_base;
+                            let code =
+                                f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
+                            let q = code - offset;
+                            #[unroll]
+                            for r in 0..rows {
+                                part[r] += q * xs[r * stride + kk + kk / 32];
+                            }
+                        }
                     }
                 }
+                #[unroll]
+                for r in 0..rows {
+                    acc[r] += part[r] * scale;
+                }
+                w += PLANE * v;
             }
         }
-        #[unroll]
-        for r in 0..rows {
-            acc[r] += part[r] * scale;
-        }
-        w += PLANE * v;
+        sync_cube();
+        k_base += tile_k;
     }
     #[unroll]
     for r in 0..rows {
         let total = plane_sum(acc[r]);
-        if lane == 0 {
+        if active && lane == 0 {
             out[r * n_len + n] = F::cast_from(total);
         }
     }
+}
+
+/// The input tile of the staged quantised kernels for `rows` rows of `k_len` inputs within
+/// `capacity` staged slots (skewed by one every 32): all of `k_len` when it fits, else the
+/// largest multiple of 512 that does (512 aligns every q8/q4 word vector and scale group).
+pub(crate) fn staged_tile(rows: usize, k_len: usize, capacity: usize) -> usize {
+    let fits = |t: usize| rows * (t + t / 32 + 1) <= capacity;
+    if fits(k_len) {
+        return k_len;
+    }
+    let mut tile = 512;
+    while tile + 512 < k_len && fits(tile + 512) {
+        tile += 512;
+    }
+    tile
 }
 
 /// Decodes `packed` `[n_len, words]` with `scales` into `out` `[k_len, n_len]` (contiguous):

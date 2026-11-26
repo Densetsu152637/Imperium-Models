@@ -11,7 +11,7 @@ mod attend;
 mod delta;
 mod gemv;
 mod norm;
-mod quant;
+pub(crate) mod quant;
 mod retrieval;
 
 use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
@@ -432,7 +432,8 @@ impl NcmKernels for CubeBackend {
         // for q8; two for q4, whose decoding rather than its loads limits it.
         let vec = if bits == 4 { 2 } else { 4 };
         let strides = packed.meta.strides().to_vec();
-        if rows * (d_in + d_in / 32 + 1) <= quant::QX
+        // Any width: the kernel stages x a tile at a time.
+        if rows <= crate::quant::GEMV_ROWS
             && strides[1] == 1
             && strides[0].is_multiple_of(vec)
             && words.is_multiple_of(vec)
@@ -451,6 +452,7 @@ impl NcmKernels for CubeBackend {
                     d_in,
                     n_len,
                     words,
+                    quant::staged_tile(rows, d_in, quant::QX),
                     bits,
                     rows,
                     group_words,
