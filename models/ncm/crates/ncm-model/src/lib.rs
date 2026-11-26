@@ -34,9 +34,9 @@ pub mod weights;
 
 pub use cache::{KvCache, LayerCache};
 pub use config::{
-    Config, ConfigError, Design, NcmConfig, TokConfig, V2Config, ncm_250m, ncm_250m_of,
-    ncm_250m_v2, tiny_ncm, tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2, tok_250m, tok_250m_of,
-    tok_250m_v2,
+    Config, ConfigError, Design, HybridConfig, NcmConfig, TokConfig, V2Config, ncm_250m,
+    ncm_250m_hybrid, ncm_250m_of, ncm_250m_v2, tiny_hybrid, tiny_ncm, tiny_ncm_v2, tiny_tok,
+    tiny_tok_v2, tiny_v2, tok_250m, tok_250m_of, tok_250m_v2,
 };
 pub use ncm::{NcmCache, NcmLm, NcmParts, ncm_cache_bytes};
 pub use speculative::{Acceptance, DraftLoss, SpecStats, Speculator, draft_loss};

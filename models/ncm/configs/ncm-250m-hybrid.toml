@@ -1,0 +1,82 @@
+# NCM hybrid (adopted 2026-11-26): the v2 backbone over 32-token blocks (one step per block) and
+# the coarse-to-fine block decoder of Next-Concept Modeling (arXiv 2610.14162): a multiscale
+# residual VQ block tokenizer (8 levels), a 6-layer generator with cross-attention to a memory,
+# and the k = 4 design's 4-layer local decoder as the token decoder (with a reconstruction input
+# and a copy head). Design of record: Imperium-Research docs/next-concept-modelling/architecture.md.
+# ncm-250m-v2.toml (k = 4) is the fallback decoder design.
+model = "ncm"
+attention = "v2"
+vocab_size = 32000
+k = 4                # unused by the hybrid: blocks are [hybrid].block tokens
+head_dim = 64        # encoder, generator and token-decoder attention heads
+# Local encoder (also the tied-embedding width): 2 sliding-window layers + 1 gated DeltaNet
+local_dim = 512
+enc_layers = 2
+enc_heads = 8
+enc_kv_heads = 4
+enc_ff_dim = 1536
+enc_window = 512
+# Token decoder: the k = 4 design's local decoder
+dec_layers = 4
+dec_heads = 8
+dec_kv_heads = 4
+dec_ff_dim = 1536
+draft_layers = 0
+# Backbone over blocks: 14 layers, 7 gated DeltaNet and 7 sparse retrieval, alternating
+bb_dim = 1024
+bb_layers = 14
+bb_ff_dim = 2112
+rope_base = 10000.0
+rope_base_full = 1000000.0
+rope_scale = 1.0
+rope_scale_full = 1.0
+norm_eps = 1e-6
+
+[v2]
+dn_head_dim = 128
+dn_conv = 4
+dn_chunk = 64
+ret_heads = 8
+ret_nope_dim = 128
+ret_rope_dim = 64
+ret_v_dim = 128
+ret_latent = 512     # MLA cache: 512 latent + 64 RoPE key per block position
+idx_heads = 4
+idx_dim = 128
+ret_block = 64       # block positions per retrievable group (2,048 tokens)
+ret_topk = 32        # groups per query (2,048 positions, about 64k tokens)
+ret_local = 1024     # most recent block positions (32k tokens), always visible
+ret_dense = false
+idx_8bit = true
+ret_yarn_factor = 1.0
+ret_yarn_original = 128   # block positions (4,096 tokens) seen in pretraining
+
+[hybrid]
+block = 32
+levels = [1, 2, 4, 8, 12, 16, 24, 32]
+codebook = 4096
+latent = 256
+phi_ratio = 0.5
+phi_count = 4
+ema_decay = 0.99
+commitment = 0.25
+nested_dropout = 0.5
+tok_heads = 4        # tokenizer decoder: one bidirectional block of width 256
+tok_head_dim = 64
+tok_ff_dim = 768
+gen_layers = 6       # generator: 6 x 512, self- and cross-attention, MLP 1,536
+gen_heads = 8
+gen_kv_heads = 8
+gen_ff_dim = 1536
+slots = 4            # backbone slots in the memory
+recent = 2048        # recent local-encoder states in the memory
+retrieved_blocks = 8 # earlier block positions whose token ids join the memory
+copy_dim = 256
+pool_heads = 8
+corrupt_first = 0.75 # code corruption: mean 0.5, decreasing linearly across levels
+corrupt_last = 0.25
+zero_share = 0.3     # blocks trained on the autoregressive path (no reconstruction)
+known_share = 0.5    # blocks trained with a known prefix of 1..31 tokens
+level_alpha = 1.0
+redecode_min = 20
+tau = 0.5

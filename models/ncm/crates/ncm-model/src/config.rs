@@ -16,6 +16,8 @@ pub const NCM_250M_TOML: &str = include_str!("../../../configs/ncm-250m.toml");
 pub const TOK_250M_V2_TOML: &str = include_str!("../../../configs/tok-250m-v2.toml");
 /// The 250M NCM in the v2 attention design.
 pub const NCM_250M_V2_TOML: &str = include_str!("../../../configs/ncm-250m-v2.toml");
+/// The 250M NCM hybrid: v2 backbone over 32-token blocks, coarse-to-fine block decoder.
+pub const NCM_250M_HYBRID_TOML: &str = include_str!("../../../configs/ncm-250m-hybrid.toml");
 
 /// Every `full_every`-th layer (1-based) attends over the whole context.
 pub fn is_full_layer(index: usize, full_every: usize) -> bool {
@@ -107,6 +109,130 @@ impl Default for V2Config {
             ret_yarn_factor: 1.0,
             ret_yarn_original: 4096,
         }
+    }
+}
+
+/// The hybrid block decoder (`[hybrid]` in an NCM config; design of record: the research
+/// repository's `docs/next-concept-modelling/architecture.md`). An NCM config with this table
+/// builds [`crate::hybrid::HybridLm`]; without it, the k-token design ([`crate::NcmLm`]), which
+/// stays the fallback decoder design.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HybridConfig {
+    /// Tokens per block (L); the backbone runs once per block.
+    pub block: usize,
+    /// Code positions per level, coarse to fine (K = `levels.len()`); the last equals `block`.
+    pub levels: Vec<usize>,
+    /// Entries of each level's codebook.
+    pub codebook: usize,
+    /// Tokenizer latent width (codebook vectors).
+    pub latent: usize,
+    /// Blend ratio r of the phi convolution: `(1 - r) h + r conv(h)`.
+    pub phi_ratio: f64,
+    /// Phi convolutions, shared by levels as in the paper's code: level i uses the one whose
+    /// tick `j / (count - 1)` is nearest to `i / (K - 1)`.
+    pub phi_count: usize,
+    /// EMA decay of the codebook updates.
+    pub ema_decay: f64,
+    /// Commitment weight of the quantiser loss.
+    pub commitment: f64,
+    /// Probability of truncating the hierarchy at a random coarser level in tokenizer training.
+    pub nested_dropout: f64,
+    /// Tokenizer decoder: one bidirectional block of `latent` width.
+    pub tok_heads: usize,
+    pub tok_head_dim: usize,
+    pub tok_ff_dim: usize,
+    /// Generator: layers of `local_dim` width with self- and cross-attention.
+    pub gen_layers: usize,
+    pub gen_heads: usize,
+    pub gen_kv_heads: usize,
+    pub gen_ff_dim: usize,
+    /// Backbone slots in the memory: the block's backbone output projected into this many
+    /// vectors of `local_dim`.
+    pub slots: usize,
+    /// Recent local-encoder states in the memory (tokens before the block's start).
+    pub recent: usize,
+    /// Earlier block positions whose token ids join the memory (0: off).
+    pub retrieved_blocks: usize,
+    /// Width of the token decoder's copy (pointer) head.
+    pub copy_dim: usize,
+    /// Heads of the block pooling's attention.
+    pub pool_heads: usize,
+    /// Code corruption rate of the first and of the last level in generator training, linear
+    /// in between (the paper's recipe: mean 0.5, decreasing across levels).
+    pub corrupt_first: f64,
+    pub corrupt_last: f64,
+    /// Share of blocks whose token decoder trains without a reconstruction (z = 0: the
+    /// autoregressive path).
+    pub zero_share: f64,
+    /// Share of blocks that train with a known prefix of 1..block-1 tokens.
+    pub known_share: f64,
+    /// Level weights `l_k^-alpha` of the code loss (1: each level counts equally).
+    pub level_alpha: f64,
+    /// Re-decode after a rejection only if at least this many positions remain.
+    pub redecode_min: usize,
+    /// Parallel mode rejects a position whose top probability is below this.
+    pub tau: f64,
+}
+
+impl Default for HybridConfig {
+    fn default() -> Self {
+        Self {
+            block: 32,
+            levels: vec![1, 2, 4, 8, 12, 16, 24, 32],
+            codebook: 4096,
+            latent: 256,
+            phi_ratio: 0.5,
+            phi_count: 4,
+            ema_decay: 0.99,
+            commitment: 0.25,
+            nested_dropout: 0.5,
+            tok_heads: 4,
+            tok_head_dim: 64,
+            tok_ff_dim: 768,
+            gen_layers: 6,
+            gen_heads: 8,
+            gen_kv_heads: 8,
+            gen_ff_dim: 1536,
+            slots: 4,
+            recent: 2048,
+            retrieved_blocks: 8,
+            copy_dim: 256,
+            pool_heads: 8,
+            corrupt_first: 0.75,
+            corrupt_last: 0.25,
+            zero_share: 0.3,
+            known_share: 0.5,
+            level_alpha: 1.0,
+            redecode_min: 20,
+            tau: 0.5,
+        }
+    }
+}
+
+impl HybridConfig {
+    /// Levels (K).
+    pub fn depth(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Codes per block (99 for the design's schedule).
+    pub fn codes_per_block(&self) -> usize {
+        self.levels.iter().sum()
+    }
+
+    /// Offset of level `k`'s codes within a block's codes.
+    pub fn level_offset(&self, k: usize) -> usize {
+        self.levels[..k].iter().sum()
+    }
+
+    /// Panics unless the schedule is usable: increasing, ending at `block`.
+    pub fn check(&self) {
+        assert!(!self.levels.is_empty(), "the hybrid needs at least one level");
+        assert!(self.levels.windows(2).all(|w| w[0] < w[1]), "levels must increase");
+        assert_eq!(self.levels.last().copied(), Some(self.block), "the finest level is per token");
+        assert!(self.phi_count >= 1, "at least one phi convolution");
+        assert!(self.block >= 2, "blocks of at least two tokens");
     }
 }
 
@@ -209,6 +335,9 @@ pub struct NcmConfig {
     pub rope_scale_full: f64,
     pub norm_eps: f64,
     pub v2: V2Config,
+    /// The hybrid block decoder; None: the k-token design.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hybrid: Option<HybridConfig>,
 }
 
 impl Default for NcmConfig {
@@ -242,11 +371,14 @@ impl Default for NcmConfig {
             rope_scale_full: 1.0,
             norm_eps: 1e-6,
             v2: V2Config::default(),
+            hybrid: None,
         }
     }
 }
 
 /// Either model configuration; the `model` key of a config file picks the variant.
+// Configs are built once per model: the size gap between variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Config {
     Tok(TokConfig),
@@ -298,11 +430,11 @@ impl Config {
         }
     }
 
-    /// Tokens per decode unit: 1 for the baseline, `k` for the NCM.
+    /// Tokens per decode unit: 1 for the baseline, `k` for the NCM, the block for the hybrid.
     pub fn unit(&self) -> usize {
         match self {
             Self::Tok(_) => 1,
-            Self::Ncm(c) => c.k,
+            Self::Ncm(c) => c.hybrid.as_ref().map_or(c.k, |h| h.block),
         }
     }
 }
@@ -339,6 +471,11 @@ pub fn tok_250m_v2() -> TokConfig {
 /// The 250M NCM in the v2 attention design.
 pub fn ncm_250m_v2() -> NcmConfig {
     parse_ncm(NCM_250M_V2_TOML)
+}
+
+/// The 250M NCM hybrid (v2 backbone of 14 layers over 32-token blocks, block decoder).
+pub fn ncm_250m_hybrid() -> NcmConfig {
+    parse_ncm(NCM_250M_HYBRID_TOML)
 }
 
 /// The 250M token baseline of `design`.
@@ -429,4 +566,34 @@ pub fn tiny_tok_v2(v2: V2Config) -> TokConfig {
 /// The tiny NCM in the v2 design; the encoder's sliding window is `enc_window` tokens.
 pub fn tiny_ncm_v2(enc_window: usize, v2: V2Config) -> NcmConfig {
     NcmConfig { attention: Design::V2, v2, ..tiny_ncm(enc_window, 4) }
+}
+
+/// The tiny hybrid for CPU tests on the tiny v2 NCM: blocks of 8 tokens in 4 levels (1, 2, 4,
+/// 8), 16-entry codebooks of width 16, a 2-layer generator, a recent window of 16 tokens and 2
+/// retrieved block positions.
+pub fn tiny_hybrid(v2: V2Config) -> NcmConfig {
+    NcmConfig {
+        hybrid: Some(HybridConfig {
+            block: 8,
+            levels: vec![1, 2, 4, 8],
+            codebook: 16,
+            latent: 16,
+            phi_count: 2,
+            tok_heads: 2,
+            tok_head_dim: 8,
+            tok_ff_dim: 32,
+            gen_layers: 2,
+            gen_heads: 2,
+            gen_kv_heads: 1,
+            gen_ff_dim: 64,
+            slots: 2,
+            recent: 16,
+            retrieved_blocks: 2,
+            copy_dim: 16,
+            pool_heads: 2,
+            redecode_min: 4,
+            ..HybridConfig::default()
+        }),
+        ..tiny_ncm_v2(16, v2)
+    }
 }
