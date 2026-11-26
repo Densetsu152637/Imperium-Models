@@ -5,7 +5,8 @@
 //! [`gemv_vec_kernel`] reads a row-major `W` `[K, N]` in vectors of consecutive columns (16
 //! bytes per load where the width allows), eight units striding `K` per vector, and splits `K`
 //! over a second grid axis for about two cubes per SM; [`gemv_sum_kernel`] then adds the splits.
-//! [`gemv_cols_kernel`] is its scalar form (one column per unit), for widths no vector divides. [`gemv_rows_kernel`] is for a weight
+//! [`gemv_cols_kernel`] is its scalar form (one column per unit, up to eight rows), for widths
+//! no vector divides or strided weights. [`gemv_rows_kernel`] is for a weight
 //! stored transposed (`W[k, n]` at `n * K + k`, as the tied embedding in the logits): one plane
 //! per output, its units along `K`.
 
@@ -17,12 +18,10 @@ pub(crate) const CUBE: usize = 256;
 /// Columns per cube of [`gemv_cols_kernel`]; `CUBE / COLS` units share a column.
 pub(crate) const COLS: usize = 64;
 const LANES: usize = CUBE / COLS;
-/// Most rows `x` may have.
-/// Most rows `x` may have (the vector and transposed kernels; the scalar column kernel
-/// takes at most [`COLS_ROWS`]).
+/// Most rows `x` may have (every kernel here).
 pub(crate) const MAX_ROWS: usize = 8;
-/// Most rows of [`gemv_cols_kernel`].
-pub(crate) const COLS_ROWS: usize = 4;
+/// Most rows of [`gemv_cols_kernel`] (its staged slice is `COLS_ROWS * 512` values).
+pub(crate) const COLS_ROWS: usize = MAX_ROWS;
 
 /// Sums the `LANES` partial values of each column held in `red` (`CUBE` slots, lane-major).
 #[cube]
@@ -78,64 +77,31 @@ pub(crate) fn gemv_cols_kernel<F: Float>(
     }
     sync_cube();
     let (w0, w1) = (w.stride(0), w.stride(1));
-    let mut a0 = 0.0f32;
-    let mut a1 = 0.0f32;
-    let mut a2 = 0.0f32;
-    let mut a3 = 0.0f32;
+    let mut acc = Array::<f32>::new(rows);
+    #[unroll]
+    for r in 0..rows {
+        acc[r] = 0.0;
+    }
     if col < n {
         let mut kk = k0 + lane;
         while kk < k1 {
             let wv = f32::cast_from(w[kk * w0 + col * w1]);
             let at = kk - k0;
-            a0 += xs[at] * wv;
-            if comptime!(rows > 1) {
-                a1 += xs[512 + at] * wv;
-            }
-            if comptime!(rows > 2) {
-                a2 += xs[1024 + at] * wv;
-            }
-            if comptime!(rows > 3) {
-                a3 += xs[1536 + at] * wv;
+            #[unroll]
+            for r in 0..rows {
+                acc[r] += xs[r * 512 + at] * wv;
             }
             kk += LANES;
         }
     }
-    let t0 = lane_sum(&mut red, a0);
-    let mut t1 = f32::new(0.0f32);
-    let mut t2 = f32::new(0.0f32);
-    let mut t3 = f32::new(0.0f32);
-    if comptime!(rows > 1) {
-        t1 = lane_sum(&mut red, a1);
-    }
-    if comptime!(rows > 2) {
-        t2 = lane_sum(&mut red, a2);
-    }
-    if comptime!(rows > 3) {
-        t3 = lane_sum(&mut red, a3);
-    }
-    if tid < COLS && col < n {
-        if comptime!(split) {
-            let base = s * rows * n + col;
-            part[base] = t0;
-            if comptime!(rows > 1) {
-                part[base + n] = t1;
-            }
-            if comptime!(rows > 2) {
-                part[base + 2 * n] = t2;
-            }
-            if comptime!(rows > 3) {
-                part[base + 3 * n] = t3;
-            }
-        } else {
-            y[col] = F::cast_from(t0);
-            if comptime!(rows > 1) {
-                y[n + col] = F::cast_from(t1);
-            }
-            if comptime!(rows > 2) {
-                y[2 * n + col] = F::cast_from(t2);
-            }
-            if comptime!(rows > 3) {
-                y[3 * n + col] = F::cast_from(t3);
+    #[unroll]
+    for r in 0..rows {
+        let total = lane_sum(&mut red, acc[r]);
+        if tid < COLS && col < n {
+            if comptime!(split) {
+                part[s * rows * n + r * n + col] = total;
+            } else {
+                y[r * n + col] = F::cast_from(total);
             }
         }
     }

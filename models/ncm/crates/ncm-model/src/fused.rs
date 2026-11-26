@@ -115,7 +115,7 @@ pub fn add_rms_norm<const D: usize>(
 }
 
 /// `x W` for a dense weight `w` `[K, N]` (row-major, or the transpose of a row-major `[N, K]`):
-/// on CUDA with the fused kernels on, inputs of at most four rows (decode steps) take the
+/// on CUDA with the fused kernels on, inputs of at most eight rows (decode steps) take the
 /// matrix-vector kernels ([`crate::kernels::gemv`]); everything else Burn's matmul. Dense
 /// [`crate::quant::QLinear`] layers and the tied output head multiply through it.
 pub fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {

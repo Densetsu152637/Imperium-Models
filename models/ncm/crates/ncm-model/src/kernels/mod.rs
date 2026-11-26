@@ -373,8 +373,8 @@ impl NcmKernels for CubeBackend {
             // With splits, the last cube of each tile combined them (no second launch).
             return y;
         }
-        // A strided weight neither layout serves: the scalar column kernel (up to four rows).
-        assert!(rows <= gemv::COLS_ROWS, "a strided GEMV weight takes at most four rows");
+        // A strided weight neither layout serves: the scalar column kernel (up to eight rows).
+        assert!(rows <= gemv::COLS_ROWS, "a strided GEMV weight takes at most eight rows");
         // Enough cubes to keep every SM reading: split K when N alone gives too few tiles.
         let tiles = n.div_ceil(COLS);
         let mut splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(COLS).max(1));
@@ -1266,7 +1266,7 @@ pub fn assign_int_into<const D: usize>(
     drop(<Dispatch as NcmKernels>::ncm_assign_int(dst, src.into_dispatch(), axis, at));
 }
 
-/// `x W` for `x` `[.., K]` with at most four rows in all and `w` `[K, N]` (row-major, or the
+/// `x W` for `x` `[.., K]` with at most eight rows in all and `w` `[K, N]` (row-major, or the
 /// transpose of a row-major `[N, K]`), as bandwidth-bound matrix-vector kernels.
 pub fn gemv<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
     let mut shape = x.dims();
