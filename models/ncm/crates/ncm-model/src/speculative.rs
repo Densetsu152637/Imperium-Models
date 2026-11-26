@@ -206,6 +206,10 @@ pub struct Speculator {
     stats: SpecStats,
     #[cfg(feature = "cuda")]
     graphs: GraphState,
+    /// Whether the current concept's passes replay the graphs (set by `prepare`: a speculator
+    /// kept across requests waits for the cross-attention ring to fill again).
+    #[cfg(feature = "cuda")]
+    serving: bool,
 }
 
 impl Speculator {
@@ -219,6 +223,8 @@ impl Speculator {
             stats: SpecStats::default(),
             #[cfg(feature = "cuda")]
             graphs: GraphState::Untried,
+            #[cfg(feature = "cuda")]
+            serving: false,
         }
     }
 
@@ -373,20 +379,26 @@ impl Speculator {
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn prepare(&mut self, model: &NcmLm, cond: &Tensor<3>, cache: &NcmCache) {
         #[cfg(feature = "cuda")]
-        if let Some(g) = self.graphs(model, cond, cache) {
-            let device = cond.device();
-            let (cos, sin) = model.rope(cache.tokens, model.concept_size(), &device).tables();
-            let (q_cos, q_sin) = g.rope_q.tables();
-            crate::kernels::assign_into(&g.cond, cond.clone(), 0, 0);
-            crate::kernels::assign_into(&q_cos, cos, 0, 0);
-            crate::kernels::assign_into(&q_sin, sin, 0, 0);
+        {
+            let serving = if let Some(g) = self.graphs(model, cond, cache) {
+                let device = cond.device();
+                let (cos, sin) = model.rope(cache.tokens, model.concept_size(), &device).tables();
+                let (q_cos, q_sin) = g.rope_q.tables();
+                crate::kernels::assign_into(&g.cond, cond.clone(), 0, 0);
+                crate::kernels::assign_into(&q_cos, cos, 0, 0);
+                crate::kernels::assign_into(&q_sin, sin, 0, 0);
+                true
+            } else {
+                false
+            };
+            self.serving = serving;
         }
     }
 
     /// Greedy draft tokens `[B, k]` on the device. Follows [`Self::prepare`].
     fn draft(&mut self, model: &NcmLm, cond: &Tensor<3>, cache: &NcmCache) -> Tensor<2, Int> {
         #[cfg(feature = "cuda")]
-        if let GraphState::Ready(g) = &self.graphs {
+        if let (true, GraphState::Ready(g)) = (self.serving, &self.graphs) {
             // Safety: every buffer the graph touched is held by `g`, by the model (weights) or
             // by `cache` (the cross-attention rings), all alive across the replay, and all work
             // runs on this thread's stream.
@@ -409,7 +421,7 @@ impl Speculator {
         guess: Tensor<2, Int>,
     ) -> Tensor<2, Int> {
         #[cfg(feature = "cuda")]
-        if let GraphState::Ready(g) = &self.graphs {
+        if let (true, GraphState::Ready(g)) = (self.serving, &self.graphs) {
             crate::kernels::assign_int_into(&g.guess, guess, 0, 0);
             // Safety: as for the draft graph.
             unsafe { Dispatch::graph_replay(cond.device().as_dispatch(), &g.verify) }
@@ -507,7 +519,7 @@ impl Speculator {
             };
         }
         match &self.graphs {
-            GraphState::Ready(g) => Some(g),
+            GraphState::Ready(g) if ring_full => Some(g),
             _ => None,
         }
     }

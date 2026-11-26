@@ -138,6 +138,24 @@ impl KvCache {
         self.length = len;
     }
 
+    /// What [`Self::restore`] needs to return here.
+    pub fn snapshot(&self) -> KvSnapshot {
+        let ring = self.window.map(|_| {
+            (copy_of(self.k.as_ref().expect("cache")), copy_of(self.v.as_ref().expect("cache")))
+        });
+        KvSnapshot { len: self.length, ring }
+    }
+
+    /// Back to a [`Self::snapshot`] of this cache (ring contents written into its own buffers
+    /// on CUDA).
+    pub fn restore(&mut self, snapshot: &KvSnapshot) {
+        if let Some((k, v)) = &snapshot.ring {
+            store(self.k.as_mut().expect("cache"), k.clone());
+            store(self.v.as_mut().expect("cache"), v.clone());
+        }
+        self.length = snapshot.len;
+    }
+
     fn held(&self) -> usize {
         self.length.min(self.capacity)
     }
@@ -238,6 +256,44 @@ impl KvCache {
     }
 }
 
+/// A copy of `t` in a buffer of its own (on the CPU a clone suffices: writes there copy a
+/// buffer another tensor holds).
+pub(crate) fn copy_of<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&t.device()) {
+        let c = Tensor::<D>::zeros(t.dims(), &t.device()).cast(t.dtype());
+        crate::kernels::assign_into(&c, t.clone(), 0, 0);
+        return c;
+    }
+    t.clone()
+}
+
+/// Sets `slot` to `value`: written into `slot`'s own buffer on CUDA with the fused kernels on,
+/// so that graphs captured against the buffer keep seeing the cache, replaced elsewhere.
+pub(crate) fn store<const D: usize>(slot: &mut Tensor<D>, value: Tensor<D>) {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&slot.device()) {
+        crate::inplace::write_float(slot, value, 0, 0);
+        return;
+    }
+    *slot = value;
+}
+
+/// What a cache needs to return to an earlier position: its position, and the contents that
+/// moving on would overwrite (sliding rings and DeltaNet states). Append-only storage (growing
+/// key/value caches, retrieval latents) only rewinds.
+pub enum LayerSnapshot {
+    Kv(KvSnapshot),
+    Delta((Tensor<4>, Tensor<3>, usize)),
+    Latent(usize),
+}
+
+/// A [`KvCache`]'s position, and for a ring its keys and values.
+pub struct KvSnapshot {
+    len: usize,
+    ring: Option<(Tensor<4>, Tensor<4>)>,
+}
+
 /// Bytes of one layer's cache for a run of `max_positions`.
 pub fn layer_cache_bytes(
     kv_heads: usize,
@@ -279,6 +335,25 @@ impl LayerCache {
             Self::Kv(c) => c.reset(),
             Self::Delta(c) => c.reset(),
             Self::Latent(c) => c.reset(),
+        }
+    }
+
+    /// What [`Self::restore`] needs to return here.
+    pub fn snapshot(&self) -> LayerSnapshot {
+        match self {
+            Self::Kv(c) => LayerSnapshot::Kv(c.snapshot()),
+            Self::Delta(c) => LayerSnapshot::Delta(c.snapshot()),
+            Self::Latent(c) => LayerSnapshot::Latent(c.len()),
+        }
+    }
+
+    /// Back to a [`Self::snapshot`] of this cache.
+    pub fn restore(&mut self, snapshot: &LayerSnapshot) {
+        match (self, snapshot) {
+            (Self::Kv(c), LayerSnapshot::Kv(s)) => c.restore(s),
+            (Self::Delta(c), LayerSnapshot::Delta(s)) => c.restore(s.clone()),
+            (Self::Latent(c), LayerSnapshot::Latent(len)) => c.rewind(*len),
+            _ => panic!("a snapshot restores the cache it was taken of"),
         }
     }
 

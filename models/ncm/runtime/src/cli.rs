@@ -112,6 +112,10 @@ pub struct Cli {
     /// pass may resolve a near tie differently from step-by-step greedy decoding.
     #[arg(long)]
     pub speculate: bool,
+    /// Prefill every prompt from scratch instead of reusing the previous request's cache when
+    /// the prompt extends the previous prompt.
+    #[arg(long)]
+    pub no_prefix_reuse: bool,
     /// Quantise the linear layers' weights at load. A quantised weight file loads as it is.
     #[arg(long, value_enum, default_value = "none")]
     pub quant: QuantArg,
