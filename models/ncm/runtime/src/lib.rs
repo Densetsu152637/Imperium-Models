@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod app;
+pub mod batch;
 pub mod chat;
 pub mod cli;
 pub mod constrain;

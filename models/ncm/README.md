@@ -9,10 +9,11 @@ The design, plan and acceptance checks live in Imperium-Research under `docs/nex
 | Path | Contents |
 |---|---|
 | `Cargo.toml` | Rust workspace. CPU is the default backend; CUDA is the `cuda` feature |
-| `crates/ncm-model/` | Configs, layers, KV caches, the token baseline and the NCM. Device-agnostic: Burn picks CUDA, CPU or wgpu from the `Device` |
+| `crates/ncm-model/` | Configs, layers, caches, the token baseline and the NCM, each in two attention designs (`attention = "v2"` or `"fallback"`, see `docs/attention.md`). Device-agnostic: Burn picks CUDA, CPU or wgpu from the `Device` |
 | `crates/ncm-bench/` | `ncm-bench`, the batch-1 decode-speed benchmark |
 | `crates/ncm-data/` | `ncm-data`, the stage 2 data pipeline: fetch, sample, train the tokenizer, tokenise, stats |
-| `configs/` | Model configs (TOML), embedded into `ncm-model`, and `data-mix.toml`, the pinned pretraining source manifest |
+| `configs/` | Model configs (TOML), embedded into `ncm-model`: `*-250m-v2.toml` (the adopted attention design) and `*-250m.toml` (the fallback); and `data-mix.toml`, the pinned pretraining source manifest |
+| `docs/` | `attention.md` (the two attention designs as implemented), `quantisation.md` (8- and 4-bit weights), `chat-format.md` |
 | `runtime/` | `ncm-server`, an OpenAI-compatible inference server launched by Imperium like `llama-server` (see `runtime/README.md`). A training crate (Burn autodiff) will also build on `ncm-model` |
 | `scripts/check.sh` | CI checks: `cargo fmt --check`, `clippy`, `test` on the CPU backend, and a tiny benchmark run |
 | `data/`, `runs/`, `outputs/`, `weights/` | Local only, ignored by Git |
@@ -21,13 +22,34 @@ The design, plan and acceptance checks live in Imperium-Research under `docs/nex
 
 ```
 cargo build --release -p ncm-bench --features cuda
-target/release/ncm-bench --device cuda --context 2048 16384 --new-tokens 256   # the stage 1 gate
-target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8       # smoke run
+target/release/ncm-bench --device cuda --context 2048 16384 131072 --new-tokens 256   # speed gate, all four models
+target/release/ncm-bench --device cuda --design fallback --context 2048 16384          # the stage 1 gate
+target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8              # smoke run
+```
+
+`--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models; `--size 250m|1b` (default `250m`) picks the size (`configs/*-1b.toml`: `tok-1b`, `ncm-1b`, `ncm-hybrid-1b`, ~1.04B each, the v2 design only). `--quant q8|q4` runs the linear layers on 8-bit or 4-bit weights (`--quant-group 64|128` for q4, `--dense-head` to keep the output head dense; see `docs/quantisation.md`). With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
+
+More switches:
+
+| Flag | Effect |
+|---|---|
+| `--reference-kernels` | Run the v2 layers' reference tensor code on CUDA instead of the fused CubeCL kernels (which also turns the CUDA graphs off) |
+| `--no-cuda-graphs` | Keep the fused kernels but run them eagerly instead of replaying the NCM decoder, draft and verify passes and the v2 backbone step as CUDA graphs |
+| `--speculate on` | After each plain NCM run, decode the NCM again by self-speculation (the draft head proposes each concept in one pass, the decoder verifies it in one parallel pass; `docs/attention.md`) and report its tok/s, the share of draft tokens kept and the verify passes per concept. The token baseline always decodes plainly |
+| `--assume-accept 1.0 0.75 0.5` | With `--speculate on`, one more speculative run per rate that keeps that share of draft tokens whatever the decoder says. **Synthetic**: it times the passes a trained model with that acceptance would run (random weights accept few drafts); the output is not the model's, and the report labels it |
+| `--model hybrid` / `all` | The NCM hybrid (`configs/ncm-250m-hybrid.toml`, block decoder over 32-token blocks; `all` adds the token baseline and the k = 4 NCM, and reports hybrid / k = 4 ratios with the local test plan's step 6 gate). Runs the fast decode path (`ncm_model::hybrid::FastSession`, graphed on CUDA) |
+| `--hybrid-p 1.0 0.986 0.967 0.950` | The hybrid's **synthetic** per-token agreement rates (geometric first rejections, re-decodes and autoregressive fills run for real), plus a run on the autoregressive path alone and one with full rejection |
+| `predict` (subcommand) | The plan's decode-speed model, no GPU: `passes × c + weight bytes / bandwidth` (`--c-us` 41, `--bandwidth-gbs` 960), plus the measured context cost per backbone step, for the token baseline, the k = 4 NCM and the hybrid (autoregressive path alone, and over `--p` acceptance rates with re-decode and fill) at 250M and 1B, bf16 / q8 / q4, per `--context` |
+| `train-memory` (subcommand) | Training-memory estimate, no GPU: parameters, weights, optional fp32 master copy (`--master`), gradients, AdamW states (fp32 or 8-bit), and activations per micro-batch (`--seq`, `--micro-batch`, `--value-bytes`) with and without per-layer recomputation, for the token baseline and the hybrid at 250M and about 1B, against `--gpu-gib` (16). An estimate: the activation model is written out in `crates/ncm-bench/src/train_memory.rs` |
+
+```
+target/release/ncm-bench --model ncm --design v2 --device cuda --context 2048 16384 --new-tokens 256 \
+    --speculate on --assume-accept 1.0 0.75 0.5
 ```
 
 `cuda` builds need a local CUDA toolkit. `.cargo/config.toml` sets `CUDARC_CUDA_VERSION=13040` because cudarc (under burn-cuda) only lists CUDA up to 13.4 and rejects 13.5; the 13.x runtime is ABI compatible. CI never builds the `cuda` feature.
 
-The benchmark uses random weights, batch 1 and greedy decode with caches. Prefill is timed separately, decode tok/s counts output tokens (median of `--repeats`), and the NCM/token ratio is graded PASS (1.5x or more), WEAK (1.2x to 1.5x) or FAIL. The `host` column is the share of decode time spent enqueueing work: near 100% means the run is bound by host op dispatch, not the GPU.
+The benchmark uses random weights, batch 1 and greedy decode with caches. Prefill is timed separately, decode tok/s counts output tokens (median of `--repeats`), and the NCM/token ratio is graded PASS (1.5x or more), WEAK (1.2x to 1.5x) or FAIL. Decode graphs are captured before the decode clock starts, and the NCM's first concept (written from the prompt's condition before the concept step can serve) is not timed; the rate counts the timed tokens. The `host` column estimates the host's own share of decode time (the median host time of one step call, times the steps): near 100% means the run is bound by host op dispatch, not the GPU. `enqueue` is the decode time before the final device sync, which also counts the host blocking on a full launch queue when the GPU is the bottleneck.
 
 ## Stage 1 result
 
@@ -43,6 +65,14 @@ The speed gate passed. NCM against the token baseline: 1.45x to 2.02x at 2k cont
 | `emperor-ncm-250m`, `consul-ncm-250m` | NCM | `ncm-250m-base` |
 
 All models support a context of at least 1M tokens. Tests allocate 2k to 16k.
+
+**NCM hybrid** (`configs/ncm-250m-hybrid.toml`, a `[hybrid]` table; design of record in Imperium-Research `docs/next-concept-modelling/architecture.md`): the v2 backbone (14 layers, one step per 32-token block) with the coarse-to-fine block decoder, in `crates/ncm-model/src/hybrid/` as reference Burn code: the block tokenizer (`vq.rs`: multiscale residual VQ, phi blend, EMA codebooks, nested dropout), the memory (`memory.rs`), the generator, token decoder and training losses (`model.rs`), and the batch-1 decode loop (`decode.rs`: verified and parallel modes, one re-decode, autoregressive fill, mixed-block switch, stops). NCM configs without the table build the k = 4 design, which stays the fallback. Choices where the design leaves details open:
+
+- Retrieved blocks are scored by the block's condition against earlier blocks' backbone inputs, a stand-in until the last retrieval layer reports its attention.
+- Memory keys carry RoPE at absolute token positions: recent and known-prefix states at their own, slots and retrieved tokens at the block's start; generator queries sit at the block's start.
+- The copy head points at memory token entries, each standing for the token after it; a null entry keeps blocks with nothing to copy valid.
+- Parallel mode accepts a draft token only when the check pass also agrees with it (the next position was conditioned on the draft), besides the top probability being at least tau.
+- The fast decode path (`hybrid/fast.rs`): memory keys and values projected once into rings, fixed-buffer block passes (generator, draft, check, acceptance on the device) and autoregressive passes, captured as CUDA graphs; the level tail (codes to contribution) is one kernel (`kernels/hybrid.rs`). The grammar scan runs on the host over the tokens a check pass reads back (TODO: a GPU scan needs a bounded-depth token automaton). ncm-server serves the hybrid on one slot.
 
 ## Data
 

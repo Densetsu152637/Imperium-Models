@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use ncm_model::quant::QuantSpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ArchArg {
@@ -25,6 +26,17 @@ pub enum DeviceArg {
     Cpu,
     /// Needs a build with `--features cuda`.
     Cuda,
+}
+
+/// Weight-only quantisation of the linear layers (see `ncm_model::quant`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum QuantArg {
+    /// Dense weights at the run dtype.
+    None,
+    /// 8-bit codes, one scale per output channel (W8A16).
+    Q8,
+    /// 4-bit codes, one scale per `--quant-group` inputs (W4A16).
+    Q4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -72,7 +84,9 @@ pub struct Cli {
     /// With `--parallel N`, each request gets `ctx-size / N`.
     #[arg(short = 'c', long, default_value_t = 4096)]
     pub ctx_size: usize,
-    /// Slots. Requests run one at a time; this only divides the context, as in llama-server.
+    /// Slots: up to this many requests decode together (continuous batching), each with
+    /// `ctx-size / N` context tokens and caches of its own, as in llama-server. 1 serves
+    /// requests one at a time.
     #[arg(long, default_value_t = 1)]
     pub parallel: usize,
     /// `cuda` when built with it and `--n-gpu-layers` is not 0, else `cpu`.
@@ -91,9 +105,39 @@ pub struct Cli {
     pub top_k: usize,
     #[arg(long, default_value_t = 0.95)]
     pub top_p: f32,
-    /// Prompt tokens fed to the model per step.
-    #[arg(long, default_value_t = 512)]
-    pub prefill_chunk: usize,
+    /// Prompt tokens fed to the model per step (default 8192 for the v2 design, 512 for the
+    /// fallback).
+    #[arg(long)]
+    pub prefill_chunk: Option<usize>,
+    /// Decode greedy, unconstrained NCM requests by self-speculation (draft and verify passes)
+    /// when the model has a draft head; CUDA only. Off by default: in bf16 the parallel verify
+    /// pass may resolve a near tie differently from step-by-step greedy decoding.
+    #[arg(long)]
+    pub speculate: bool,
+    /// Prefill every prompt from scratch instead of reusing the previous request's cache when
+    /// the prompt extends the previous prompt.
+    #[arg(long)]
+    pub no_prefix_reuse: bool,
+    /// Skip the warm-up requests at launch (the first request then compiles the kernels and
+    /// captures the decode graphs).
+    #[arg(long)]
+    pub no_warmup: bool,
+    /// Directory of the on-disk CUDA kernel cache (default: the user cache directory's
+    /// `ncm/kernels`): a restarted server skips compiling the kernels a previous run compiled.
+    #[arg(long, value_name = "DIR")]
+    pub kernel_cache_dir: Option<PathBuf>,
+    /// Compile every kernel anew instead of keeping them on disk.
+    #[arg(long)]
+    pub no_kernel_cache: bool,
+    /// Quantise the linear layers' weights at load. A quantised weight file loads as it is.
+    #[arg(long, value_enum, default_value = "none")]
+    pub quant: QuantArg,
+    /// Inputs per scale for `--quant q4` (a multiple of 32).
+    #[arg(long, default_value_t = 64)]
+    pub quant_group: usize,
+    /// Keep the tied output head dense when quantising.
+    #[arg(long)]
+    pub dense_head: bool,
 
     // llama-server flags: accepted so Imperium's launch line works unchanged.
     /// Layers on the GPU; 0 means CPU. Anything else uses the GPU when the build has one.
@@ -151,6 +195,16 @@ pub fn normalize_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
 }
 
 impl Cli {
+    /// The quantisation `--quant`, `--quant-group` and `--dense-head` ask for.
+    pub fn quant_spec(&self) -> Result<Option<QuantSpec>, String> {
+        let mode = match self.quant {
+            QuantArg::None => "none",
+            QuantArg::Q8 => "q8",
+            QuantArg::Q4 => "q4",
+        };
+        QuantSpec::parse(mode, self.quant_group, !self.dense_head)
+    }
+
     pub fn parse_normalized() -> Self {
         Self::parse_from(normalize_args(std::env::args()))
     }
@@ -171,13 +225,6 @@ impl Cli {
         }
         if self.mmproj.is_some() {
             notes.push("--mmproj ignored: this runtime reads text only".into());
-        }
-        if self.parallel > 1 {
-            notes.push(format!(
-                "--parallel {}: requests run one at a time; each gets {} context tokens",
-                self.parallel,
-                self.ctx_size / self.parallel
-            ));
         }
         notes
     }

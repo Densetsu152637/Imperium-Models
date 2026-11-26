@@ -5,7 +5,10 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{engine as build, request, tiny_ncm_config, tiny_tok_config, vocab};
+use common::{
+    engine as build, request, tiny_ncm_config, tiny_ncm_v2_config, tiny_tok_config,
+    tiny_tok_v2_config, vocab,
+};
 use ncm_server::constrain::ToolCallGuard;
 use ncm_server::engine::{Backend, Engine, EngineError, Finish, GenRequest};
 use ncm_server::sampling::SamplingParams;
@@ -56,6 +59,19 @@ fn greedy_decoding_is_deterministic_and_repeatable_across_requests() {
 }
 
 #[test]
+fn v2_models_decode_and_reset_between_requests() {
+    // Prompts long enough that retrieval selects blocks and DeltaNet spans several chunks.
+    for config in [tiny_tok_v2_config(), tiny_ncm_v2_config()] {
+        let engine = build(config, 256);
+        let text = "the quick brown fox jumps over the lazy dog, twice: the quick brown fox";
+        let (first, stats) = run(&engine, request(prompt(text), 12, SamplingParams::GREEDY));
+        assert!(stats.completion_tokens > 0);
+        let (second, _) = run(&engine, request(prompt(text), 12, SamplingParams::GREEDY));
+        assert_eq!(first, second, "a request must not see the previous one's state");
+    }
+}
+
+#[test]
 fn a_seed_makes_sampled_decoding_repeatable() {
     let params = SamplingParams { temperature: 1.0, top_k: 0, top_p: 1.0, seed: Some(11) };
     for config in [tiny_tok_config(), tiny_ncm_config()] {
@@ -70,10 +86,12 @@ fn a_seed_makes_sampled_decoding_repeatable() {
     }
 }
 
+/// Prompts of any length: a trailing partial concept starts the first decoded one, and a
+/// prompt shorter than one concept is padded to one.
 #[test]
-fn the_ncm_pads_prompts_that_are_not_whole_concepts() {
+fn the_ncm_serves_prompts_that_are_not_whole_concepts() {
     let engine = build(tiny_ncm_config(), 256);
-    // 1, 2, 3 and 4 tokens: all valid even though k = 4.
+    // 1 to 5 tokens: all valid even though k = 4.
     for n in 1..=5 {
         let text: String = "abcde".chars().take(n).collect();
         let (_, stats) = run(&engine, request(prompt(&text), 4, SamplingParams::GREEDY));
@@ -123,6 +141,11 @@ fn contexts_too_small_for_the_model_are_refused() {
         weights: None,
         seed: 0,
         prefill_chunk: 16,
+        speculate: false,
+        prefix_reuse: true,
+        warmup: false,
+        slots: 1,
+        quant: None,
     };
     assert!(matches!(
         Engine::new(options(4), vocab()),
@@ -227,4 +250,183 @@ fn the_guard_is_free_until_a_tool_call_opens() {
     assert!(!guard.allows(brace), "nothing but whitespace after the object");
     guard.advance(vocab.ids.tool_call_end);
     assert!(!guard.in_call());
+}
+
+#[test]
+fn quantised_engines_load_dense_and_quantised_weight_files() {
+    use burn::tensor::FloatDType;
+    use ncm_model::quant::{self, Format, QuantSpec};
+    use ncm_model::weights::save_weights;
+    use ncm_model::{Config, NcmLm, TokenLm};
+    use ncm_server::engine::{DeviceChoice, EngineOptions, make_device};
+
+    let dir = tempfile::tempdir().unwrap();
+    let device = make_device(DeviceChoice::Cpu, FloatDType::F32).unwrap();
+    let spec = QuantSpec { format: Format::q4(64), head: true };
+    for (i, config) in [tiny_tok_v2_config(), tiny_ncm_v2_config()].into_iter().enumerate() {
+        let dense = dir.path().join(format!("dense-{i}.safetensors"));
+        let packed = dir.path().join(format!("q4-{i}.safetensors"));
+        match &config {
+            Config::Tok(c) => {
+                let model = TokenLm::new(c, &device);
+                save_weights(&model, &config, &dense).unwrap();
+                let q = quant::quantize_model(&model, spec, &device, || TokenLm::new(c, &device));
+                quant::save_quantized(&q.unwrap(), &config, spec, &packed).unwrap();
+            }
+            Config::Ncm(c) => {
+                let model = NcmLm::new(c, &device);
+                save_weights(&model, &config, &dense).unwrap();
+                let q = quant::quantize_model(&model, spec, &device, || NcmLm::new(c, &device));
+                quant::save_quantized(&q.unwrap(), &config, spec, &packed).unwrap();
+            }
+        }
+        let options = |weights: &std::path::Path, quant| EngineOptions {
+            config: config.clone(),
+            ctx: 64,
+            device: device.clone(),
+            device_name: "cpu".into(),
+            dtype: FloatDType::F32,
+            weights: Some(weights.to_path_buf()),
+            seed: 0,
+            prefill_chunk: 16,
+            speculate: false,
+            prefix_reuse: true,
+            warmup: false,
+            slots: 1,
+            quant,
+        };
+        // Quantising a dense file at load and loading the quantised file give the same model.
+        let converted = Engine::new(options(&dense, Some(spec)), vocab()).unwrap();
+        let loaded = Engine::new(options(&packed, None), vocab()).unwrap();
+        let greedy = || request(prompt("quantised"), 8, SamplingParams::GREEDY);
+        let (tokens, stats) = run(&converted, greedy());
+        assert!(stats.completion_tokens > 0);
+        assert_eq!(tokens, run(&loaded, greedy()).0);
+        // A quantised file does not convert to another quantisation.
+        let q8 = QuantSpec { format: Format::q8(), head: true };
+        assert!(matches!(
+            Engine::new(options(&packed, Some(q8)), vocab()),
+            Err(EngineError::QuantMismatch { .. })
+        ));
+    }
+}
+
+/// An engine of `config` that reuses prompt prefixes (`reuse`) or prefills every prompt anew.
+fn engine_with_reuse(config: ncm_model::Config, reuse: bool) -> Engine {
+    let options = ncm_server::engine::EngineOptions {
+        config,
+        ctx: 256,
+        device: ncm_server::engine::make_device(
+            ncm_server::engine::DeviceChoice::Cpu,
+            burn::tensor::FloatDType::F32,
+        )
+        .unwrap(),
+        device_name: "cpu".into(),
+        dtype: burn::tensor::FloatDType::F32,
+        weights: None,
+        seed: 3,
+        prefill_chunk: 16,
+        quant: None,
+        speculate: false,
+        prefix_reuse: reuse,
+        warmup: false,
+        slots: 1,
+    };
+    Engine::new(options, vocab()).unwrap()
+}
+
+/// One engine throughout: tests run in parallel and seed the shared CPU generator, so two
+/// engines of one config need not hold the same random weights. For each config, prompts of
+/// every length modulo 4 (the NCM's k) extend an earlier prompt of every length modulo 4: the
+/// earlier prompt's whole concepts (all of it for the token baseline) are reused, and the reply
+/// equals the one decoded after a full prefill.
+#[test]
+fn a_prompt_extending_the_last_one_reuses_its_prefix_and_decodes_the_same() {
+    let configs =
+        [tiny_tok_config(), tiny_tok_v2_config(), tiny_ncm_config(), tiny_ncm_v2_config()];
+    let greedy = SamplingParams::GREEDY;
+    for config in configs {
+        let engine = engine_with_reuse(config.clone(), true);
+        let ncm = matches!(config, ncm_model::Config::Ncm(_));
+        for a in 0..4 {
+            let first = prompt(&format!("the first turn of a conversation{}", ".".repeat(a)));
+            for b in 0..4 {
+                let mut second = first.clone();
+                second.extend(prompt(&format!(" and a follow-up{}", "!".repeat(b))));
+                run(&engine, request(first.clone(), 8, greedy));
+                let (extended, stats) = run(&engine, request(second.clone(), 8, greedy));
+                let reused = if ncm { first.len() - first.len() % 4 } else { first.len() };
+                assert_eq!(stats.cached_tokens, reused, "{config:?} {a} {b}: prefix reuse");
+                // The same prompt again reuses all of it but a pending partial concept.
+                let (again, stats) = run(&engine, request(second.clone(), 8, greedy));
+                let whole = if ncm { second.len() - second.len() % 4 } else { second.len() };
+                assert_eq!(stats.cached_tokens, whole);
+                // A prompt that does not extend the last one starts afresh: the full prefill.
+                let (_, stats) = run(&engine, request(prompt("something else"), 4, greedy));
+                assert_eq!(stats.cached_tokens, 0);
+                let (want, stats) = run(&engine, request(second.clone(), 8, greedy));
+                assert_eq!(stats.cached_tokens, 0);
+                assert_eq!(extended, want, "{config:?} {a} {b}: prefix reuse changes the reply");
+                assert_eq!(again, want, "{config:?} {a} {b}: a whole hit changes the reply");
+            }
+        }
+    }
+    // Turned off, nothing is reused.
+    let engine = engine_with_reuse(tiny_ncm_config(), false);
+    run(&engine, request(prompt("abcdefgh"), 4, SamplingParams::GREEDY));
+    let (_, stats) = run(&engine, request(prompt("abcdefghijkl"), 4, SamplingParams::GREEDY));
+    assert_eq!(stats.cached_tokens, 0);
+}
+
+/// The next turn of an agent loop repeats the previous prompt and its reply: the cache as it
+/// stood at the end of the reply is reused (beyond the prompt), and the next reply equals the
+/// one decoded after a full prefill.
+#[test]
+fn a_prompt_repeating_the_last_reply_reuses_the_reply_too() {
+    let greedy = SamplingParams::GREEDY;
+    for config in [tiny_tok_v2_config(), tiny_ncm_v2_config(), tiny_tok_config(), tiny_ncm_config()]
+    {
+        let engine = engine_with_reuse(config.clone(), true);
+        let ncm = matches!(config, ncm_model::Config::Ncm(_));
+        let first = prompt("an agent's first prompt, of some length");
+        let (reply, _) = run(&engine, request(first.clone(), 24, greedy));
+        let mut next = first.clone();
+        next.extend(&reply);
+        next.extend(prompt(" and the tool's answer"));
+        let (got, stats) = run(&engine, request(next.clone(), 8, greedy));
+        let prompt_end = if ncm { first.len() - first.len() % 4 } else { first.len() };
+        assert!(stats.cached_tokens >= prompt_end, "{config:?}: {}", stats.cached_tokens);
+        if !ncm {
+            // All but the last reply token went back into the cache.
+            assert_eq!(stats.cached_tokens, first.len() + reply.len() - 1, "{config:?}");
+        }
+        eprintln!("{config:?}: reused {} of {}", stats.cached_tokens, next.len());
+        run(&engine, request(prompt("something else"), 4, greedy));
+        let (want, stats) = run(&engine, request(next, 8, greedy));
+        assert_eq!(stats.cached_tokens, 0);
+        assert_eq!(got, want, "{config:?}: reply reuse changes the reply");
+    }
+}
+
+/// A request abandoned before its prefill (its cancel flag set) generates nothing and leaves no
+/// kept state claiming its prompt: the next request prefills from scratch and decodes what a
+/// full prefill does.
+#[test]
+fn an_abandoned_prefill_keeps_no_prompt_state() {
+    for config in [tiny_tok_config(), tiny_ncm_config()] {
+        let engine = engine_with_reuse(config.clone(), true);
+        let first = prompt("a prompt the next one extends");
+        let mut second = first.clone();
+        second.extend(prompt(" with more text"));
+        run(&engine, request(first.clone(), 4, SamplingParams::GREEDY));
+        let abandoned = request(second.clone(), 8, SamplingParams::GREEDY);
+        abandoned.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (tokens, stats) = run(&engine, abandoned);
+        assert!(tokens.is_empty() && stats.completion_tokens == 0, "{config:?}");
+        let (after, stats) = run(&engine, request(second.clone(), 8, SamplingParams::GREEDY));
+        assert_eq!(stats.cached_tokens, 0, "{config:?}: the aborted prefill was forgotten");
+        run(&engine, request(prompt("unrelated"), 2, SamplingParams::GREEDY));
+        let (want, _) = run(&engine, request(second, 8, SamplingParams::GREEDY));
+        assert_eq!(after, want, "{config:?}");
+    }
 }

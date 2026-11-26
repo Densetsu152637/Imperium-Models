@@ -4,7 +4,7 @@
 //! |---|---|
 //! | `GET /health` | 200 `{"status":"ok"}` when the model is loaded, 503 while it loads (Imperium polls this) |
 //! | `GET /v1/models` | the one loaded model |
-//! | `GET /props` | `default_generation_settings.n_ctx` (the context one request gets), slots, cache size |
+//! | `GET /props` | `default_generation_settings.n_ctx` (the context one request gets), slots and their state, the queue, cache size |
 //! | `POST /v1/chat/completions` | chat completion, optionally streamed as server-sent events |
 //! | `POST /tokenize`, `POST /detokenize` | the model's own tokenizer (Imperium counts context with it) |
 //! | `POST /apply-template` | the rendered prompt for `messages` and `tools` |
@@ -43,6 +43,8 @@ pub struct AppState {
     backend: OnceLock<Arc<dyn Backend>>,
     /// Why loading failed, if it did.
     failure: OnceLock<String>,
+    /// Why the backend broke, if generation panicked on the caller's thread.
+    broken: Arc<OnceLock<String>>,
     /// The model name in responses.
     pub alias: String,
     pub model_path: String,
@@ -57,6 +59,7 @@ impl AppState {
         Self {
             backend: OnceLock::new(),
             failure: OnceLock::new(),
+            broken: Arc::new(OnceLock::new()),
             alias: alias.to_owned(),
             model_path: model_path.to_owned(),
             slots,
@@ -84,11 +87,20 @@ impl AppState {
         self.failure.get().cloned()
     }
 
+    /// The loaded backend, or why there is none to serve with: still loading, failed to load,
+    /// or broken by a panic (then every request, `/health` included, answers 503, so that
+    /// Imperium's supervisor restarts the server).
     fn backend(&self) -> Result<&Arc<dyn Backend>, ApiError> {
-        self.backend.get().ok_or_else(|| match self.failure.get() {
+        let backend = self.backend.get().ok_or_else(|| match self.failure.get() {
             Some(message) => ApiError::unavailable(format!("the model failed to load: {message}")),
             None => ApiError::unavailable("Loading model"),
-        })
+        })?;
+        match self.broken.get().cloned().or_else(|| backend.broken()) {
+            Some(message) => Err(ApiError::unavailable(format!(
+                "the model stopped after an internal error: {message}"
+            ))),
+            None => Ok(backend),
+        }
     }
 
     fn next_id(&self) -> String {
@@ -145,7 +157,29 @@ async fn models(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiEr
 }
 
 async fn props(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let info = state.backend()?.info();
+    let backend = state.backend()?;
+    let info = backend.info();
+    let slots = backend.slots();
+    let batching = slots.as_ref().map(|r| {
+        let mean =
+            if r.decode_steps == 0 { 0.0 } else { r.decode_rows as f64 / r.decode_steps as f64 };
+        json!({
+            "slots": r.slots.iter().map(|s| json!({
+                "id": s.id,
+                "state": s.state,
+                "is_processing": s.state != "idle",
+                "n_tokens": s.tokens,
+                "n_prompt_tokens": s.prompt_tokens,
+                "n_decoded": s.generated,
+            })).collect::<Vec<_>>(),
+            "queued": r.queued,
+            "served": r.served,
+            "forks": r.forks,
+            "decode_steps": r.decode_steps,
+            "mean_batch": mean,
+        })
+    });
+    let processing = slots.as_ref().map(|r| r.slots.iter().filter(|s| s.state != "idle").count());
     Ok(Json(json!({
         "default_generation_settings": {
             "n_ctx": info.ctx,
@@ -157,6 +191,9 @@ async fn props(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiErr
             },
         },
         "total_slots": state.slots,
+        "is_processing": processing.map(|n| n > 0),
+        "n_processing": processing,
+        "batching": batching,
         "model_path": state.model_path,
         "model_alias": state.alias,
         "chat_template": "",
@@ -241,13 +278,32 @@ enum Message {
 }
 
 /// Starts generation on a blocking thread and returns the channel its tokens arrive on. The
-/// thread stops by itself when the receiver is dropped (the client left).
-fn start_generation(backend: Arc<dyn Backend>, request: GenRequest) -> mpsc::Receiver<Message> {
+/// thread stops by itself when the receiver is dropped (the client left). A panic in the backend
+/// fails the request and marks the server broken (`broken`).
+fn start_generation(
+    backend: Arc<dyn Backend>,
+    broken: Arc<OnceLock<String>>,
+    request: GenRequest,
+) -> mpsc::Receiver<Message> {
     let (tx, rx) = mpsc::channel(256);
+    // A client that leaves drops the receiver: abandon the request then, even mid-prefill,
+    // before any token would have noticed.
+    let (watch, cancel) = (tx.clone(), request.cancel.clone());
+    tokio::spawn(async move {
+        watch.closed().await;
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
     tokio::task::spawn_blocking(move || {
         let sender = tx.clone();
-        let result = backend
-            .generate(request, &mut |token| sender.blocking_send(Message::Token(token)).is_ok());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend
+                .generate(request, &mut |token| sender.blocking_send(Message::Token(token)).is_ok())
+        }));
+        let result = result.unwrap_or_else(|panic| {
+            let message = crate::engine::panic_message(panic.as_ref());
+            broken.set(message.clone()).ok();
+            Err(EngineError::Device(format!("generation panicked: {message}")))
+        });
         tx.blocking_send(Message::Done(result)).ok();
     });
     rx
@@ -273,6 +329,7 @@ fn prepare(state: &AppState, body: &Value) -> Result<(Arc<dyn Backend>, Prepared
         max_tokens: request.max_tokens.unwrap_or(usize::MAX),
         sampling: request.sampling,
         constraint,
+        cancel: Default::default(),
     };
     Ok((backend, Prepared { request, generation, parse_tools }))
 }
@@ -293,7 +350,7 @@ async fn chat_completions(
     let created = unix_time();
     let Prepared { request, generation, parse_tools } = prepared;
     let cache_bytes = backend.info().cache_bytes;
-    let rx = start_generation(backend.clone(), generation);
+    let rx = start_generation(backend.clone(), state.broken.clone(), generation);
     if request.stream {
         Ok(stream_response(backend, rx, request, parse_tools, id, model, created, cache_bytes))
     } else {

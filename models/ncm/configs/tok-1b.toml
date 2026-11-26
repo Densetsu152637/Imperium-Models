@@ -1,0 +1,33 @@
+# Token baseline at ~1B (Princeps at 1B, plan 007fbba): the v2 stack at width 2,048, 20 layers
+# (10 gated DeltaNet + 10 sparse retrieval), MLP 4,608, 16 retrieval heads: 1,035,235,648
+# parameters. tok-250m-v2.toml is the 250M baseline.
+model = "tok"
+attention = "v2"
+vocab_size = 32000
+d_model = 2048
+n_layers = 20
+ff_dim = 4608
+rope_base_full = 1000000.0   # retrieval layers' decoupled RoPE key
+rope_scale_full = 1.0
+norm_eps = 1e-6
+
+[v2]
+dn_head_dim = 128    # 16 DeltaNet heads
+dn_conv = 4
+dn_chunk = 64
+ret_heads = 16
+ret_nope_dim = 128
+ret_rope_dim = 64
+ret_v_dim = 128
+ret_latent = 512     # MLA cache: 512 latent + 64 RoPE key per token
+idx_heads = 4
+idx_dim = 128
+ret_block = 64       # tokens per block
+ret_topk = 32        # blocks per query
+ret_local = 1024     # most recent tokens, always visible
+ret_dense = false    # true for the dense training warm-up
+idx_8bit = true      # indexer keys as 8-bit codes + one scale per position; false: run dtype
+# YaRN on the retrieval layers' decoupled RoPE key: off (1.0) for pretraining at 4k tokens; the
+# 1M long-context stage sets ret_yarn_factor = 256.0 (1M / 4k).
+ret_yarn_factor = 1.0
+ret_yarn_original = 4096  # tokens seen in pretraining

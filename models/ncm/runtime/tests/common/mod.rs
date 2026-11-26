@@ -6,7 +6,9 @@
 use std::sync::{Arc, Mutex};
 
 use burn::tensor::FloatDType;
-use ncm_model::{Config, NcmConfig, TokConfig, tiny_ncm, tiny_tok};
+use ncm_model::{
+    Config, NcmConfig, TokConfig, tiny_ncm, tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2,
+};
 use ncm_server::api::ApiError;
 use ncm_server::engine::{
     Backend, DeviceChoice, Engine, EngineError, EngineOptions, Finish, GenRequest, GenStats,
@@ -25,11 +27,32 @@ pub fn tiny_ncm_config() -> Config {
     Config::Ncm(NcmConfig { vocab_size: BYTE_TOKENIZER_SIZE, ..tiny_ncm(8, 4) })
 }
 
+/// The v2 attention design: retrieval over blocks of 4 tokens, top 2 plus the last 8.
+pub fn tiny_tok_v2_config() -> Config {
+    Config::Tok(TokConfig { vocab_size: BYTE_TOKENIZER_SIZE, ..tiny_tok_v2(tiny_v2(4, 2, 8)) })
+}
+
+/// The v2 attention design: retrieval over blocks of 2 concepts, top 2 plus the last 4.
+pub fn tiny_ncm_v2_config() -> Config {
+    Config::Ncm(NcmConfig { vocab_size: BYTE_TOKENIZER_SIZE, ..tiny_ncm_v2(8, tiny_v2(2, 2, 4)) })
+}
+
 pub fn vocab() -> Arc<Vocab> {
     Arc::new(Vocab::new(byte_tokenizer(), BYTE_TOKENIZER_SIZE).expect("byte tokenizer"))
 }
 
 pub fn engine(config: Config, ctx: usize) -> Engine {
+    engine_with_slots(config, ctx, 1)
+}
+
+/// Engines seed the CPU device and draw their weights from its one random stream: two built at
+/// once (tests run in parallel) would interleave their draws and get other weights than the
+/// seed gives. Every test engine is built under this lock.
+static BUILD: Mutex<()> = Mutex::new(());
+
+/// An engine serving `slots` requests at once (continuous batching), `ctx` tokens each.
+pub fn engine_with_slots(config: Config, ctx: usize, slots: usize) -> Engine {
+    let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     let options = EngineOptions {
         config,
         ctx,
@@ -39,12 +62,17 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
         weights: None,
         seed: 3,
         prefill_chunk: 16,
+        speculate: false,
+        prefix_reuse: true,
+        warmup: false,
+        slots,
+        quant: None,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
 }
 
 pub fn request(prompt: Vec<u32>, max_tokens: usize, sampling: SamplingParams) -> GenRequest {
-    GenRequest { prompt, max_tokens, sampling, constraint: None }
+    GenRequest { prompt, max_tokens, sampling, constraint: None, cancel: Default::default() }
 }
 
 /// Replays `tokens` for every request and records the prompts it was given.
@@ -119,6 +147,12 @@ impl Backend for Scripted {
             prompt_s: 0.002,
             decode_s: 0.004,
             decode_tokens: sent,
+            cached_tokens: 0,
+            capture_s: 0.0,
+            path: ncm_server::engine::DecodePath::Eager,
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
         })
     }
 }

@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [features]
 # The CPU backend is always built; CUDA is opt-in (CI has no GPU).
-cuda = ["burn/cuda"]
+cuda = ["burn/cuda", "ncm-model/cuda"]
 
 [dependencies]
 ncm-model = { path = "../crates/ncm-model" }

@@ -132,6 +132,14 @@ pub fn load_engine(plan: &Plan, cli: &Cli) -> Result<Engine, String> {
         None => Vocab::new(byte_tokenizer(), vocab_size),
     }
     .map_err(|e| e.to_string())?;
+    // Before the device is first used: CubeCL reads its configuration once per process.
+    #[cfg(feature = "cuda")]
+    if plan.device == DeviceChoice::Cuda && !cli.no_kernel_cache {
+        match ncm_model::kernels::enable_kernel_cache(cli.kernel_cache_dir.clone()) {
+            Some(dir) => eprintln!("ncm-server: kernel cache in {}", dir.display()),
+            None => eprintln!("ncm-server: kernel cache not enabled (no cache directory)"),
+        }
+    }
     let device = make_device(plan.device, plan.dtype).map_err(|e| e.to_string())?;
     let options = EngineOptions {
         config: plan.config.clone(),
@@ -141,7 +149,15 @@ pub fn load_engine(plan: &Plan, cli: &Cli) -> Result<Engine, String> {
         dtype: plan.dtype,
         weights: plan.weights.clone(),
         seed: cli.weights_seed,
-        prefill_chunk: cli.prefill_chunk,
+        prefill_chunk: cli.prefill_chunk.unwrap_or(match plan.config.design() {
+            ncm_model::Design::V2 => crate::engine::DEFAULT_PREFILL_CHUNK_V2,
+            ncm_model::Design::Fallback => crate::engine::DEFAULT_PREFILL_CHUNK,
+        }),
+        quant: cli.quant_spec()?,
+        speculate: cli.speculate,
+        prefix_reuse: !cli.no_prefix_reuse,
+        warmup: !cli.no_warmup,
+        slots: cli.parallel,
     };
     Engine::new(options, Arc::new(vocab)).map_err(|e| e.to_string())
 }

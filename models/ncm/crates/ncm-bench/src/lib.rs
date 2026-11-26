@@ -1,30 +1,92 @@
-//! Batch-1 decode-speed benchmark: NCM against the token baseline, random weights.
+//! Batch-1 decode-speed benchmark: NCM against the token baseline, random weights, in either or
+//! both attention designs.
 //!
 //! ```text
-//! ncm-bench --model both --context 2048 16384 --new-tokens 256 --device cuda
+//! ncm-bench --model both --design both --context 2048 16384 --new-tokens 256 --device cuda
 //! ```
 //!
 //! Both models share the token vocabulary, so decode tokens per second are directly comparable.
 //! Decode tok/s counts output tokens (the NCM emits `k` tokens per decoder pass).
+//!
+//! `--speculate on` also decodes the NCM by self-speculation (`ncm_model::speculative`): the
+//! draft head proposes each concept in one pass and the decoder verifies it in one parallel
+//! pass. Random weights almost never accept a draft, so `--assume-accept` adds synthetic runs
+//! that force a given acceptance rate: they estimate the speed of a trained model, not its
+//! output.
+//!
+//! `--model hybrid` (or `all`) runs the NCM hybrid's block decode loop ([`hybrid`]): the
+//! autoregressive path alone and synthetic per-token agreement rates `--hybrid-p` (step 6 of the
+//! local test plan), against the k = 4 NCM of the v2 design when that runs too.
+//!
+//! `ncm-bench train-memory` prints a training-memory estimate instead ([`train_memory`]), and
+//! `ncm-bench predict` the latency model's decode-speed predictions ([`predict`]).
+
+pub mod hybrid;
+pub mod predict;
+pub mod train_memory;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use clap::{Parser, ValueEnum};
+#[cfg(not(feature = "cuda"))]
+use ncm_model::fused::argmax_last;
+use ncm_model::fused::{kernels_built, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::set_fused_attention;
-use ncm_model::{Config, NcmLm, TokenLm, cache_bytes, ncm_250m, tiny_ncm, tiny_tok, tok_250m};
+use ncm_model::quant::{self, QuantSpec};
+use ncm_model::{
+    Acceptance, Config, Design, NcmLm, SpecStats, Speculator, TokenLm, cache_bytes,
+    cache_bytes_with, ncm_250m_of, tiny_ncm, tiny_ncm_v2, tiny_tok, tiny_tok_v2, tiny_v2,
+    tok_250m_of,
+};
 use serde_json::{Value, json};
 
 pub const PASS_RATIO: f64 = 1.5;
 pub const WEAK_RATIO: f64 = 1.2;
-const PREFILL_CHUNK: usize = 512;
+/// The v2 NCM may be at most 25% slower than the fallback NCM (plan, local test plan step 2).
+pub const FALLBACK_FLOOR: f64 = 0.75;
+/// Prompt tokens per prefill call of the model being measured (`--prefill-chunk`).
+static PREFILL_CHUNK: AtomicUsize = AtomicUsize::new(512);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ModelChoice {
     Tok,
     Ncm,
     Both,
+    /// The NCM hybrid (block decoder) only.
+    Hybrid,
+    /// The token baseline, the k = 4 NCM and the hybrid.
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DesignChoice {
+    /// Gated DeltaNet and sparse retrieval (the adopted design).
+    V2,
+    /// Sliding-window attention with a full layer every fourth (the stage 1 design).
+    Fallback,
+    Both,
+}
+
+impl DesignChoice {
+    fn designs(self) -> Vec<Design> {
+        match self {
+            Self::V2 => vec![Design::V2],
+            Self::Fallback => vec![Design::Fallback],
+            Self::Both => vec![Design::Fallback, Design::V2],
+        }
+    }
+}
+
+/// Model size: the 250M research pair (Princeps-Lite) or the ~1B configs (Princeps).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SizeChoice {
+    #[value(name = "250m")]
+    M250,
+    #[value(name = "1b")]
+    B1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -38,10 +100,30 @@ pub enum DeviceChoice {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Speculate {
+    /// Plain decoding only.
+    Off,
+    /// Plain decoding, then self-speculative decoding of the NCM (draft head and one parallel
+    /// verify pass per concept), with real verification and every `--assume-accept` rate.
+    On,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum DtypeChoice {
     Bf16,
     #[value(alias = "fp32")]
     F32,
+}
+
+/// Weight-only quantisation of the linear layers (see `ncm_model::quant`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum QuantChoice {
+    /// Dense weights at the run dtype.
+    None,
+    /// 8-bit codes, one scale per output channel (W8A16).
+    Q8,
+    /// 4-bit codes, one scale per `--quant-group` inputs (W4A16).
+    Q4,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -53,6 +135,13 @@ pub enum DtypeChoice {
 pub struct Cli {
     #[arg(long, value_enum, default_value = "both")]
     pub model: ModelChoice,
+    /// Attention design(s) to run.
+    #[arg(long, value_enum, default_value = "both")]
+    pub design: DesignChoice,
+    /// Model size: `250m` (configs/*-250m*.toml) or `1b` (configs/*-1b.toml, the v2 design
+    /// only; `--design both` then runs v2).
+    #[arg(long, value_enum, default_value = "250m")]
+    pub size: SizeChoice,
     /// Prompt lengths in tokens.
     #[arg(long, num_args = 1.., default_values_t = [2048usize, 16384], value_name = "N")]
     pub context: Vec<usize>,
@@ -74,6 +163,62 @@ pub struct Cli {
     /// Use Burn's fused attention op instead of matmul-softmax-matmul (experimental).
     #[arg(long)]
     pub fused_attention: bool,
+    /// Run the v2 layers' reference tensor code on CUDA instead of their fused kernels (which a
+    /// `--features cuda` build uses by default).
+    #[arg(long)]
+    pub reference_kernels: bool,
+    /// Run the fused kernels eagerly instead of replaying the decode steps (NCM concept steps,
+    /// token-baseline steps) as captured CUDA graphs.
+    #[arg(long)]
+    pub no_cuda_graphs: bool,
+    /// Directory of the on-disk CUDA kernel cache (default: the user cache directory's
+    /// `ncm/kernels`).
+    #[arg(long, value_name = "DIR")]
+    pub kernel_cache_dir: Option<PathBuf>,
+    /// Compile every kernel anew instead of keeping them on disk.
+    #[arg(long)]
+    pub no_kernel_cache: bool,
+    /// Also decode the NCM by self-speculation (the token baseline always decodes plainly).
+    #[arg(long, value_enum, default_value = "off")]
+    pub speculate: Speculate,
+    /// With `--speculate on`: one more speculative run per rate, accepting that share of draft
+    /// tokens whatever the decoder says. SYNTHETIC: it times the passes a trained model with
+    /// that acceptance would run; the tokens are not the model's output.
+    #[arg(long, num_args = 1.., value_name = "RATE")]
+    pub assume_accept: Vec<f64>,
+    /// Quantise the linear layers' weights (the random weights are quantised as they are built).
+    #[arg(long, value_enum, default_value = "none")]
+    pub quant: QuantChoice,
+    /// Inputs per scale for `--quant q4` (a multiple of 32).
+    #[arg(long, default_value_t = 64)]
+    pub quant_group: usize,
+    /// Keep the tied output head dense when quantising.
+    #[arg(long)]
+    pub dense_head: bool,
+    /// Prompt tokens per prefill call [default: 8192 for v2, whose layers prefill sparsely,
+    /// 512 for the fallback design, whose full-attention layers build `[chunk, context]` scores].
+    #[arg(long)]
+    pub prefill_chunk: Option<usize>,
+    /// Cache the v2 indexer keys at the run dtype instead of 8-bit codes.
+    #[arg(long)]
+    pub float_index_keys: bool,
+    /// The hybrid's SYNTHETIC per-token agreement rates (geometric first rejections): the
+    /// design's mean accepted prefixes of 32, 25.6, 19.2 and 15.4 tokens. A run with the
+    /// autoregressive path alone and one with full rejection (p = 0) are always added.
+    #[arg(long, num_args = 1.., value_name = "P", default_values_t = [1.0, 0.986, 0.967, 0.950])]
+    pub hybrid_p: Vec<f64>,
+}
+
+impl Cli {
+    /// The quantisation `--quant`, `--quant-group` and `--dense-head` ask for.
+    pub fn quant_spec(&self) -> Result<Option<QuantSpec>, String> {
+        let mode = match self.quant {
+            QuantChoice::None => "none",
+            QuantChoice::Q8 => "q8",
+            QuantChoice::Q4 => "q4",
+        };
+        QuantSpec::parse(mode, self.quant_group, !self.dense_head)
+    }
 }
 
 pub fn verdict(ratio: f64) -> &'static str {
@@ -84,6 +229,11 @@ pub fn verdict(ratio: f64) -> &'static str {
     } else {
         "FAIL"
     }
+}
+
+/// Verdict on v2 NCM decode speed relative to the fallback NCM.
+pub fn fallback_verdict(ratio: f64) -> &'static str {
+    if ratio >= FALLBACK_FLOOR { "PASS" } else { "FAIL" }
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -119,11 +269,21 @@ impl Model {
         }
     }
 
-    fn parts(&self) -> Vec<(&'static str, usize)> {
+    /// Parameter bytes on the device (codes and scales when quantised).
+    fn weight_bytes(&self) -> usize {
         match self {
-            Model::Tok(m) => m.parts().rows(),
-            Model::Ncm(m) => m.parts().rows(),
+            Model::Tok(m) => quant::weight_bytes(m.as_ref()),
+            Model::Ncm(m) => quant::weight_bytes(m.as_ref()),
         }
+    }
+}
+
+/// Parameter counts of `cfg` by part, from a dense model that is never initialised (a quantised
+/// model's own count would see codes and scales).
+fn dense_parts(cfg: &Config, device: &Device) -> Vec<(&'static str, usize)> {
+    match cfg {
+        Config::Tok(c) => TokenLm::new(c, device).parts().rows(),
+        Config::Ncm(c) => NcmLm::new(c, device).parts().rows(),
     }
 }
 
@@ -131,59 +291,178 @@ fn sync(device: &Device) {
     device.sync().expect("device sync");
 }
 
-/// Prefill the prompt, then greedily decode `new_tokens` tokens; returns (prefill s, decode s).
+/// How the NCM writes its concepts.
+#[derive(Clone, Copy, Debug)]
+enum Decode {
+    Plain,
+    Speculative(Acceptance),
+}
+
+/// Prefill the prompt, then greedily decode `new_tokens` tokens; returns the timings.
 ///
 /// The token baseline prefills all but the last prompt token and decodes from that one, so its
-/// decode loop produces exactly `new_tokens` tokens like the NCM loop does.
-fn run_once(model: &Model, prompt: &Tensor<2, Int>, new_tokens: usize, device: &Device) -> Run {
+/// decode loop produces `new_tokens` tokens like the NCM loop does. It ignores `mode`.
+///
+/// Graph captures stay out of the timed decode: the decode graphs are captured (their warm-up
+/// runs undone) before the clock starts. The NCM's first concept, written from the prompt's
+/// condition before the concept step can serve, is untimed as well, and so is the first
+/// speculative concept (which captures the draft and verify graphs); the rate counts the
+/// tokens of the timed loop only.
+fn run_once(
+    model: &Model,
+    prompt: &Tensor<2, Int>,
+    new_tokens: usize,
+    mode: Decode,
+    device: &Device,
+) -> Run {
     let context = prompt.dims()[1];
-    let (started, prefilled) = match model {
+    let mut spec = None;
+    // Host time of each step call of the timed loop.
+    let mut calls = Vec::new();
+    let mut timed = |f: &mut dyn FnMut()| {
+        let t0 = Instant::now();
+        f();
+        calls.push(t0.elapsed().as_secs_f64());
+    };
+    let (started, prefilled, from, timed_tokens) = match model {
         Model::Ncm(m) => {
             let mut cache = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let mut cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK);
+            let cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK.load(Ordering::Relaxed));
             sync(device);
             let prefilled = Instant::now();
-            let concepts = new_tokens / m.concept_size();
-            for c in 0..concepts {
-                let (tokens, _) = m.decode_concept(cond.clone(), &mut cache, None, false);
-                if c + 1 < concepts {
-                    cond = m.append_tokens(tokens, &mut cache);
+            let k = m.concept_size();
+            let concepts = new_tokens / k;
+            match mode {
+                Decode::Plain => {
+                    // On CUDA with the fused kernels on, every concept after the first is one
+                    // captured graph replay: append the concept just written, then decode the
+                    // next one (captured once the cross-attention ring is full).
+                    let (mut tokens, _) = m.decode_concept(cond, &mut cache, None, false);
+                    #[cfg(feature = "cuda")]
+                    let mut graphed = ncm_model::ncm::GraphedStep::default();
+                    #[cfg(feature = "cuda")]
+                    graphed.prepare(m, &tokens, &mut cache);
+                    sync(device);
+                    let from = Instant::now();
+                    for _ in 1..concepts {
+                        timed(&mut || {
+                            #[cfg(feature = "cuda")]
+                            {
+                                tokens = graphed.step(m, tokens.clone(), &mut cache);
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                let cond = m.append_tokens(tokens.clone(), &mut cache);
+                                tokens = m.decode_concept(cond, &mut cache, None, false).0;
+                            }
+                        });
+                    }
+                    #[cfg(feature = "cuda")]
+                    if let Some(why) = graphed.failure() {
+                        eprintln!("ncm-bench: concept step not captured, eager: {why}");
+                    }
+                    (started, prefilled, from, (concepts - 1) * k)
+                }
+                Decode::Speculative(acceptance) => {
+                    // The draft and verify passes replay CUDA graphs likewise, and so does
+                    // appending each written concept.
+                    let mut speculator = Speculator::new(acceptance);
+                    let mut tokens = speculator.decode(m, cond, &cache);
+                    #[cfg(feature = "cuda")]
+                    let mut append = ncm_model::ncm::GraphedAppend::default();
+                    #[cfg(feature = "cuda")]
+                    append.prepare(m, &tokens, &mut cache);
+                    sync(device);
+                    let from = Instant::now();
+                    for _ in 1..concepts {
+                        timed(&mut || {
+                            #[cfg(feature = "cuda")]
+                            let cond = append.append(m, tokens.clone(), &mut cache);
+                            #[cfg(not(feature = "cuda"))]
+                            let cond = m.append_tokens(tokens.clone(), &mut cache);
+                            tokens = speculator.decode(m, cond, &cache);
+                        });
+                    }
+                    #[cfg(feature = "cuda")]
+                    if let Some(why) = speculator.failure().or(append.failure()) {
+                        eprintln!("ncm-bench: speculative graphs not captured, eager: {why}");
+                    }
+                    spec = Some(speculator.stats());
+                    (started, prefilled, from, (concepts - 1) * k)
                 }
             }
-            (started, prefilled)
         }
         Model::Tok(m) => {
             let mut caches = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let _ = m.prefill(prompt.clone().narrow(1, 0, context - 1), &mut caches, PREFILL_CHUNK);
+            let _ = m.prefill(
+                prompt.clone().narrow(1, 0, context - 1),
+                &mut caches,
+                PREFILL_CHUNK.load(Ordering::Relaxed),
+            );
             sync(device);
             let prefilled = Instant::now();
             let mut token = prompt.clone().narrow(1, context - 1, 1);
+            // On CUDA with the fused kernels on, every step is one captured graph replay
+            // (embedding, stack, logits, argmax), as the NCM's concept steps are.
+            #[cfg(feature = "cuda")]
+            let mut graphed = ncm_model::tok::GraphedTok::default();
+            #[cfg(feature = "cuda")]
+            graphed.prepare(m, &token, &mut caches);
+            sync(device);
+            let from = Instant::now();
             for _ in 0..new_tokens {
-                token = m.step(token, &mut caches).argmax(2).reshape([1, 1]);
+                timed(&mut || {
+                    #[cfg(feature = "cuda")]
+                    {
+                        token = graphed.step(m, token.clone(), &mut caches);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        token = argmax_last(m.step(token.clone(), &mut caches)).reshape([1, 1]);
+                    }
+                });
             }
-            (started, prefilled)
+            #[cfg(feature = "cuda")]
+            if let Some(why) = graphed.failure() {
+                eprintln!("ncm-bench: token step not captured, eager: {why}");
+            }
+            (started, prefilled, from, new_tokens)
         }
     };
     let enqueued = Instant::now();
     sync(device);
     let done = Instant::now();
+    let steps = calls.len();
     Run {
         prefill_s: prefilled.duration_since(started).as_secs_f64(),
-        decode_s: done.duration_since(prefilled).as_secs_f64(),
-        enqueue_s: enqueued.duration_since(prefilled).as_secs_f64(),
+        decode_s: done.duration_since(from).as_secs_f64(),
+        enqueue_s: enqueued.duration_since(from).as_secs_f64(),
+        host_s: if steps == 0 { 0.0 } else { median(&mut calls) * steps as f64 },
+        timed_tokens,
+        spec,
     }
 }
 
-/// Timings of one run. `enqueue_s` is the decode time before the final device sync: close to
-/// `decode_s` means the host, not the GPU, is the bottleneck.
+/// Timings of one run, decode counted over the timed loop only.
+///
+/// `enqueue_s` is the decode time before the final device sync. It overstates the host's work
+/// when the GPU is the bottleneck: the host then blocks inside launches once the launch queue
+/// is full. `host_s` estimates the host's own work instead: the median host time of one step
+/// call (the unblocked cost) times the steps. `host_s` near `decode_s` means the host is the
+/// bottleneck.
 struct Run {
     prefill_s: f64,
     decode_s: f64,
     enqueue_s: f64,
+    host_s: f64,
+    /// Tokens the timed loop wrote.
+    timed_tokens: usize,
+    /// Speculative runs: what the speculator did.
+    spec: Option<SpecStats>,
 }
 
 fn random_prompt(device: &Device, vocab: usize, n: usize) -> Tensor<2, Int> {
@@ -217,17 +496,24 @@ fn bench_model(
     cli: &Cli,
     device: &Device,
     itemsize: usize,
+    spec: Option<QuantSpec>,
 ) -> (Value, Vec<(usize, f64)>) {
     device.seed(0);
-    let model = match cfg {
+    let model = quant::build(spec, || match cfg {
         Config::Tok(c) => Model::Tok(Box::new(TokenLm::new(c, device))),
         Config::Ncm(c) => Model::Ncm(Box::new(NcmLm::new(c, device))),
-    };
-    let parts = model.parts();
+    });
+    let design = cfg.design().name();
+    let parts = dense_parts(cfg, device);
     let params: usize = parts.iter().map(|p| p.1).sum();
     let unit = cfg.unit();
     let new_tokens = cli.new_tokens - cli.new_tokens % unit;
-    println!("{}: {} params, {new_tokens} new tokens", model.name(), fmt_params(params));
+    let quant = spec.map_or_else(|| "none".to_owned(), |s| s.name());
+    println!(
+        "{} ({design}, quant {quant}): {} params, {new_tokens} new tokens",
+        model.name(),
+        fmt_params(params)
+    );
     for (name, n) in &parts {
         println!("  {name:<18} {:>10}", fmt_params(*n));
     }
@@ -237,43 +523,66 @@ fn bench_model(
         let context = context - context % unit;
         let prompt = random_prompt(device, cfg.vocab_size(), context);
         let warm = random_prompt(device, cfg.vocab_size(), context.min(64 * unit));
-        run_once(&model, &warm, 2 * unit, device); // warm-up: compile kernels, fill pools
+        // Warm-up: compile kernels, fill pools.
+        run_once(&model, &warm, 2 * unit, Decode::Plain, device);
         let (mut prefills, mut decodes, mut enqueues) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut hosts, mut rates) = (Vec::new(), Vec::new());
         for _ in 0..cli.repeats {
-            let run = run_once(&model, &prompt, new_tokens, device);
+            let run = run_once(&model, &prompt, new_tokens, Decode::Plain, device);
             prefills.push(run.prefill_s);
             decodes.push(run.decode_s);
             enqueues.push(run.enqueue_s);
+            hosts.push(run.host_s / run.decode_s);
+            rates.push(run.timed_tokens as f64 / run.decode_s);
         }
         let reserved = device.memory_pool_usage().map(|u| u.bytes_reserved);
+        // The design's cache (8-bit indexer keys in v2) and what the reference allocates.
         let cache = cache_bytes(cfg, context + new_tokens, itemsize, 1);
-        let decode_tok_s = new_tokens as f64 / median(&mut decodes.clone());
+        let allocated = cache_bytes_with(cfg, context + new_tokens, itemsize, itemsize, 1);
+        let decode_tok_s = median(&mut rates);
         let prefill_s = median(&mut prefills.clone());
-        let host_share = median(&mut enqueues.clone()) / median(&mut decodes.clone());
+        let host_share = median(&mut hosts.clone());
+        let enqueue_share = median(&mut enqueues.clone()) / median(&mut decodes.clone());
         println!(
             "  ctx {context:>7}: prefill {prefill_s:.3}s  decode {decode_tok_s:.1} tok/s  \
-             host {:.0}%  reserved {}  cache {}",
+             host {:.0}% (enqueue {:.0}%)  reserved {}  cache {}",
             host_share * 100.0,
+            enqueue_share * 100.0,
             reserved.map_or("n/a".into(), fmt_bytes),
             fmt_bytes(cache as u64),
         );
+        let speculative = match &model {
+            Model::Ncm(_) if cli.speculate == Speculate::On => {
+                bench_speculative(&model, cli, &prompt, &warm, new_tokens, decode_tok_s, device)
+            }
+            _ => Vec::new(),
+        };
         contexts.insert(
             context.to_string(),
             json!({
                 "prefill_s": prefill_s,
                 "decode_tok_s": decode_tok_s,
                 "decode_host_share": host_share,
+                "decode_enqueue_share": enqueue_share,
                 "decode_s_runs": decodes,
                 "prefill_s_runs": prefills,
                 "reserved_memory_bytes": reserved,
                 "cache_bytes": cache,
+                "cache_bytes_allocated": allocated,
+                "speculative": speculative,
             }),
         );
         decode_rates.push((context, decode_tok_s));
     }
+    // After the runs, so every parameter is initialised in the order the runs used them.
+    let weight_bytes = model.weight_bytes();
+    println!("  weights {:.1} MiB on the device", weight_bytes as f64 / (1u64 << 20) as f64);
     let result = json!({
         "name": model.name(),
+        "design": design,
+        "quant": quant,
         "params": params,
+        "weight_bytes": weight_bytes,
         "parts": parts.iter().map(|(n, c)| json!({"name": n, "params": c})).collect::<Vec<_>>(),
         "new_tokens": new_tokens,
         "contexts": contexts,
@@ -281,8 +590,105 @@ fn bench_model(
     (result, decode_rates)
 }
 
+/// Speculative decode runs of the NCM at one context: real verification, then each assumed
+/// acceptance rate. `plain_tok_s` is the plain decode rate they are compared with.
+fn bench_speculative(
+    model: &Model,
+    cli: &Cli,
+    prompt: &Tensor<2, Int>,
+    warm: &Tensor<2, Int>,
+    new_tokens: usize,
+    plain_tok_s: f64,
+    device: &Device,
+) -> Vec<Value> {
+    let context = prompt.dims()[1];
+    let modes = std::iter::once(Acceptance::Verify)
+        .chain(cli.assume_accept.iter().map(|&rate| Acceptance::Assume(rate)));
+    let mut out = Vec::new();
+    for acceptance in modes {
+        let mode = Decode::Speculative(acceptance);
+        let unit = match model {
+            Model::Ncm(m) => m.concept_size(),
+            Model::Tok(_) => 1,
+        };
+        run_once(model, warm, 2 * unit, mode, device);
+        let (mut decodes, mut rates, mut stats) = (Vec::new(), Vec::new(), SpecStats::default());
+        for _ in 0..cli.repeats {
+            let run = run_once(model, prompt, new_tokens, mode, device);
+            decodes.push(run.decode_s);
+            rates.push(run.timed_tokens as f64 / run.decode_s);
+            let s = run.spec.expect("a speculative run reports its stats");
+            stats.concepts += s.concepts;
+            stats.verify_passes += s.verify_passes;
+            stats.judged += s.judged;
+            stats.accepted += s.accepted;
+        }
+        let tok_s = median(&mut rates);
+        let speedup = tok_s / plain_tok_s;
+        let (label, assumed) = match acceptance {
+            Acceptance::Verify => ("real verification (random weights)".to_string(), None),
+            Acceptance::Assume(rate) => {
+                (format!("SYNTHETIC assumed acceptance {rate}"), Some(rate))
+            }
+        };
+        println!(
+            "  ctx {context:>7}: speculative, {label}: decode {tok_s:.1} tok/s ({speedup:.2}x \
+             plain), draft tokens kept {:.1}%, {:.2} verify passes per concept",
+            stats.acceptance() * 100.0,
+            stats.passes_per_concept(),
+        );
+        out.push(json!({
+            "acceptance_mode": if assumed.is_some() { "assumed" } else { "verify" },
+            "synthetic": assumed.is_some(),
+            "assumed_acceptance": assumed,
+            "decode_tok_s": tok_s,
+            "speedup_over_plain": speedup,
+            "decode_s_runs": decodes,
+            "draft_acceptance": stats.acceptance(),
+            "verify_passes_per_concept": stats.passes_per_concept(),
+        }));
+    }
+    out
+}
+
+/// The config of model `kind` ("tok" or "ncm") in `design` at `size` (the 1B configs exist in
+/// the v2 design only).
+fn config_for(kind: &str, design: Design, tiny: bool, size: SizeChoice) -> Config {
+    if size == SizeChoice::B1 && !tiny {
+        return match kind {
+            "tok" => Config::Tok(ncm_model::tok_1b()),
+            _ => Config::Ncm(ncm_model::ncm_1b()),
+        };
+    }
+    match (kind, design, tiny) {
+        ("tok", Design::Fallback, true) => Config::Tok(tiny_tok(8)),
+        ("tok", Design::V2, true) => Config::Tok(tiny_tok_v2(tiny_v2(4, 2, 8))),
+        ("tok", design, false) => Config::Tok(tok_250m_of(design)),
+        (_, Design::Fallback, true) => Config::Ncm(tiny_ncm(8, 4)),
+        (_, Design::V2, true) => Config::Ncm(tiny_ncm_v2(8, tiny_v2(2, 2, 4))),
+        (_, design, false) => Config::Ncm(ncm_250m_of(design)),
+    }
+}
+
+/// Decode tok/s by context of one model.
+type Rates = Vec<(usize, f64)>;
+
+/// `a / b` at every context both measured.
+fn rate_ratios(a: &Rates, b: &Rates) -> Vec<(usize, f64)> {
+    a.iter()
+        .filter_map(|(context, ra)| {
+            b.iter().find(|(c, _)| c == context).map(|(_, rb)| (*context, ra / rb))
+        })
+        .collect()
+}
+
 /// Run the benchmark described by `cli`; prints the report and returns the JSON payload.
 pub fn run(cli: &Cli) -> Result<Value, String> {
+    // Before the device is first used: CubeCL reads its configuration once per process.
+    #[cfg(feature = "cuda")]
+    if cli.device == DeviceChoice::Cuda && !cli.no_kernel_cache {
+        ncm_model::kernels::enable_kernel_cache(cli.kernel_cache_dir.clone());
+    }
     let mut device = make_device(cli.device)?;
     let dtype = cli.dtype.unwrap_or(match cli.device {
         DeviceChoice::Cuda => DtypeChoice::Bf16,
@@ -292,46 +698,131 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         DtypeChoice::Bf16 => FloatDType::BF16,
         DtypeChoice::F32 => FloatDType::F32,
     };
-    device
-        .configure(float)
-        .map_err(|e| format!("cannot use {dtype:?} on {:?}: {e}", cli.device))?;
+    // A device's dtype locks on first use; a second run in the same process may reuse it.
+    if let Err(e) = device.configure(float)
+        && device.settings().float_dtype != float
+    {
+        return Err(format!("cannot use {dtype:?} on {:?}: {e}", cli.device));
+    }
     if cli.repeats == 0 || cli.context.is_empty() {
         return Err("--repeats and --context need at least one value".into());
     }
+    if !cli.assume_accept.is_empty() && cli.speculate == Speculate::Off {
+        return Err("--assume-accept needs --speculate on".into());
+    }
+    if let Some(rate) = cli.assume_accept.iter().find(|r| !(0.0..=1.0).contains(*r)) {
+        return Err(format!("--assume-accept {rate} is not between 0 and 1"));
+    }
     set_fused_attention(cli.fused_attention);
+    set_fused_kernels(!cli.reference_kernels);
+    set_cuda_graphs(!cli.no_cuda_graphs);
+    let spec = cli.quant_spec()?;
     let itemsize = match dtype {
         DtypeChoice::Bf16 => 2,
         DtypeChoice::F32 => 4,
     };
+    if let Some(p) = cli.hybrid_p.iter().find(|p| !(0.0..=1.0).contains(*p)) {
+        return Err(format!("--hybrid-p {p} is not between 0 and 1"));
+    }
     let kinds: Vec<&str> = match cli.model {
         ModelChoice::Tok => vec!["tok"],
         ModelChoice::Ncm => vec!["ncm"],
-        ModelChoice::Both => vec!["tok", "ncm"],
+        ModelChoice::Both | ModelChoice::All => vec!["tok", "ncm"],
+        ModelChoice::Hybrid => vec![],
     };
     let mut results = Vec::new();
-    let mut rates = Vec::new();
-    for kind in &kinds {
-        let cfg = match (*kind, cli.tiny) {
-            ("tok", true) => Config::Tok(tiny_tok(8)),
-            ("tok", false) => Config::Tok(tok_250m()),
-            (_, true) => Config::Ncm(tiny_ncm(8, 4)),
-            (_, false) => Config::Ncm(ncm_250m()),
-        };
-        let (result, decode) = bench_model(&cfg, cli, &device, itemsize);
-        results.push(result);
-        rates.push((*kind, decode));
+    let mut rates: Vec<(&str, Design, Rates)> = Vec::new();
+    let designs = match cli.size {
+        SizeChoice::B1 if !cli.tiny => {
+            if cli.design == DesignChoice::Fallback {
+                return Err("--size 1b has the v2 design only".into());
+            }
+            vec![Design::V2]
+        }
+        _ => cli.design.designs(),
+    };
+    for design in designs.clone() {
+        for kind in &kinds {
+            let chunk = match design {
+                Design::V2 => 8192,
+                Design::Fallback => 512,
+            };
+            PREFILL_CHUNK.store(cli.prefill_chunk.unwrap_or(chunk).max(1), Ordering::Relaxed);
+            let mut cfg = config_for(kind, design, cli.tiny, cli.size);
+            if cli.float_index_keys {
+                match &mut cfg {
+                    Config::Tok(c) => c.v2.idx_8bit = false,
+                    Config::Ncm(c) => c.v2.idx_8bit = false,
+                }
+            }
+            let (result, decode) = bench_model(&cfg, cli, &device, itemsize, spec);
+            results.push(result);
+            rates.push((kind, design, decode));
+        }
     }
+    let mut hybrid_ratios = Vec::new();
+    if matches!(cli.model, ModelChoice::Hybrid | ModelChoice::All) {
+        PREFILL_CHUNK.store(cli.prefill_chunk.unwrap_or(8192).max(1), Ordering::Relaxed);
+        let (result, hybrid_rates) = hybrid::bench_hybrid(cli, &device, spec);
+        results.push(result);
+        let k4 = rates.iter().find(|r| r.0 == "ncm" && r.1 == Design::V2).map(|r| r.2.clone());
+        for (context, label, tok_s) in &hybrid_rates {
+            // The k = 4 NCM runs whole concepts (context 37 runs as 36): its run at the largest
+            // context up to the hybrid's.
+            let base = k4
+                .as_ref()
+                .and_then(|r| r.iter().filter(|(c, _)| *c <= *context).max_by_key(|(c, _)| *c));
+            let Some(base) = base else {
+                continue;
+            };
+            let ratio = tok_s / base.1;
+            let gate = if *label == hybrid::gate_label() {
+                Some(if ratio >= hybrid::HYBRID_GATE { "PASS" } else { "FAIL" })
+            } else if *label == hybrid::ar_label() {
+                Some(if ratio >= 1.0 { "PASS" } else { "FAIL" })
+            } else {
+                None
+            };
+            println!(
+                "ratio hybrid/ncm k=4 (v2) @ ctx {context}, {label}: {ratio:.2}x{}",
+                gate.map_or(String::new(), |g| format!(" {g}"))
+            );
+            hybrid_ratios.push(json!({
+                "context": context,
+                "mode": label,
+                "ratio": ratio,
+                "verdict": gate,
+            }));
+        }
+    }
+    let find = |kind: &str, design: Design| {
+        rates.iter().find(|r| r.0 == kind && r.1 == design).map(|r| &r.2)
+    };
+    let note = if cli.tiny { "  (tiny config: smoke run, not a gate result)" } else { "" };
     let mut ratios = Vec::new();
-    let tok = rates.iter().find(|r| r.0 == "tok");
-    let ncm = rates.iter().find(|r| r.0 == "ncm");
-    if let (Some((_, tok)), Some((_, ncm))) = (tok, ncm) {
-        for (context, ncm_rate) in ncm {
-            let Some((_, tok_rate)) = tok.iter().find(|(c, _)| c == context) else { continue };
-            let ratio = ncm_rate / tok_rate;
+    for design in designs {
+        let (Some(tok), Some(ncm)) = (find("tok", design), find("ncm", design)) else { continue };
+        for (context, ratio) in rate_ratios(ncm, tok) {
             let v = verdict(ratio);
-            let note = if cli.tiny { "  (tiny config: smoke run, not a gate result)" } else { "" };
-            println!("ratio ncm/tok @ ctx {context}: {ratio:.2}x {v}{note}");
-            ratios.push(json!({"context": context, "ratio": ratio, "verdict": v}));
+            println!("ratio ncm/tok ({}) @ ctx {context}: {ratio:.2}x {v}{note}", design.name());
+            ratios.push(json!({
+                "design": design.name(),
+                "context": context,
+                "ratio": ratio,
+                "verdict": v,
+            }));
+        }
+    }
+    // The second gate: the v2 NCM against the fallback NCM.
+    let mut design_ratios = Vec::new();
+    if let (Some(v2), Some(fallback)) = (find("ncm", Design::V2), find("ncm", Design::Fallback)) {
+        for (context, ratio) in rate_ratios(v2, fallback) {
+            let v = fallback_verdict(ratio);
+            println!(
+                "ratio ncm v2/fallback @ ctx {context}: {ratio:.2}x {v} \
+                 (floor {FALLBACK_FLOOR}x){note}"
+            );
+            design_ratios.push(json!({"context": context, "ratio": ratio, "verdict": v}));
         }
     }
     Ok(json!({
@@ -339,7 +830,16 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         "dtype": format!("{dtype:?}").to_lowercase(),
         "tiny": cli.tiny,
         "fused_attention": cli.fused_attention,
+        "fused_kernels": cli.device == DeviceChoice::Cuda && kernels_built() && !cli.reference_kernels,
+        "cuda_graphs": cli.device == DeviceChoice::Cuda
+            && kernels_built()
+            && !cli.reference_kernels
+            && !cli.no_cuda_graphs,
+        "speculate": cli.speculate == Speculate::On,
+        "quant": spec.map_or_else(|| "none".to_owned(), |s| s.name()),
         "results": results,
         "ratios": ratios,
+        "ncm_v2_over_fallback": design_ratios,
+        "hybrid_over_ncm_v2": hybrid_ratios,
     }))
 }

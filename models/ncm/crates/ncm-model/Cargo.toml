@@ -7,12 +7,24 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Fused CubeCL kernels for v2 decode on CUDA devices (src/kernels). Local GPU builds only: CI has
+# no CUDA toolkit and never enables it; without it every device runs the reference path.
+cuda = ["burn/cuda", "burn/extension", "dep:burn-cubecl", "dep:cubecl-cuda"]
+# Training helpers that need autodiff devices (`hybrid::train`).
+train = ["burn/autodiff"]
+
 [dependencies]
 burn = { workspace = true, features = ["store", "safetensors"] }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Default features off: they would switch on fusion and autotune for every cubecl device.
+burn-cubecl = { version = "=0.22.1", default-features = false, features = ["std", "cuda"], optional = true }
+# Only for its `persistence` feature: the on-disk cache of compiled kernels
+# (`kernels::enable_kernel_cache`).
+cubecl-cuda = { version = "=0.11.4", default-features = false, features = ["persistence"], optional = true }
 
 [dev-dependencies]
 burn = { workspace = true, features = ["flex"] }

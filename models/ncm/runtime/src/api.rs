@@ -232,7 +232,7 @@ pub fn usage_json(stats: &GenStats) -> Value {
         "prompt_tokens": stats.prompt_tokens,
         "completion_tokens": stats.completion_tokens,
         "total_tokens": stats.prompt_tokens + stats.completion_tokens,
-        "prompt_tokens_details": { "cached_tokens": 0 },
+        "prompt_tokens_details": { "cached_tokens": stats.cached_tokens },
     })
 }
 
@@ -244,21 +244,43 @@ fn per_token_ms(count: usize, seconds: f64) -> f64 {
     if count > 0 { seconds * 1000.0 / count as f64 } else { 0.0 }
 }
 
-/// llama-server's `timings` object, with prompt processing and decoding timed separately.
-/// `predicted_per_second` is the decode speed in tokens per second; `cache_bytes` is the
-/// key/value cache allocated at launch (an extension).
+/// llama-server's `timings` object, with prompt processing and decoding timed separately:
+/// `cache_n` prompt tokens came from the previous request's cache (prompt-prefix reuse) and
+/// `prompt_n` were prefilled.
+/// `predicted_per_second` is the decode speed in tokens per second. Extensions: `cache_bytes`,
+/// the key/value cache allocated at launch; `graph_capture_ms`, the decode graph's capture
+/// (counted in neither `prompt_ms` nor `predicted_ms`); `decode_path`, the loop the request
+/// took (`eager`, `graphed-greedy`, `graphed-sampled`, `speculative`, `batched`); with
+/// continuous batching, `queue_ms` (the wait for a slot), `mean_batch` (the mean rows of the
+/// decode steps it took part in) and `forked` (its prompt's prefill was another slot's).
 pub fn timings_json(stats: &GenStats, cache_bytes: usize) -> Value {
     json!({
-        "cache_n": 0,
-        "prompt_n": stats.prompt_tokens,
+        "cache_n": stats.cached_tokens,
+        "prompt_n": stats.prompt_tokens - stats.cached_tokens,
         "prompt_ms": stats.prompt_s * 1000.0,
-        "prompt_per_token_ms": per_token_ms(stats.prompt_tokens, stats.prompt_s),
-        "prompt_per_second": per_second(stats.prompt_tokens, stats.prompt_s),
+        "prompt_per_token_ms": per_token_ms(stats.prompt_tokens - stats.cached_tokens, stats.prompt_s),
+        "prompt_per_second": per_second(stats.prompt_tokens - stats.cached_tokens, stats.prompt_s),
         "predicted_n": stats.completion_tokens,
         "predicted_ms": stats.decode_s * 1000.0,
         "predicted_per_token_ms": per_token_ms(stats.decode_tokens, stats.decode_s),
         "predicted_per_second": per_second(stats.decode_tokens, stats.decode_s),
         "cache_bytes": cache_bytes,
+        "graph_capture_ms": stats.capture_s * 1000.0,
+        "decode_path": stats.path.name(),
+        "hybrid": match stats.path {
+            crate::engine::DecodePath::Hybrid(a) => json!({
+                "blocks": a.blocks,
+                "mean_first_accepted": a.mean_first_accepted(),
+                "first_passes": a.first_passes,
+                "redecodes": a.redecodes,
+                "ar_tokens": a.ar_tokens,
+                "graphed": a.graphed,
+            }),
+            _ => Value::Null,
+        },
+        "queue_ms": stats.queue_s * 1000.0,
+        "mean_batch": stats.mean_batch,
+        "forked": stats.forked,
     })
 }
 

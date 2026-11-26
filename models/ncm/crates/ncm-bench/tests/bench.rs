@@ -1,13 +1,14 @@
 //! Benchmark CLI: help text, thresholds and a tiny CPU run.
 
 use clap::{CommandFactory, Parser};
-use ncm_bench::{Cli, run, verdict};
+use ncm_bench::{Cli, fallback_verdict, run, verdict};
 
 #[test]
 fn help_lists_the_documented_flags() {
     let help = Cli::command().render_long_help().to_string();
     for flag in [
         "--model",
+        "--design",
         "--context",
         "--new-tokens",
         "--device",
@@ -15,6 +16,11 @@ fn help_lists_the_documented_flags() {
         "--repeats",
         "--json",
         "--tiny",
+        "--reference-kernels",
+        "--no-cuda-graphs",
+        "--speculate",
+        "--assume-accept",
+        "--hybrid-p",
     ] {
         assert!(help.contains(flag), "missing {flag}");
     }
@@ -37,7 +43,13 @@ fn cuda_is_refused_without_the_feature() {
 }
 
 #[test]
-fn tiny_cpu_run_reports_both_models() {
+fn fallback_floor() {
+    assert_eq!(fallback_verdict(0.75), "PASS");
+    assert_eq!(fallback_verdict(0.74), "FAIL");
+}
+
+#[test]
+fn tiny_cpu_run_reports_both_models_in_both_designs() {
     let cli = Cli::parse_from([
         "ncm-bench",
         "--tiny",
@@ -53,16 +65,188 @@ fn tiny_cpu_run_reports_both_models() {
         "1",
     ]);
     let payload = run(&cli).expect("tiny run");
-    let names: Vec<&str> = payload["results"]
+    let names: Vec<String> = payload["results"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| r["name"].as_str().unwrap())
+        .map(|r| format!("{} {}", r["name"].as_str().unwrap(), r["design"].as_str().unwrap()))
         .collect();
-    assert_eq!(names, ["tok", "ncm"]);
-    assert_eq!(payload["ratios"].as_array().unwrap().len(), 1);
-    assert_eq!(payload["ratios"][0]["context"], 64);
-    let tok = &payload["results"][0]["contexts"]["64"];
-    assert!(tok["decode_tok_s"].as_f64().unwrap() > 0.0);
-    assert!(tok["cache_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(names, ["tok fallback", "ncm fallback", "tok v2", "ncm v2"]);
+    let ratios = payload["ratios"].as_array().unwrap();
+    assert_eq!(ratios.len(), 2);
+    assert_eq!(
+        (ratios[0]["design"].as_str(), ratios[1]["design"].as_str()),
+        (Some("fallback"), Some("v2"))
+    );
+    assert_eq!(ratios[0]["context"], 64);
+    assert_eq!(payload["ncm_v2_over_fallback"].as_array().unwrap().len(), 1);
+    for result in payload["results"].as_array().unwrap() {
+        let ctx = &result["contexts"]["64"];
+        assert!(ctx["decode_tok_s"].as_f64().unwrap() > 0.0);
+        assert!(ctx["cache_bytes"].as_u64().unwrap() > 0);
+    }
+}
+
+#[test]
+fn design_flag_picks_one_design() {
+    let cli = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--design",
+        "v2",
+        "--model",
+        "ncm",
+        "--context",
+        "32",
+        "--new-tokens",
+        "4",
+        "--repeats",
+        "1",
+    ]);
+    let payload = run(&cli).expect("tiny run");
+    let results = payload["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["design"], "v2");
+    assert!(payload["ratios"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn speculate_reports_real_and_synthetic_runs() {
+    let cli = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--model",
+        "ncm",
+        "--context",
+        "32",
+        "--new-tokens",
+        "8",
+        "--repeats",
+        "1",
+        "--speculate",
+        "on",
+        "--assume-accept",
+        "1.0",
+        "0.5",
+    ]);
+    let payload = run(&cli).expect("tiny run");
+    for result in payload["results"].as_array().unwrap() {
+        let runs = result["contexts"]["32"]["speculative"].as_array().unwrap();
+        let synthetic: Vec<_> = runs.iter().map(|r| r["synthetic"].as_bool().unwrap()).collect();
+        assert_eq!(synthetic, [false, true, true]);
+        assert_eq!(runs[1]["assumed_acceptance"], 1.0);
+        assert_eq!(runs[1]["verify_passes_per_concept"], 1.0);
+        assert!(runs.iter().all(|r| r["decode_tok_s"].as_f64().unwrap() > 0.0));
+    }
+}
+
+#[test]
+fn assume_accept_needs_speculate_and_a_rate() {
+    let base = ["ncm-bench", "--tiny", "--device", "cpu", "--model", "ncm"];
+    let off = Cli::parse_from(base.iter().chain(&["--assume-accept", "0.5"]));
+    assert!(run(&off).unwrap_err().contains("--speculate on"));
+    let bad = Cli::parse_from(base.iter().chain(&["--speculate", "on", "--assume-accept", "1.5"]));
+    assert!(run(&bad).unwrap_err().contains("between 0 and 1"));
+}
+
+#[test]
+fn hybrid_runs_against_the_k4_ncm() {
+    let cli = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--design",
+        "v2",
+        "--model",
+        "all",
+        "--context",
+        "37",
+        "--new-tokens",
+        "16",
+        "--repeats",
+        "1",
+        "--hybrid-p",
+        "1.0",
+        "0.9",
+    ]);
+    let payload = run(&cli).expect("tiny run");
+    let results = payload["results"].as_array().unwrap();
+    let hybrid = results.iter().find(|r| r["name"] == "hybrid").expect("a hybrid result");
+    let runs = hybrid["contexts"]["37"]["runs"].as_array().unwrap();
+    // The autoregressive path, the two rates and full rejection.
+    assert_eq!(runs.len(), 4);
+    // p = 1 accepts every draft token: the prompt's open block (3 of 8 left), then whole blocks.
+    let first = runs[1]["mean_first_accepted"].as_f64().unwrap();
+    assert!((3.0..=8.0).contains(&first), "{first}");
+    assert_eq!(runs[3]["redecodes_per_block"].as_f64().map(|r| r > 0.0), Some(true));
+    assert_eq!(payload["hybrid_over_ncm_v2"].as_array().unwrap().len(), 4);
+    let bad = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--model",
+        "hybrid",
+        "--hybrid-p",
+        "1.5",
+    ]);
+    assert!(run(&bad).is_err());
+}
+
+#[test]
+fn train_memory_estimates_every_model() {
+    use ncm_bench::train_memory::{TrainMemoryCli, run};
+    let cli = TrainMemoryCli::parse_from(["train-memory", "--seq", "4096", "--micro-batch", "1"]);
+    let payload = run(&cli);
+    let models = payload["models"].as_array().unwrap();
+    assert_eq!(models.len(), 6);
+    for m in models {
+        let p = m["params"].as_f64().unwrap();
+        assert!(p > 1e8, "{m}");
+        // AdamW fp32 moments are 8 bytes per parameter, 8-bit about 2.
+        let (a, a8) = (m["adamw_gib"].as_f64().unwrap(), m["adamw8_gib"].as_f64().unwrap());
+        assert!((a / a8 - 4.0).abs() < 0.05);
+        // Recomputation never keeps more.
+        assert!(m["activations_recompute_gib"].as_f64() <= m["activations_gib"].as_f64());
+    }
+    // The 1B models are larger than the 250M ones.
+    for i in 0..3 {
+        assert!(models[i + 3]["params"].as_f64() > models[i]["params"].as_f64());
+    }
+}
+
+/// The latency model reproduces the plan's checks: the 250M token baseline about 724 tok/s and
+/// the k = 4 NCM about 1,450 in bf16 at 2k; hybrid speed rises with acceptance, and its
+/// autoregressive path alone sits between full rejection and full acceptance.
+#[test]
+fn predict_matches_the_plans_checks() {
+    use ncm_bench::predict::{PredictCli, run};
+    let cli = PredictCli::parse_from(["predict", "--size", "250m", "--context", "2048"]);
+    let rows = run(&cli)["rows"].as_array().unwrap().clone();
+    let rate = |format: &str, model: &str| {
+        rows.iter()
+            .find(|r| r["format"] == format && r["model"] == model)
+            .and_then(|r| r["tok_s"].as_f64())
+            .unwrap_or_else(|| panic!("{format} {model}"))
+    };
+    let tok = rate("bf16", "token baseline");
+    assert!((tok / 724.0 - 1.0).abs() < 0.05, "token baseline {tok}");
+    let ncm = rate("bf16", "ncm k=4");
+    assert!((ncm / 1449.0 - 1.0).abs() < 0.1, "k = 4 {ncm}");
+    let (full, p95, zero) = (
+        rate("bf16", "hybrid, p = 1"),
+        rate("bf16", "hybrid, p = 0.95"),
+        rate("bf16", "hybrid, p = 0"),
+    );
+    let ar = rate("bf16", "hybrid, AR path only");
+    assert!(full > p95 && p95 > zero);
+    assert!(full > ar && ar > zero);
+    // Quantised weights read fewer bytes.
+    assert!(rate("q4", "token baseline") > rate("q8", "token baseline"));
+    assert!(rate("q8", "token baseline") > tok);
 }

@@ -1,5 +1,6 @@
 # Token baseline: plain decoder-only transformer, same tokenizer, heads and layer pattern as NCM.
 model = "tok"
+attention = "fallback"  # first design; see tok-250m-v2.toml for the adopted one
 vocab_size = 32000
 d_model = 1024
 n_layers = 20

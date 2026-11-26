@@ -1,0 +1,629 @@
+//! The memory the generator and the token decoder cross-attend to, one per block, and the
+//! attention over it.
+//!
+//! A memory holds, for each of `nb` blocks:
+//!
+//! * **token states** shared by the blocks: local-encoder states of a token range (the whole
+//!   training sequence, or the recent ring at decode time), of which each block sees only its own
+//!   window, the last `recent` tokens before its start (the causality rule);
+//! * **per-block entries**: the backbone slots, the retrieved tokens (embedded ids plus their
+//!   position within their block) and, for the generator only, the block's known prefix (encoder
+//!   states plus a segment embedding); hidden entries are masked.
+//!
+//! Queries attend over both parts with one softmax. Keys carry RoPE at absolute token positions:
+//! token states at their own, slots and retrieved tokens at the block's start, known-prefix states
+//! at theirs; queries sit at the block's start (generator) or at their token (token decoder).
+//! The copy head reads the same token entries, each standing for the token that followed it.
+
+use burn::module::Module;
+use burn::tensor::activation::{log_softmax, softmax};
+use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
+
+use crate::layers::{Rope, apply_rope, linear};
+use crate::quant::QLinear as Linear;
+
+/// RoPE tables with a row per position and optionally per batch row `[B or 1, 1, T, D]`
+/// (`cos`, `sin` repeated over both halves): the fast path's queries and per-block entries,
+/// whose positions differ per slot when slots are batched. Applied with plain tensor ops,
+/// broadcasting over heads (and over the batch when B is 1).
+#[derive(Clone, Debug)]
+pub struct RopeTables {
+    pub cos: Tensor<4>,
+    pub sin: Tensor<4>,
+}
+
+impl RopeTables {
+    /// Plain RoPE (no scaling) tables for `positions`, one row each `[1, 1, T, D]`.
+    pub fn at(positions: &[usize], head_dim: usize, base: f64, device: &Device) -> Self {
+        let n = positions.len();
+        let (mut cos, mut sin) = (vec![0f32; n * head_dim], vec![0f32; n * head_dim]);
+        let rows = cos.chunks_mut(head_dim).zip(sin.chunks_mut(head_dim));
+        for (&pos, (c, s)) in positions.iter().zip(rows) {
+            crate::layers::rope_values(pos, head_dim, base, 1.0, crate::layers::Yarn::OFF, c, s);
+        }
+        let shape = [1, 1, n, head_dim];
+        Self {
+            cos: Tensor::from_data(TensorData::new(cos, shape), device),
+            sin: Tensor::from_data(TensorData::new(sin, shape), device),
+        }
+    }
+
+    /// Rows `start..start + len`.
+    pub fn rows(&self, start: usize, len: usize) -> Self {
+        Self {
+            cos: self.cos.clone().narrow(2, start, len),
+            sin: self.sin.clone().narrow(2, start, len),
+        }
+    }
+
+    /// The tables of several slots stacked along the batch `[B, 1, T, D]`.
+    pub fn stack(tables: &[&RopeTables]) -> Self {
+        if tables.len() == 1 {
+            return tables[0].clone();
+        }
+        Self {
+            cos: Tensor::cat(tables.iter().map(|t| t.cos.clone()).collect(), 0),
+            sin: Tensor::cat(tables.iter().map(|t| t.sin.clone()).collect(), 0),
+        }
+    }
+
+    /// `x` `[B, H, T, D]` rotated: `x cos + [-x2, x1] sin`; one launch on CUDA with the fused
+    /// kernels on ([`crate::rope_fused::rope_tables`]).
+    pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(&x.device())
+            && let Some(y) =
+                crate::rope_fused::rope_tables(x.clone(), self.cos.clone(), self.sin.clone())
+        {
+            return y;
+        }
+        let d = x.dims()[3];
+        let h = d / 2;
+        let rot =
+            Tensor::cat(vec![x.clone().narrow(3, h, d - h).neg(), x.clone().narrow(3, 0, h)], 3);
+        x * self.cos.clone() + rot * self.sin.clone()
+    }
+}
+
+/// The layer-independent memory of `nb` blocks (see the module docs).
+#[derive(Clone, Debug)]
+pub struct Memory {
+    pub nb: usize,
+    /// Token states `[B, N, d]` at absolute positions `seq_start..`, None when there are none.
+    pub seq: Option<Tensor<3>>,
+    pub seq_start: usize,
+    /// Per block, the visible range of `seq` (indices into it) and the range the copy head may
+    /// point into (an entry is copyable when the token after it is before the block).
+    pub windows: Vec<(usize, usize)>,
+    pub copy_windows: Vec<(usize, usize)>,
+    /// The token that followed each `seq` entry `[B, N]` (0 where none is known).
+    pub seq_next: Option<Tensor<2, Int>>,
+    /// Per-block entries `[B, nb, E, d]`, their absolute positions (`nb * E`, block-major) and
+    /// which are hidden `[B, nb, E]` (`true` hides).
+    pub extra: Tensor<4>,
+    pub extra_pos: Vec<usize>,
+    pub extra_hidden: Tensor<3, Bool>,
+    /// The retrieved-token segment of `extra`: offset, length and the token that followed each
+    /// entry `[B, nb, len]`.
+    pub copy_extra: Option<(usize, usize, Tensor<3, Int>)>,
+    /// Blocks attended at once (0: all): the attention over the token states then runs per
+    /// chunk of blocks over the chunk's window only, so a training sequence's scores take
+    /// `chunk · q · (recent + chunk · L)` per head instead of `nb · q · N`. Same math.
+    pub chunk_blocks: usize,
+}
+
+impl Memory {
+    /// Per-block entries.
+    pub fn extra_len(&self) -> usize {
+        self.extra.dims()[2]
+    }
+
+    /// Blocks `b0..b1` alone, with the token states cut to their windows' span `lo..hi`
+    /// (returned): the memory a chunk of blocks attends.
+    pub fn blocks(&self, b0: usize, b1: usize) -> (Memory, usize, usize) {
+        let e = self.extra_len();
+        let spans = self.windows[b0..b1].iter().chain(&self.copy_windows[b0..b1]);
+        let spans: Vec<_> = spans.filter(|w| w.1 > w.0).collect();
+        let lo = spans.iter().map(|w| w.0).min().unwrap_or(0);
+        let hi = spans.iter().map(|w| w.1).max().unwrap_or(0);
+        let shift = |ws: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            ws.iter().map(|&(a, b)| if b > a { (a - lo, b - lo) } else { (0, 0) }).collect()
+        };
+        let has = hi > lo;
+        let memory = Memory {
+            nb: b1 - b0,
+            seq: self.seq.as_ref().filter(|_| has).map(|s| s.clone().narrow(1, lo, hi - lo)),
+            seq_start: self.seq_start + lo,
+            windows: shift(&self.windows[b0..b1]),
+            copy_windows: shift(&self.copy_windows[b0..b1]),
+            seq_next: self
+                .seq_next
+                .as_ref()
+                .filter(|_| has)
+                .map(|s| s.clone().narrow(1, lo, hi - lo)),
+            extra: self.extra.clone().narrow(1, b0, b1 - b0),
+            extra_pos: self.extra_pos[b0 * e..b1 * e].to_vec(),
+            extra_hidden: self.extra_hidden.clone().narrow(1, b0, b1 - b0),
+            copy_extra: self
+                .copy_extra
+                .as_ref()
+                .map(|(o, l, n)| (*o, *l, n.clone().narrow(1, b0, b1 - b0))),
+            chunk_blocks: 0,
+        };
+        (memory, lo, hi)
+    }
+
+    /// The chunks of blocks [`Self::chunk_blocks`] asks for, or None to attend at once.
+    fn chunks(&self) -> Option<Vec<(usize, usize)>> {
+        let c = self.chunk_blocks;
+        (c > 0 && self.nb > c)
+            .then(|| (0..self.nb).step_by(c).map(|b| (b, (b + c).min(self.nb))).collect())
+    }
+
+    /// Block `i`'s memory alone (one block, the same token states).
+    pub fn block(&self, i: usize) -> Memory {
+        let e = self.extra_len();
+        Memory {
+            nb: 1,
+            seq: self.seq.clone(),
+            seq_start: self.seq_start,
+            windows: vec![self.windows[i]],
+            copy_windows: vec![self.copy_windows[i]],
+            seq_next: self.seq_next.clone(),
+            extra: self.extra.clone().narrow(1, i, 1),
+            extra_pos: self.extra_pos[i * e..(i + 1) * e].to_vec(),
+            extra_hidden: self.extra_hidden.clone().narrow(1, i, 1),
+            copy_extra: self
+                .copy_extra
+                .as_ref()
+                .map(|(o, l, n)| (*o, *l, n.clone().narrow(1, i, 1))),
+            chunk_blocks: 0,
+        }
+    }
+
+    /// The `[nb * q, N]` mask of the token states for `q` queries per block over `windows`
+    /// (`true` hides).
+    fn seq_mask(&self, windows: &[(usize, usize)], q: usize, device: &Device) -> Tensor<2, Bool> {
+        let n = self.seq.as_ref().map_or(0, |s| s.dims()[1]);
+        let mut hidden = Vec::with_capacity(self.nb * q * n);
+        for &(lo, hi) in windows {
+            for _ in 0..q {
+                hidden.extend((0..n).map(|i| i < lo || i >= hi));
+            }
+        }
+        Tensor::from_data(TensorData::new(hidden, [self.nb * q, n]), device)
+    }
+}
+
+/// One cross-attention layer's keys and values of a [`Memory`]: token states `[B, KVH, N, D]`
+/// and per-block entries `[B, KVH, nb * E, D]`.
+pub struct LayerKv {
+    seq: Option<(Tensor<4>, Tensor<4>)>,
+    extra: (Tensor<4>, Tensor<4>),
+}
+
+impl LayerKv {
+    /// The keys and values of [`Memory::blocks`]`(b0, b1)` (span `lo..hi`, `e` entries per
+    /// block).
+    fn blocks(&self, b0: usize, b1: usize, e: usize, lo: usize, hi: usize) -> LayerKv {
+        let seq = self
+            .seq
+            .as_ref()
+            .filter(|_| hi > lo)
+            .map(|(k, v)| (k.clone().narrow(2, lo, hi - lo), v.clone().narrow(2, lo, hi - lo)));
+        let (k, v) = &self.extra;
+        let extra = (
+            k.clone().narrow(2, b0 * e, (b1 - b0) * e),
+            v.clone().narrow(2, b0 * e, (b1 - b0) * e),
+        );
+        LayerKv { seq, extra }
+    }
+}
+
+/// Queries from the generator or the token decoder over a [`Memory`].
+#[derive(Module, Debug)]
+pub struct MemoryAttention {
+    q: Linear,
+    kv: Linear,
+    o: Linear,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+}
+
+impl MemoryAttention {
+    pub fn new(d: usize, heads: usize, kv_heads: usize, head_dim: usize, device: &Device) -> Self {
+        assert!(heads.is_multiple_of(kv_heads), "query heads come in groups per key head");
+        Self {
+            q: linear(d, heads * head_dim, device),
+            kv: linear(d, 2 * kv_heads * head_dim, device),
+            o: linear(heads * head_dim, d, device),
+            heads,
+            kv_heads,
+            head_dim,
+        }
+    }
+
+    /// Keys (rotated by `rope`, one row per entry) and values `[B, KVH, n, D]` of memory
+    /// entries `x` `[B, n, d]`.
+    pub fn project_rows(&self, x: Tensor<3>, rope: &Rope) -> (Tensor<4>, Tensor<4>) {
+        let hd = self.head_dim;
+        let [b, t, _] = x.dims();
+        let kv = self.kv.forward(x);
+        let k = kv.clone().narrow(2, 0, self.kv_heads * hd);
+        let v = kv.narrow(2, self.kv_heads * hd, self.kv_heads * hd);
+        let k = apply_rope(k.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2), rope);
+        (k, v.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2))
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// [`Self::project_rows`] with per-row (and per-batch-row) tables.
+    pub fn project_rows_tables(&self, x: Tensor<3>, rope: &RopeTables) -> (Tensor<4>, Tensor<4>) {
+        let hd = self.head_dim;
+        let [b, t, _] = x.dims();
+        let kv = self.kv.forward(x);
+        let k = kv.clone().narrow(2, 0, self.kv_heads * hd);
+        let v = kv.narrow(2, self.kv_heads * hd, self.kv_heads * hd);
+        let k = rope.apply(k.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2));
+        (k, v.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2))
+    }
+
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    /// The fast decode path's attention over one block's memory: `x` `[1, q, d]` with query
+    /// tables `q_rope` (q rows), token-state keys and values `seq` `[1, KVH, N, D]` with an
+    /// additive bias `[1, N]` (0 visible, -inf hidden), and per-block entries `extra` likewise
+    /// with a bias `[1, E]`. No host data: every input is a device buffer, so it can run inside
+    /// a captured graph.
+    pub fn forward_biased(
+        &self,
+        x: Tensor<3>,
+        q_rope: &RopeTables,
+        seq: Option<(&Tensor<4>, &Tensor<4>, &Tensor<2>)>,
+        extra: (&Tensor<4>, &Tensor<4>, &Tensor<2>),
+    ) -> Tensor<3> {
+        let [b, nq, _] = x.dims();
+        let (h, hd) = (self.heads, self.head_dim);
+        let groups = h / self.kv_heads;
+        let expand = |t: &Tensor<4>| {
+            let [b, kvh, n, d] = t.dims();
+            t.clone().unsqueeze_dim::<5>(2).expand([b, kvh, groups, n, d]).reshape([b, h, n, d])
+        };
+        let q = q_rope.apply(self.q.forward(x).reshape([b, nq, h, hd]).swap_dims(1, 2));
+        let scale = 1.0 / (hd as f64).sqrt();
+        let (ek, ev, ebias) = extra;
+        let [eb, e] = ebias.dims();
+        let s_extra = q.clone().matmul(expand(ek).swap_dims(2, 3)) * scale
+            + ebias.clone().reshape([eb, 1, 1, e]);
+        let out = match seq {
+            None => softmax(s_extra, 3).matmul(expand(ev)),
+            Some((sk, sv, sbias)) => {
+                let [sb, n] = sbias.dims();
+                let s_seq = q.matmul(expand(sk).swap_dims(2, 3)) * scale
+                    + sbias.clone().reshape([sb, 1, 1, n]);
+                let p = softmax(Tensor::cat(vec![s_seq, s_extra], 3), 3);
+                p.clone().narrow(3, 0, n).matmul(expand(sv)) + p.narrow(3, n, e).matmul(expand(ev))
+            }
+        };
+        self.o.forward(out.swap_dims(1, 2).reshape([b, nq, h * hd]))
+    }
+
+    /// Keys (with RoPE at `rope_base`) and values of `memory` for this layer.
+    pub fn project(&self, memory: &Memory, rope_base: f64) -> LayerKv {
+        let device = memory.extra.device();
+        let hd = self.head_dim;
+        let split = |x: Tensor<3>, rope: Rope| self.project_rows(x, &rope);
+        let seq = memory.seq.as_ref().map(|s| {
+            let n = s.dims()[1];
+            split(s.clone(), Rope::new(memory.seq_start, n, hd, rope_base, 1.0, &device))
+        });
+        let [b, nb, e, d] = memory.extra.dims();
+        let extra = split(
+            memory.extra.clone().reshape([b, nb * e, d]),
+            Rope::at(&memory.extra_pos, hd, rope_base, &device),
+        );
+        LayerKv { seq, extra }
+    }
+
+    /// `x` `[B, nb * q, d]` (q queries per block, block-major) at absolute positions `q_pos`
+    /// attending over the layer's memory keys `kv`: `[B, nb * q, d]`.
+    pub fn forward(
+        &self,
+        x: Tensor<3>,
+        q_pos: &[usize],
+        rope_base: f64,
+        kv: &LayerKv,
+        memory: &Memory,
+    ) -> Tensor<3> {
+        if let Some(chunks) = memory.chunks() {
+            let q_per = x.dims()[1] / memory.nb;
+            let e = memory.extra_len();
+            let outs = chunks
+                .into_iter()
+                .map(|(b0, b1)| {
+                    let (m, lo, hi) = memory.blocks(b0, b1);
+                    let kv = kv.blocks(b0, b1, e, lo, hi);
+                    let rows = x.clone().narrow(1, b0 * q_per, (b1 - b0) * q_per);
+                    self.forward(rows, &q_pos[b0 * q_per..b1 * q_per], rope_base, &kv, &m)
+                })
+                .collect();
+            return Tensor::cat(outs, 1);
+        }
+        let [b, nq, _] = x.dims();
+        let (h, hd, nb) = (self.heads, self.head_dim, memory.nb);
+        let q_per = nq / nb;
+        let device = x.device();
+        let groups = h / self.kv_heads;
+        let expand = |t: &Tensor<4>| {
+            let [b, kvh, n, d] = t.dims();
+            t.clone().unsqueeze_dim::<5>(2).expand([b, kvh, groups, n, d]).reshape([b, h, n, d])
+        };
+        let q = self.q.forward(x).reshape([b, nq, h, hd]).swap_dims(1, 2);
+        let q = apply_rope(q, &Rope::at(q_pos, hd, rope_base, &device));
+        let scale = 1.0 / (hd as f64).sqrt();
+        let e = memory.extra_len();
+        let (ek, ev) = (expand(&kv.extra.0), expand(&kv.extra.1));
+        let s_extra = q
+            .clone()
+            .reshape([b, h, nb, q_per, hd])
+            .matmul(ek.reshape([b, h, nb, e, hd]).swap_dims(3, 4))
+            * scale;
+        let hidden =
+            memory.extra_hidden.clone().reshape([b, 1, nb, 1, e]).expand([b, h, nb, q_per, e]);
+        let s_extra = s_extra.mask_fill(hidden, f32::NEG_INFINITY).reshape([b, h, nq, e]);
+        let out = match &kv.seq {
+            None => {
+                let p = softmax(s_extra, 3).reshape([b, h, nb, q_per, e]);
+                p.matmul(ev.reshape([b, h, nb, e, hd])).reshape([b, h, nq, hd])
+            }
+            Some((sk, sv)) => {
+                let (sk, sv) = (expand(sk), expand(sv));
+                let n = sk.dims()[2];
+                let mask = memory.seq_mask(&memory.windows, q_per, &device);
+                let mask = mask.reshape([1, 1, nq, n]).expand([b, h, nq, n]);
+                let s_seq =
+                    (q.matmul(sk.swap_dims(2, 3)) * scale).mask_fill(mask, f32::NEG_INFINITY);
+                let p = softmax(Tensor::cat(vec![s_seq, s_extra], 3), 3);
+                let p_seq = p.clone().narrow(3, 0, n);
+                let p_extra = p.narrow(3, n, e).reshape([b, h, nb, q_per, e]);
+                p_seq.matmul(sv)
+                    + p_extra.matmul(ev.reshape([b, h, nb, e, hd])).reshape([b, h, nq, hd])
+            }
+        };
+        self.o.forward(out.swap_dims(1, 2).reshape([b, nq, h * hd]))
+    }
+}
+
+/// The token decoder's copy (pointer) head: a distribution over the memory's token entries,
+/// each standing for the token that followed it, mixed with the vocabulary distribution by a
+/// learned gate.
+#[derive(Module, Debug)]
+pub struct CopyHead {
+    q: Linear,
+    k: Linear,
+    gate: Linear,
+    dim: usize,
+}
+
+impl CopyHead {
+    pub fn new(d: usize, dim: usize, device: &Device) -> Self {
+        Self {
+            q: linear(d, dim, device),
+            k: linear(d, dim, device),
+            gate: linear(d, 1, device),
+            dim,
+        }
+    }
+
+    /// Log-probabilities of `targets` `[B, nb * q]` under [`Self::mix`]'s distribution, without
+    /// building it: the copy mass on a target is the attention on the entries whose following
+    /// token is the target (a masked sum per row), so no scatter-add with its order-dependent
+    /// atomics on GPU (reproducible training), and nothing vocabulary-sized beyond the logits.
+    /// Chunked like [`Self::mix`].
+    pub fn target_logp(
+        &self,
+        h: Tensor<3>,
+        logits: Tensor<3>,
+        memory: &Memory,
+        targets: Tensor<2, Int>,
+    ) -> Tensor<2> {
+        if let Some(chunks) = memory.chunks() {
+            let q_per = h.dims()[1] / memory.nb;
+            let outs = chunks
+                .into_iter()
+                .map(|(b0, b1)| {
+                    let (m, _, _) = memory.blocks(b0, b1);
+                    let (at, n) = (b0 * q_per, (b1 - b0) * q_per);
+                    self.target_logp(
+                        h.clone().narrow(1, at, n),
+                        logits.clone().narrow(1, at, n),
+                        &m,
+                        targets.clone().narrow(1, at, n),
+                    )
+                })
+                .collect();
+            return Tensor::cat(outs, 1);
+        }
+        let [b, nq, _] = logits.dims();
+        let nb = memory.nb;
+        let q_per = nq / nb;
+        let device = h.device();
+        let target = targets.clone().reshape([b, nq, 1]);
+        let p_vocab = log_softmax(logits, 2).gather(2, target.clone()).exp();
+        let gate = burn::tensor::activation::sigmoid(self.gate.forward(h.clone()));
+        let cq = self.q.forward(h);
+        let scale = 1.0 / (self.dim as f64).sqrt();
+        let mut scores = Vec::new();
+        let mut hits = Vec::new();
+        if let (Some(seq), Some(next)) = (&memory.seq, &memory.seq_next) {
+            let n = seq.dims()[1];
+            let ck = self.k.forward(seq.clone());
+            let mask = memory.seq_mask(&memory.copy_windows, q_per, &device);
+            let s = (cq.clone().matmul(ck.swap_dims(1, 2)) * scale)
+                .mask_fill(mask.reshape([1, nq, n]).expand([b, nq, n]), f32::NEG_INFINITY);
+            scores.push(s);
+            let ids = next.clone().reshape([b, 1, n]).expand([b, nq, n]);
+            hits.push(ids.equal(target.clone().expand([b, nq, n])).float());
+        }
+        if let Some((off, len, next)) = &memory.copy_extra {
+            let (off, len) = (*off, *len);
+            let entries = memory.extra.clone().narrow(2, off, len);
+            let ce = self.k.forward(entries.reshape([b, nb * len, memory.extra.dims()[3]]));
+            let ce = ce.reshape([b, nb, len, self.dim]);
+            let s = cq.clone().reshape([b, nb, q_per, self.dim]).matmul(ce.swap_dims(2, 3)) * scale;
+            let hidden = memory.extra_hidden.clone().narrow(2, off, len);
+            let hidden = hidden.reshape([b, nb, 1, len]).expand([b, nb, q_per, len]);
+            scores.push(s.mask_fill(hidden, f32::NEG_INFINITY).reshape([b, nq, len]));
+            let ids = next
+                .clone()
+                .reshape([b, nb, 1, len])
+                .expand([b, nb, q_per, len])
+                .reshape([b, nq, len]);
+            hits.push(ids.equal(target.clone().expand([b, nq, len])).float());
+        }
+        let p = if scores.is_empty() {
+            p_vocab
+        } else {
+            scores.push(Tensor::zeros([b, nq, 1], &device));
+            let a = softmax(Tensor::cat(scores, 2), 2);
+            let entries = a.dims()[2] - 1;
+            let null = a.clone().narrow(2, entries, 1);
+            let copy = (a.narrow(2, 0, entries) * Tensor::cat(hits, 2)).sum_dim(2);
+            let keep = gate.clone().neg() + 1.0 + gate.clone() * null;
+            p_vocab * keep + copy * gate
+        };
+        p.clamp_min(1e-30).log().reshape([b, nq])
+    }
+
+    /// Copy keys `[B, n, dim]` of memory token entries `[B, n, d]`.
+    pub fn keys(&self, entries: Tensor<3>) -> Tensor<3> {
+        self.k.forward(entries)
+    }
+
+    /// The fast decode path's [`Self::mix`] for one block: copy keys `seq` `[1, N, dim]`
+    /// (projected when the states entered the ring) with the tokens following them `[1, N]`
+    /// and an additive bias `[1, N]`, and the retrieved tokens' entries `[1, Rt, d]` likewise.
+    /// No host data (see [`MemoryAttention::forward_biased`]).
+    pub fn mix_biased(
+        &self,
+        h: Tensor<3>,
+        logits: Tensor<3>,
+        seq: Option<(&Tensor<3>, &Tensor<2, Int>, &Tensor<2>)>,
+        retrieved: Option<(Tensor<3>, &Tensor<2, Int>, &Tensor<2>)>,
+    ) -> Tensor<3> {
+        let [b, nq, v] = logits.dims();
+        let device = h.device();
+        let gate = burn::tensor::activation::sigmoid(self.gate.forward(h.clone()));
+        let cq = self.q.forward(h);
+        let scale = 1.0 / (self.dim as f64).sqrt();
+        let mut scores = Vec::new();
+        let mut ids = Vec::new();
+        if let Some((keys, next, bias)) = seq {
+            let [bb, n] = bias.dims();
+            scores.push(
+                cq.clone().matmul(keys.clone().swap_dims(1, 2)) * scale
+                    + bias.clone().reshape([bb, 1, n]),
+            );
+            ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
+        }
+        if let Some((entries, next, bias)) = retrieved {
+            let [bb, n] = bias.dims();
+            let keys = self.k.forward(entries);
+            scores.push(
+                cq.clone().matmul(keys.swap_dims(1, 2)) * scale + bias.clone().reshape([bb, 1, n]),
+            );
+            ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
+        }
+        let p_vocab = softmax(logits, 2);
+        if scores.is_empty() {
+            return p_vocab.clamp_min(1e-30).log();
+        }
+        scores.push(Tensor::zeros([b, nq, 1], &device));
+        let a = softmax(Tensor::cat(scores, 2), 2);
+        let entries = a.dims()[2] - 1;
+        let null = a.clone().narrow(2, entries, 1);
+        let copy = Tensor::<3>::zeros([b, nq, v], &device).scatter(
+            2,
+            Tensor::cat(ids, 2),
+            a.narrow(2, 0, entries),
+            burn::tensor::IndexingUpdateOp::Add,
+        );
+        let keep = gate.clone().neg() + 1.0 + gate.clone() * null;
+        (p_vocab * keep + copy * gate).clamp_min(1e-30).log()
+    }
+
+    /// Log-probabilities `[B, nb * q, V]` of decoder states `h` `[B, nb * q, d]` with vocabulary
+    /// logits `logits` `[B, nb * q, V]`: `(1 - g) p_vocab + g p_copy`, where the copy softmax
+    /// also has a null entry whose mass falls back to `p_vocab` (a block with nothing to copy).
+    pub fn mix(&self, h: Tensor<3>, logits: Tensor<3>, memory: &Memory) -> Tensor<3> {
+        if let Some(chunks) = memory.chunks() {
+            let q_per = h.dims()[1] / memory.nb;
+            let outs = chunks
+                .into_iter()
+                .map(|(b0, b1)| {
+                    let (m, _, _) = memory.blocks(b0, b1);
+                    let (at, n) = (b0 * q_per, (b1 - b0) * q_per);
+                    self.mix(h.clone().narrow(1, at, n), logits.clone().narrow(1, at, n), &m)
+                })
+                .collect();
+            return Tensor::cat(outs, 1);
+        }
+        let [b, nq, v] = logits.dims();
+        let nb = memory.nb;
+        let q_per = nq / nb;
+        let device = h.device();
+        let gate = burn::tensor::activation::sigmoid(self.gate.forward(h.clone()));
+        let cq = self.q.forward(h);
+        let scale = 1.0 / (self.dim as f64).sqrt();
+        let mut scores = Vec::new();
+        let mut ids = Vec::new();
+        if let (Some(seq), Some(next)) = (&memory.seq, &memory.seq_next) {
+            let n = seq.dims()[1];
+            let ck = self.k.forward(seq.clone());
+            let mask = memory.seq_mask(&memory.copy_windows, q_per, &device);
+            let s = (cq.clone().matmul(ck.swap_dims(1, 2)) * scale)
+                .mask_fill(mask.reshape([1, nq, n]).expand([b, nq, n]), f32::NEG_INFINITY);
+            scores.push(s);
+            ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
+        }
+        if let Some((off, len, next)) = &memory.copy_extra {
+            let (off, len) = (*off, *len);
+            let entries = memory.extra.clone().narrow(2, off, len);
+            let ce = self.k.forward(entries.reshape([b, nb * len, memory.extra.dims()[3]]));
+            let ce = ce.reshape([b, nb, len, self.dim]);
+            let s = cq.clone().reshape([b, nb, q_per, self.dim]).matmul(ce.swap_dims(2, 3)) * scale;
+            let hidden = memory.extra_hidden.clone().narrow(2, off, len);
+            let hidden = hidden.reshape([b, nb, 1, len]).expand([b, nb, q_per, len]);
+            scores.push(s.mask_fill(hidden, f32::NEG_INFINITY).reshape([b, nq, len]));
+            ids.push(
+                next.clone()
+                    .reshape([b, nb, 1, len])
+                    .expand([b, nb, q_per, len])
+                    .reshape([b, nq, len]),
+            );
+        }
+        let p_vocab = softmax(logits, 2);
+        let mixed = if scores.is_empty() {
+            p_vocab
+        } else {
+            scores.push(Tensor::zeros([b, nq, 1], &device));
+            let a = softmax(Tensor::cat(scores, 2), 2);
+            let entries = a.dims()[2] - 1;
+            let null = a.clone().narrow(2, entries, 1);
+            let copy = Tensor::<3>::zeros([b, nq, v], &device).scatter(
+                2,
+                Tensor::cat(ids, 2),
+                a.narrow(2, 0, entries),
+                burn::tensor::IndexingUpdateOp::Add,
+            );
+            let keep = gate.clone().neg() + 1.0 + gate.clone() * null;
+            p_vocab * keep + copy * gate
+        };
+        mixed.clamp_min(1e-30).log()
+    }
+}

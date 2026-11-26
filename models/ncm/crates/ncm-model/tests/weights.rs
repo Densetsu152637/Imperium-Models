@@ -53,6 +53,45 @@ fn the_ncm_round_trips() {
 }
 
 #[test]
+fn v2_models_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let device = device();
+    let v2 = ncm_model::tiny_v2(2, 2, 4);
+    let tok_cfg = ncm_model::tiny_tok_v2(v2.clone());
+    let path = dir.path().join("tok-v2.safetensors");
+    device.seed(1);
+    let model = TokenLm::new(&tok_cfg, &device);
+    let before = values(model.forward(tokens(&device, 12), None));
+    weights::save_weights(&model, &Config::Tok(tok_cfg.clone()), &path).unwrap();
+    assert_eq!(weights::read_config(&path).unwrap(), Some(Config::Tok(tok_cfg.clone())));
+    device.seed(2);
+    let loaded =
+        weights::load_weights(TokenLm::new(&tok_cfg, &device), &path, FloatDType::F32).unwrap();
+    assert_eq!(before, values(loaded.forward(tokens(&device, 12), None)));
+
+    let ncm_cfg = ncm_model::tiny_ncm_v2(8, v2);
+    let path = dir.path().join("ncm-v2.safetensors");
+    device.seed(1);
+    let model = NcmLm::new(&ncm_cfg, &device);
+    let before = values(model.forward(tokens(&device, 16)));
+    weights::save_weights(&model, &Config::Ncm(ncm_cfg.clone()), &path).unwrap();
+    device.seed(2);
+    let loaded =
+        weights::load_weights(NcmLm::new(&ncm_cfg, &device), &path, FloatDType::F32).unwrap();
+    assert_eq!(before, values(loaded.forward(tokens(&device, 16))));
+    // A fallback file does not load into a v2 model.
+    let fallback = dir.path().join("tok.safetensors");
+    weights::save_weights(
+        &TokenLm::new(&tiny_tok(8), &device),
+        &Config::Tok(tiny_tok(8)),
+        &fallback,
+    )
+    .unwrap();
+    let v2_model = TokenLm::new(&tok_cfg, &device);
+    assert!(weights::load_weights(v2_model, &fallback, FloatDType::F32).is_err());
+}
+
+#[test]
 fn the_header_carries_the_format_and_the_config() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tok.safetensors");

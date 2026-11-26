@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [features]
 # The CPU backend is always built; CUDA and wgpu are opt-in (CI has neither).
-cuda = ["burn/cuda"]
+cuda = ["burn/cuda", "ncm-model/cuda"]
 wgpu = ["burn/wgpu"]
 
 [dependencies]

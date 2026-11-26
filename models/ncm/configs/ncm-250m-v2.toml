@@ -1,0 +1,51 @@
+# Next Concept Model, v2 attention design (adopted 2026-11-25): local encoder -> k-token concepts
+# -> global backbone of gated DeltaNet and sparse retrieval layers -> local decoder.
+# See docs/attention.md; ncm-250m.toml is the fallback design.
+model = "ncm"
+attention = "v2"
+vocab_size = 32000
+k = 4
+head_dim = 64        # encoder and decoder attention heads
+# Local encoder (also the tied-embedding width): 2 sliding-window layers + 1 gated DeltaNet
+local_dim = 512
+enc_layers = 2       # sliding-window layers; v2 inserts the DeltaNet layer after the first
+enc_heads = 8
+enc_kv_heads = 4
+enc_ff_dim = 1536
+enc_window = 512     # tokens; the decoder cross-attends to the same window
+# Local decoder: unchanged from the fallback design
+dec_layers = 4
+dec_heads = 8
+dec_kv_heads = 4
+dec_ff_dim = 1536
+draft_layers = 1     # parallel draft head for self-speculative decode (shares the decoder's cross K/V)
+# Global backbone over concepts: 16 layers alternating gated DeltaNet and sparse retrieval
+bb_dim = 1024
+bb_layers = 16
+bb_ff_dim = 2240
+rope_base = 10000.0          # encoder and decoder
+rope_base_full = 1000000.0   # retrieval layers' decoupled RoPE key
+rope_scale = 1.0
+rope_scale_full = 1.0
+norm_eps = 1e-6
+
+[v2]
+dn_head_dim = 128    # 8 DeltaNet heads in the backbone, 4 in the encoder
+dn_conv = 4
+dn_chunk = 64
+ret_heads = 8
+ret_nope_dim = 128
+ret_rope_dim = 64
+ret_v_dim = 128
+ret_latent = 512     # MLA cache: 512 latent + 64 RoPE key per concept
+idx_heads = 4
+idx_dim = 128
+ret_block = 64       # concepts per block
+ret_topk = 32        # blocks per query (2,048 concepts)
+ret_local = 1024     # most recent concepts, always visible
+ret_dense = false    # true for the dense training warm-up
+idx_8bit = true      # indexer keys as 8-bit codes + one scale per position; false: run dtype
+# YaRN on the retrieval layers' decoupled RoPE key: off (1.0) for pretraining at 4k tokens; the
+# 1M long-context stage sets ret_yarn_factor = 256.0 (1M / 4k).
+ret_yarn_factor = 1.0
+ret_yarn_original = 1024  # concepts (4,096 tokens) seen in pretraining
