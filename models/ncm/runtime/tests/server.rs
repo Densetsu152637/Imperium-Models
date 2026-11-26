@@ -439,3 +439,30 @@ async fn a_panic_in_generation_fails_the_request_and_health() {
     let again = post(&server, "/v1/chat/completions", &chat_body(json!({}))).await;
     assert_eq!(again.status(), 503);
 }
+
+/// A panic inside the real engine's worker thread (the debug-build test hook): the request
+/// fails with the panic's message, a request queued behind it fails too instead of waiting
+/// forever, and the server answers 503 from then on.
+#[tokio::test]
+async fn a_panic_in_the_engine_worker_breaks_the_server() {
+    let engine = Arc::new(common::engine(common::tiny_tok_config(), 256));
+    let backend: Arc<dyn ncm_server::engine::Backend> = engine.clone();
+    let state = Arc::new(AppState::ready(backend, "m", SamplingParams::GREEDY));
+    let server = TestServer::start(state).await;
+    engine.panic_next_request_after(std::time::Duration::from_millis(300));
+    let body = chat_body(json!({"max_tokens": 4}));
+    let first = post(&server, "/v1/chat/completions", &body);
+    let queued = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        post(&server, "/v1/chat/completions", &body).await
+    };
+    let both = async { tokio::join!(first, queued) };
+    let (first, queued) = tokio::time::timeout(std::time::Duration::from_secs(30), both)
+        .await
+        .expect("no request hangs");
+    assert!(!first.status().is_success());
+    assert!(first.text().await.unwrap().contains("the test hook's panic"));
+    assert!(!queued.status().is_success(), "the queued request fails");
+    assert!(queued.text().await.unwrap().contains("the test hook's panic"));
+    assert_eq!(reqwest::get(server.url("/health")).await.unwrap().status(), 503);
+}

@@ -124,6 +124,9 @@ pub struct GenRequest {
     pub max_tokens: usize,
     pub sampling: SamplingParams,
     pub constraint: Option<Box<dyn Constraint>>,
+    /// Set to abandon the request (its client left): generation stops before the next prefill
+    /// chunk or decode step. The engine also sets it when `on_token` returns false.
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// What `/props` and `/v1/models` report about the loaded model.
@@ -164,6 +167,21 @@ pub trait Backend: Send + Sync {
     /// supervisor restarts it.
     fn broken(&self) -> Option<String> {
         None
+    }
+}
+
+/// A request whose listener left during the prefill: nothing generated.
+fn aborted(prompt_tokens: usize) -> GenStats {
+    GenStats {
+        prompt_tokens,
+        completion_tokens: 0,
+        finish: Finish::Stop,
+        prompt_s: 0.0,
+        decode_s: 0.0,
+        decode_tokens: 0,
+        cached_tokens: 0,
+        capture_s: 0.0,
+        path: DecodePath::Eager,
     }
 }
 
@@ -535,6 +553,9 @@ pub struct Engine {
     /// Set (with the panic's message) when a request panicked on the worker thread, which then
     /// stops: its model, caches and graphs may be inconsistent.
     dead: Arc<OnceLock<String>>,
+    /// Debug builds only: the next request panics on the worker after this delay (ms; 0 off).
+    #[cfg(debug_assertions)]
+    panic_after: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Events in flight between the worker and a request's caller: about two NCM concepts'
@@ -564,6 +585,10 @@ impl Engine {
         let worker_vocab = vocab.clone();
         let dead = Arc::new(OnceLock::new());
         let worker_dead = dead.clone();
+        #[cfg(debug_assertions)]
+        let panic_after = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(debug_assertions)]
+        let worker_panic_after = panic_after.clone();
         std::thread::Builder::new()
             .name("ncm-engine".into())
             .spawn(move || {
@@ -591,6 +616,14 @@ impl Engine {
                         !cancel.load(Ordering::Relaxed) && events.send(Event::Token(token)).is_ok()
                     };
                     let result = catch_unwind(AssertUnwindSafe(|| {
+                        #[cfg(debug_assertions)]
+                        {
+                            let ms = worker_panic_after.swap(0, Ordering::Relaxed);
+                            if ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                                panic!("the test hook's panic");
+                            }
+                        }
                         core.generate(request, &cancel, &mut on_token)
                     }));
                     match result {
@@ -612,7 +645,22 @@ impl Engine {
         let info = built
             .recv()
             .map_err(|_| EngineError::Device("the engine thread stopped while loading".into()))??;
-        Ok(Self { info, vocab, jobs: Mutex::new(jobs), dead })
+        Ok(Self {
+            info,
+            vocab,
+            jobs: Mutex::new(jobs),
+            dead,
+            #[cfg(debug_assertions)]
+            panic_after,
+        })
+    }
+
+    /// Test hook, debug builds only: the next request panics on the worker thread after
+    /// `delay` (as a bug in generation would), so tests can check that the engine reports
+    /// itself broken and fails the requests queued behind it.
+    #[cfg(debug_assertions)]
+    pub fn panic_next_request_after(&self, delay: std::time::Duration) {
+        self.panic_after.store(delay.as_millis().max(1) as u64, Ordering::Relaxed);
     }
 }
 
@@ -645,9 +693,15 @@ impl Backend for Engine {
             )));
         }
         let (events, received) = mpsc::sync_channel(EVENTS_IN_FLIGHT);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = request.cancel.clone();
         let job = Job { request, events, cancel: cancel.clone() };
-        let gone = || EngineError::Device("the engine thread stopped".into());
+        // A worker that stopped after a panic drops the queued jobs: say why.
+        let gone = || match self.dead.get() {
+            Some(message) => {
+                EngineError::Device(format!("the engine stopped after a panic: {message}"))
+            }
+            None => EngineError::Device("the engine thread stopped".into()),
+        };
         self.jobs.lock().unwrap_or_else(|p| p.into_inner()).send(job).map_err(|_| gone())?;
         let mut listening = true;
         loop {
@@ -729,21 +783,23 @@ impl Core {
         let (logits, cached) = match self.pick_kept(&ids, kept) {
             Some((i, true)) => {
                 restore(caches, &kept[i]);
-                (kept[i].out.clone().expect("a whole hit has its output"), ids.len())
+                (Some(kept[i].out.clone().expect("a whole hit has its output")), ids.len())
             }
             Some((i, false)) => {
                 let n = kept[i].tokens.len();
                 restore(caches, &kept[i]);
-                let rest = self.int_tensor(&ids[n..]);
-                (model.prefill(rest, caches, self.chunk).expect("a longer prompt"), n)
+                (self.prefill_tok(model, &ids[n..], caches, run.cancel), n)
             }
             None => {
                 caches.iter_mut().for_each(LayerCache::reset);
-                let logits = model
-                    .prefill(self.int_tensor(&ids), caches, self.chunk)
-                    .ok_or(EngineError::EmptyPrompt)?;
-                (logits, 0)
+                (self.prefill_tok(model, &ids, caches, run.cancel), 0)
             }
+        };
+        let Some(logits) = logits else {
+            // The listener left during the prefill: the cache holds part of the prompt, so no
+            // kept state may claim it.
+            kept.clear();
+            return Ok(aborted(prompt.len()));
         };
         let mut next = Vec::new();
         if self.prefix_reuse {
@@ -809,6 +865,46 @@ impl Core {
         })
     }
 
+    /// Prefills the token baseline with `ids` chunk by chunk, checking `cancel` between chunks:
+    /// the logits of the last position, or None when the listener left first.
+    fn prefill_tok(
+        &self,
+        model: &TokenLm,
+        ids: &[i32],
+        caches: &mut [LayerCache],
+        cancel: &AtomicBool,
+    ) -> Option<Tensor<3>> {
+        let mut last = None;
+        for piece in ids.chunks(self.chunk) {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            last = model.prefill(self.int_tensor(piece), caches, self.chunk);
+        }
+        last
+    }
+
+    /// [`Self::prefill_tok`] for the NCM (`ids` whole concepts; chunks are whole concepts too):
+    /// the next concept's condition, or None when the listener left first.
+    fn prefill_ncm(
+        &self,
+        model: &NcmLm,
+        ids: &[i32],
+        cache: &mut NcmCache,
+        cancel: &AtomicBool,
+    ) -> Option<Tensor<3>> {
+        let k = model.concept_size();
+        let chunk = (self.chunk - self.chunk % k).max(k);
+        let mut cond = None;
+        for piece in ids.chunks(chunk) {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            cond = Some(model.prefill(self.int_tensor(piece), cache, chunk));
+        }
+        cond
+    }
+
     /// Keeps the prompt's state `next` and, when the reply fed tokens back, the state at the
     /// end of the reply (`history`, without a stored output: the graphs keep it on the device).
     #[cfg(feature = "cuda")]
@@ -848,20 +944,24 @@ impl Core {
         let (head, pending) = stream.split_at(whole);
         self.sync();
         let started = Instant::now();
-        let (mut cond, cached) = match self.pick_kept(head, kept) {
+        let (cond, cached) = match self.pick_kept(head, kept) {
             Some((i, true)) => {
                 cache.restore(&kept[i].snapshot);
-                (kept[i].out.clone().expect("a whole hit has its output"), whole)
+                (Some(kept[i].out.clone().expect("a whole hit has its output")), whole)
             }
             Some((i, false)) => {
                 let n = kept[i].tokens.len();
                 cache.restore(&kept[i].snapshot);
-                (model.prefill(self.int_tensor(&head[n..]), cache, self.chunk), n)
+                (self.prefill_ncm(model, &head[n..], cache, run.cancel), n)
             }
             None => {
                 cache.reset();
-                (model.prefill(self.int_tensor(head), cache, self.chunk), 0)
+                (self.prefill_ncm(model, head, cache, run.cancel), 0)
             }
+        };
+        let Some(mut cond) = cond else {
+            kept.clear();
+            return Ok(aborted(prompt.len()));
         };
         // Prompt tokens served from the cache, padding excluded.
         let cached = cached.saturating_sub(pad);

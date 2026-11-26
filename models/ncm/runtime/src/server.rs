@@ -261,6 +261,13 @@ fn start_generation(
     request: GenRequest,
 ) -> mpsc::Receiver<Message> {
     let (tx, rx) = mpsc::channel(256);
+    // A client that leaves drops the receiver: abandon the request then, even mid-prefill,
+    // before any token would have noticed.
+    let (watch, cancel) = (tx.clone(), request.cancel.clone());
+    tokio::spawn(async move {
+        watch.closed().await;
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
     tokio::task::spawn_blocking(move || {
         let sender = tx.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -297,6 +304,7 @@ fn prepare(state: &AppState, body: &Value) -> Result<(Arc<dyn Backend>, Prepared
         max_tokens: request.max_tokens.unwrap_or(usize::MAX),
         sampling: request.sampling,
         constraint,
+        cancel: Default::default(),
     };
     Ok((backend, Prepared { request, generation, parse_tools }))
 }

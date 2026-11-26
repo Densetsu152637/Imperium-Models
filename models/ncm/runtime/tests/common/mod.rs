@@ -59,7 +59,7 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
 }
 
 pub fn request(prompt: Vec<u32>, max_tokens: usize, sampling: SamplingParams) -> GenRequest {
-    GenRequest { prompt, max_tokens, sampling, constraint: None }
+    GenRequest { prompt, max_tokens, sampling, constraint: None, cancel: Default::default() }
 }
 
 /// Replays `tokens` for every request and records the prompts it was given.

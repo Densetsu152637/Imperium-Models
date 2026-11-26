@@ -401,3 +401,26 @@ fn a_prompt_repeating_the_last_reply_reuses_the_reply_too() {
         assert_eq!(got, want, "{config:?}: reply reuse changes the reply");
     }
 }
+
+/// A request abandoned before its prefill (its cancel flag set) generates nothing and leaves no
+/// kept state claiming its prompt: the next request prefills from scratch and decodes what a
+/// full prefill does.
+#[test]
+fn an_abandoned_prefill_keeps_no_prompt_state() {
+    for config in [tiny_tok_config(), tiny_ncm_config()] {
+        let engine = engine_with_reuse(config.clone(), true);
+        let first = prompt("a prompt the next one extends");
+        let mut second = first.clone();
+        second.extend(prompt(" with more text"));
+        run(&engine, request(first.clone(), 4, SamplingParams::GREEDY));
+        let abandoned = request(second.clone(), 8, SamplingParams::GREEDY);
+        abandoned.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (tokens, stats) = run(&engine, abandoned);
+        assert!(tokens.is_empty() && stats.completion_tokens == 0, "{config:?}");
+        let (after, stats) = run(&engine, request(second.clone(), 8, SamplingParams::GREEDY));
+        assert_eq!(stats.cached_tokens, 0, "{config:?}: the aborted prefill was forgotten");
+        run(&engine, request(prompt("unrelated"), 2, SamplingParams::GREEDY));
+        let (want, _) = run(&engine, request(second, 8, SamplingParams::GREEDY));
+        assert_eq!(after, want, "{config:?}");
+    }
+}
