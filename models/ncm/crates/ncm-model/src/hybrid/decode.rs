@@ -48,6 +48,8 @@ pub struct DecodeOptions {
     pub temperature: f64,
     /// Nucleus mass for codes and tokens (1: off).
     pub top_p: f64,
+    /// Most candidates for codes and tokens before the nucleus cut (0: off).
+    pub top_k: usize,
     pub seed: u64,
     /// Verified mode for the whole reply.
     pub verified: bool,
@@ -71,6 +73,7 @@ impl Default for DecodeOptions {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
             seed: 0,
             verified: false,
             ar_only: false,
@@ -444,7 +447,7 @@ impl HybridSession {
             let t = Self::level_temperature(opts.temperature, k, depth);
             let mut codes: Vec<i32> = host
                 .chunks(n)
-                .map(|row| sample(row, t, opts.top_p, &mut || self.uniform()) as i32)
+                .map(|row| sample(row, t, opts.top_p, opts.top_k, &mut || self.uniform()) as i32)
                 .collect();
             if let Some(f) = hooks.codes.as_mut() {
                 f(k, &mut codes);
@@ -609,7 +612,10 @@ impl HybridSession {
             }
             let token = match hooks.pick.as_mut() {
                 Some(pick) => pick(row),
-                None => sample(row, opts.temperature, opts.top_p, &mut || self.uniform()) as i32,
+                None => {
+                    sample(row, opts.temperature, opts.top_p, opts.top_k, &mut || self.uniform())
+                        as i32
+                }
             };
             stats.ar_tokens += 1;
             fixed.push(token);
@@ -681,7 +687,7 @@ impl HybridSession {
         if opts.temperature <= 0.0 {
             return argmax(row) == d as usize;
         }
-        let p = distribution(row, opts.temperature, opts.top_p);
+        let p = distribution(row, opts.temperature, opts.top_p, opts.top_k);
         self.uniform() < p[d as usize]
     }
 
@@ -692,7 +698,7 @@ impl HybridSession {
         if opts.temperature <= 0.0 {
             return argmax(row);
         }
-        let mut p = distribution(row, opts.temperature, opts.top_p);
+        let mut p = distribution(row, opts.temperature, opts.top_p, opts.top_k);
         p[d as usize] = 0.0;
         let total: f64 = p.iter().sum();
         if total <= 0.0 {
@@ -749,9 +755,16 @@ fn argmax(row: &[f32]) -> usize {
 
 /// Probabilities of `scores` (logits or log-probabilities) at temperature `t` (> 0), cut to
 /// the smallest set holding `top_p` of the mass and renormalised.
-fn distribution(scores: &[f32], t: f64, top_p: f64) -> Vec<f64> {
+fn distribution(scores: &[f32], t: f64, top_p: f64, top_k: usize) -> Vec<f64> {
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let mut p: Vec<f64> = scores.iter().map(|&s| ((s as f64 - max) / t).exp()).collect();
+    // Top-k: only the k largest (ties at the cut kept together, as the device sampler does).
+    if top_k > 0 && top_k < p.len() {
+        let mut sorted = p.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let floor = sorted[top_k - 1];
+        p.iter_mut().filter(|x| **x < floor).for_each(|x| *x = 0.0);
+    }
     let total: f64 = p.iter().sum();
     p.iter_mut().for_each(|x| *x /= total);
     if top_p < 1.0 {
@@ -789,11 +802,17 @@ fn draw(p: &[f64], total: f64, u: f64) -> usize {
 }
 
 /// A token or code from `scores`: argmax at temperature 0, else a draw.
-fn sample(scores: &[f32], t: f64, top_p: f64, uniform: &mut dyn FnMut() -> f64) -> usize {
+fn sample(
+    scores: &[f32],
+    t: f64,
+    top_p: f64,
+    top_k: usize,
+    uniform: &mut dyn FnMut() -> f64,
+) -> usize {
     if t <= 0.0 {
         return argmax(scores);
     }
-    let p = distribution(scores, t, top_p);
+    let p = distribution(scores, t, top_p, top_k);
     draw(&p, 1.0, uniform())
 }
 
@@ -807,7 +826,8 @@ pub(crate) fn sample_row(
     row: &[f32],
     t: f64,
     top_p: f64,
+    top_k: usize,
     uniform: &mut dyn FnMut() -> f64,
 ) -> usize {
-    sample(row, t, top_p, uniform)
+    sample(row, t, top_p, top_k, uniform)
 }

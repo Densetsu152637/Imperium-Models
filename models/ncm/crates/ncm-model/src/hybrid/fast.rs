@@ -21,9 +21,14 @@
 //!   buffers and replayed; a re-decode replays the block pass with the new known prefix. Every
 //!   other device, or a failed capture, runs the same passes eagerly.
 //!
-//! Scope: temperature 0 (verified or parallel mode) and parallel mode at any temperature on
-//! CUDA (codes then sampled on the device, tokens argmax); verified sampling at T > 0 and the
-//! test hooks that rewrite drafts or codes stay on the reference loop.
+//! Scope: temperature 0 (verified or parallel mode) everywhere; on CUDA also T > 0: parallel
+//! mode samples the codes on the device (tokens argmax), verified mode samples each position's
+//! token from the autoregressive path on the device and accepts the draft token where the draw
+//! equals it. For a one-token (point-mass) draft that is exactly speculative sampling: the draft
+//! token is accepted with probability `min(1, p_ar(d) / 1) = p_ar(d)`, and a rejected position's
+//! draw is distributed as the residual `p_ar` without `d`, renormalised; the output has the
+//! autoregressive path's distribution. Draws are seeded per request (counter-based). The test
+//! hooks that rewrite drafts or codes stay on the reference loop.
 
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 
@@ -116,6 +121,8 @@ struct Inputs {
     dec_q: Rope,
     /// The autoregressive pass's input tokens `[1, L]`.
     ar_tokens: Tensor<2, Int>,
+    /// A draft to check again without generating (after a mixed-block switch) `[1, L]`.
+    draft: Tensor<2, Int>,
 }
 
 /// Tables fixed for the session.
@@ -140,10 +147,34 @@ struct Consts {
 pub enum PassMode {
     /// Against the autoregressive path (no ẑ), greedy.
     Verified,
+    /// Against the autoregressive path, its tokens drawn on the device (speculative sampling,
+    /// CUDA).
+    VerifiedSampled,
+    /// The staged draft checked again against the autoregressive path, no generator (after a
+    /// mixed-block switch), greedy or sampled.
+    Recheck,
+    RecheckSampled,
     /// With ẑ, greedy codes.
     Parallel,
     /// With ẑ, codes sampled on the device (CUDA).
     ParallelSampled,
+}
+
+impl PassMode {
+    fn verified(self) -> bool {
+        matches!(
+            self,
+            Self::Verified | Self::VerifiedSampled | Self::Recheck | Self::RecheckSampled
+        )
+    }
+
+    fn sampled_tokens(self) -> bool {
+        matches!(self, Self::VerifiedSampled | Self::RecheckSampled)
+    }
+
+    fn generates(self) -> bool {
+        !matches!(self, Self::Recheck | Self::RecheckSampled)
+    }
 }
 
 /// What a block pass reports.
@@ -163,9 +194,13 @@ pub struct FastSession {
     rings: Rings,
     inputs: Inputs,
     consts: Consts,
-    /// The device code samplers, one per level (CUDA).
+    /// The device code samplers, one per level, and the token sampler (CUDA).
     #[cfg(feature = "cuda")]
     samplers: Vec<crate::sample::SampleParams>,
+    #[cfg(feature = "cuda")]
+    token_sampler: crate::sample::SampleParams,
+    /// Device draws of the request so far (the samplers' counters).
+    draws: u32,
     #[cfg(feature = "cuda")]
     graphs: Graphs,
     device: Device,
@@ -176,7 +211,8 @@ pub struct FastSession {
 #[derive(Default)]
 struct Graphs {
     block: Vec<(PassMode, Result<BlockGraph, String>)>,
-    ar: Option<Result<ArGraph, String>>,
+    /// Greedy and sampled.
+    ar: Vec<(bool, Result<ArGraph, String>)>,
 }
 
 /// A captured block pass and its output buffer.
@@ -225,6 +261,7 @@ impl FastSession {
             gen_q: Rope::at(&vec![0; l], hd, model.rope_base, device),
             dec_q: Rope::at(&(0..l).collect::<Vec<_>>(), hd, model.rope_base, device),
             ar_tokens: Tensor::zeros([1, l], device),
+            draft: Tensor::zeros([1, l], device),
         };
         let (dec_rope, causal) = model.decoder_self(device);
         let pos: Vec<i32> = (0..l as i32).collect();
@@ -251,6 +288,9 @@ impl FastSession {
             consts,
             #[cfg(feature = "cuda")]
             samplers: (0..h.depth()).map(|_| crate::sample::SampleParams::new(device)).collect(),
+            #[cfg(feature = "cuda")]
+            token_sampler: crate::sample::SampleParams::new(device),
+            draws: 0,
             #[cfg(feature = "cuda")]
             graphs: Graphs::default(),
             device: device.clone(),
@@ -420,10 +460,11 @@ impl FastSession {
             .iter()
             .map(|x| x.project_rows(dec_extra.clone(), &dec_rope_rows))
             .collect();
-        // The generator, level by level.
+        // The generator, level by level (none when the staged draft is checked again).
         let tok = model.tokenizer();
         let mut zhat: Option<Tensor<3>> = None;
-        for (k, &n) in h.levels.iter().enumerate() {
+        let levels: &[usize] = if mode.generates() { &h.levels } else { &[] };
+        for (k, &n) in levels.iter().enumerate() {
             let q_rope = i.gen_q.rows(0, n);
             let memory = FastMemory {
                 seq: Some(&r.generator),
@@ -438,21 +479,25 @@ impl FastSession {
             let codes = self.pick_codes(k, logits, mode);
             zhat = Some(tok.add_contribution(k, codes, &c.resampler, zhat));
         }
-        let zhat = zhat.expect("at least one level");
         // The draft, the known prefix forced.
-        let draft = crate::fused::argmax_last(tok.decode_with(
-            zhat.clone(),
-            model.embedding(),
-            &c.tok_rope,
-        ))
-        .reshape([1, l]);
+        let draft = match &zhat {
+            Some(z) => crate::fused::argmax_last(tok.decode_with(
+                z.clone(),
+                model.embedding(),
+                &c.tok_rope,
+            ))
+            .reshape([1, l]),
+            None => i.draft.clone(),
+        };
         let p = i.p.clone().expand([1, l]);
         let draft = draft.mask_where(c.pos.clone().lower(p.clone()), i.known_tokens.clone());
         // The check pass and the acceptance.
-        let verified = mode == PassMode::Verified;
-        let x = model.decoder_input_fast(draft.clone(), (!verified).then_some(zhat));
+        let verified = mode.verified();
+        let x = model.decoder_input_fast(draft.clone(), if verified { None } else { zhat });
         let logp = self.decoder_pass(model, x, &dec_kv, &dec_bias, retrieved);
-        let ids = crate::fused::argmax_last(logp.clone()).reshape([1, l]);
+        // Each position's token: the argmax, or a draw from the autoregressive path (where a
+        // draw equal to the draft token accepts it: speculative sampling for a one-token draft).
+        let ids = self.pick_tokens(logp.clone(), mode.sampled_tokens());
         let mut reject = ids.clone().not_equal(draft.clone());
         if !verified {
             let low = logp.max_dim(2).reshape([1, l]).lower(c.ln_tau.clone().expand([1, l]));
@@ -488,9 +533,9 @@ impl FastSession {
     }
 
     /// The autoregressive pass over `ar_tokens`: argmax ids `[1, L]` and log-probabilities.
-    fn ar_pass(&self, model: &HybridLm) -> (Tensor<2, Int>, Tensor<3>) {
+    fn ar_pass(&self, model: &HybridLm, sampled: bool) -> (Tensor<2, Int>, Tensor<3>) {
         let h = model.config();
-        let (l, rt) = (h.block, h.retrieved_blocks * h.block);
+        let rt = h.retrieved_blocks * h.block;
         let i = &self.inputs;
         let slots = model.slot_vectors(i.cond.clone());
         let retrieved = (rt > 0).then(|| model.retrieved_vectors(i.retrieved.clone()));
@@ -508,8 +553,21 @@ impl FastSession {
             model.decoder_cross().iter().map(|x| x.project_rows(extra.clone(), &rope)).collect();
         let x = model.decoder_input_fast(i.ar_tokens.clone(), None);
         let logp = self.decoder_pass(model, x, &kv, &bias, retrieved);
-        let ids = crate::fused::argmax_last(logp.clone()).reshape([1, l]);
+        let ids = self.pick_tokens(logp.clone(), sampled);
         (ids, logp)
+    }
+
+    /// Every position's token `[1, L]` from log-probabilities `[1, L, V]`: the argmax, or a
+    /// draw by the device token sampler (CUDA).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn pick_tokens(&self, logp: Tensor<3>, sampled: bool) -> Tensor<2, Int> {
+        let [_, l, v] = logp.dims();
+        #[cfg(feature = "cuda")]
+        if sampled {
+            return crate::sample::sample(logp.reshape([l, v]), &self.token_sampler, 0)
+                .reshape([1, l]);
+        }
+        crate::fused::argmax_last(logp).reshape([1, l])
     }
 
     /// Level `k`'s codes `[1, ℓ]` from its logits: the argmax, or a device draw.
@@ -560,23 +618,44 @@ impl FastSession {
         self.block_pass(model, mode)
     }
 
-    fn ar_output(&mut self, model: &HybridLm) -> (Tensor<2, Int>, Tensor<3>) {
+    fn ar_output(&mut self, model: &HybridLm, sampled: bool) -> (Tensor<2, Int>, Tensor<3>) {
         #[cfg(feature = "cuda")]
         if crate::fused::graphs_active(&self.device) {
-            if self.graphs.ar.is_none() {
+            if !self.graphs.ar.iter().any(|(s, _)| *s == sampled) {
                 let captured = {
                     let this = &*self;
-                    crate::graph::record(&self.device, &mut (), 2, |_| this.ar_pass(model), |_| {})
+                    crate::graph::record(
+                        &self.device,
+                        &mut (),
+                        2,
+                        |_| this.ar_pass(model, sampled),
+                        |_| {},
+                    )
                 };
-                self.graphs.ar = Some(captured);
+                self.graphs.ar.push((sampled, captured));
             }
-            if let Some(Ok((graph, out))) = &self.graphs.ar {
+            if let Some((_, Ok((graph, out)))) = self.graphs.ar.iter().find(|(s, _)| *s == sampled)
+            {
                 // Safety: as for the block graph.
                 unsafe { crate::graph::replay(&self.device, graph, "hybrid ar") };
                 return out.clone();
             }
         }
-        self.ar_pass(model)
+        self.ar_pass(model, sampled)
+    }
+
+    /// Sets the token sampler for the next pass's `L` draws (CUDA).
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn next_token_draws(&mut self, opts: &DecodeOptions, l: usize) {
+        #[cfg(feature = "cuda")]
+        self.token_sampler.set(crate::sample::SampleSettings {
+            temperature: opts.temperature as f32,
+            top_k: opts.top_k,
+            top_p: opts.top_p as f32,
+            seed: opts.seed,
+            counter: self.draws,
+        });
+        self.draws = self.draws.wrapping_add(l as u32);
     }
 
     /// Why a pass runs eagerly, if a capture failed.
@@ -584,7 +663,7 @@ impl FastSession {
         #[cfg(feature = "cuda")]
         {
             let block = self.graphs.block.iter().find_map(|(_, g)| g.as_ref().err().cloned());
-            let ar = self.graphs.ar.as_ref().and_then(|g| g.as_ref().err().cloned());
+            let ar = self.graphs.ar.iter().find_map(|(_, g)| g.as_ref().err().cloned());
             block.or(ar)
         }
         #[cfg(not(feature = "cuda"))]
@@ -598,7 +677,7 @@ impl FastSession {
     pub fn serves(&self, opts: &DecodeOptions) -> bool {
         let sampled = opts.temperature > 0.0;
         let device_sampling = cfg!(feature = "cuda") && crate::fused::active(&self.device);
-        !sampled || (!opts.verified && !opts.ar_only && device_sampling)
+        !sampled || device_sampling
     }
 
     /// Decodes the open block, at most `limit` tokens, as [`HybridSession::decode_block`] does
@@ -628,12 +707,18 @@ impl FastSession {
         self.stage(model, &fixed);
         let mut passes = 0;
         let mut redecode = false;
+        // After a mixed-block switch: check the same draft again in verified mode.
+        let mut recheck = false;
         let budget = |fixed: &Vec<i32>| (known + limit).saturating_sub(fixed.len());
         #[cfg(feature = "cuda")]
         let sampled = opts.temperature > 0.0;
+        let sampled_tokens = opts.temperature > 0.0;
         while !opts.ar_only && fixed.len() < l && !stopped {
-            if redecode {
+            if redecode || recheck {
                 self.stage_known(model, &fixed);
+            }
+            if sampled_tokens {
+                self.next_token_draws(opts, l);
             }
             #[cfg(feature = "cuda")]
             if sampled {
@@ -643,20 +728,24 @@ impl FastSession {
                         (self.session.rng as u32).wrapping_add((passes * 1000 + k * 100) as u32);
                     s.set(crate::sample::SampleSettings {
                         temperature: t as f32,
-                        top_k: 0,
+                        top_k: opts.top_k,
                         top_p: opts.top_p as f32,
                         seed: opts.seed,
                         counter,
                     });
                 }
             }
-            let mode = match (verified, opts.temperature > 0.0) {
-                (true, _) => PassMode::Verified,
-                (false, false) => PassMode::Parallel,
-                (false, true) => PassMode::ParallelSampled,
+            let mode = match (recheck, verified, sampled_tokens) {
+                (true, _, false) => PassMode::Recheck,
+                (true, _, true) => PassMode::RecheckSampled,
+                (false, true, false) => PassMode::Verified,
+                (false, true, true) => PassMode::VerifiedSampled,
+                (false, false, false) => PassMode::Parallel,
+                (false, false, true) => PassMode::ParallelSampled,
             };
+            recheck = false;
             let result = self.run_block(model, mode);
-            stats.generator_runs += 1;
+            stats.generator_runs += usize::from(mode.generates());
             stats.check_passes += 1;
             let p = fixed.len();
             let mut cut = match hooks.accept.as_mut() {
@@ -709,8 +798,10 @@ impl FastSession {
                 stats.switched = Some(p + s);
                 verified = true;
                 self.session.verified_span = true;
-                // One more pass over the block in verified mode (a fresh draft: TODO reuse).
-                redecode = true;
+                // One more check of the same draft, in verified mode.
+                let device = self.device.clone();
+                put_int(&mut self.inputs.draft, ints(result.draft.clone(), [1, l], &device), 1, 0);
+                recheck = true;
                 continue;
             }
             if cut.is_none() {
@@ -730,9 +821,15 @@ impl FastSession {
             inputs.resize(l, 0);
             let device = self.device.clone();
             put_int(&mut self.inputs.ar_tokens, ints(inputs, [1, l], &device), 1, 0);
-            let (ids, logp) = self.ar_output(model);
-            let token = if opts.temperature > 0.0 || hooks.ar_rows.is_some() || hooks.pick.is_some()
-            {
+            // On CUDA a sampled fill draws on the device; elsewhere the host draws.
+            let device_draw = sampled_tokens && cfg!(feature = "cuda");
+            if device_draw {
+                self.next_token_draws(opts, l);
+            }
+            let (ids, logp) = self.ar_output(model, device_draw);
+            let host_row =
+                (sampled_tokens && !device_draw) || hooks.ar_rows.is_some() || hooks.pick.is_some();
+            let token = if host_row {
                 let row: Vec<f32> = logp
                     .narrow(1, i, 1)
                     .into_data()
@@ -746,8 +843,13 @@ impl FastSession {
                     pick(&row)
                 } else if opts.temperature > 0.0 {
                     let mut uniform = || self.session.uniform();
-                    super::decode::sample_row(&row, opts.temperature, opts.top_p, &mut uniform)
-                        as i32
+                    super::decode::sample_row(
+                        &row,
+                        opts.temperature,
+                        opts.top_p,
+                        opts.top_k,
+                        &mut uniform,
+                    ) as i32
                 } else {
                     super::decode::argmax_row(&row) as i32
                 }
@@ -786,6 +888,7 @@ impl FastSession {
         hooks: &mut Hooks,
     ) -> (Vec<i32>, Vec<BlockStats>) {
         self.session.rng = opts.seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1;
+        self.draws = 0;
         let mut out = Vec::new();
         let mut stats = Vec::new();
         while out.len() < max_tokens {

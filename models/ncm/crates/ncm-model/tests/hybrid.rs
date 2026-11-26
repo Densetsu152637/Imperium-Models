@@ -724,3 +724,58 @@ fn constraint_scan_rejects_what_it_should() {
     assert!(reference.iter().all(|&t| allowed(t)), "{reference:?}");
     assert_eq!(decode(true).0, reference);
 }
+
+/// Verified mode at T > 0 has the autoregressive path's distribution: over many seeds the
+/// first reply token's frequencies from verified decoding (drafts checked by speculative
+/// sampling) match those of the autoregressive path alone, with top-k and top-p applied.
+fn verified_sampling_matches_the_path(device: Device, fast: bool) {
+    device.seed(46);
+    let (cfg, h) = tiny_cfg();
+    let model = HybridLm::new(&cfg, &device);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 4 * l, 47));
+    let prompt = &stream[..l + 3];
+    let runs = 400;
+    let count = |verified: bool| {
+        let mut counts = vec![0f64; cfg.vocab_size];
+        for seed in 0..runs {
+            let opts = DecodeOptions {
+                temperature: 0.9,
+                top_p: 0.95,
+                top_k: 20,
+                seed,
+                verified,
+                ar_only: !verified,
+                ..DecodeOptions::default()
+            };
+            let first = if fast {
+                let mut s = FastSession::new(&model, 4 * l, &device);
+                s.prefill(&model, prompt);
+                s.generate_reply(&model, 1, &opts, &mut Hooks::default()).0[0]
+            } else {
+                let mut s = HybridSession::new(&model, 4 * l, &device);
+                s.prefill(&model, prompt);
+                s.generate_reply(&model, 1, &opts, &mut Hooks::default()).0[0]
+            };
+            counts[first as usize] += 1.0 / runs as f64;
+        }
+        counts
+    };
+    let (path, verified) = (count(false), count(true));
+    for (t, (a, b)) in path.iter().zip(&verified).enumerate() {
+        let sd = (a.max(1.0 / runs as f64) * 2.0 / runs as f64).sqrt();
+        assert!((a - b).abs() <= 5.0 * sd, "token {t}: path {a:.3}, verified {b:.3}");
+    }
+}
+
+#[test]
+fn verified_sampling_has_the_paths_distribution() {
+    verified_sampling_matches_the_path(device(), false);
+}
+
+/// The same on CUDA, where the fast path draws on the device.
+#[cfg(feature = "cuda")]
+#[test]
+fn fast_verified_sampling_has_the_paths_distribution_on_cuda() {
+    verified_sampling_matches_the_path(Device::cuda(0), true);
+}

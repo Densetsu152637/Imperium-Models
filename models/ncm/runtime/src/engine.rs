@@ -951,8 +951,7 @@ impl Core {
     /// block on the fast path ([`FastSession::decode_block`]), each block's tokens streamed as
     /// it closes. Verified mode for constrained requests, whose grammar scans every check
     /// pass's tokens and picks every autoregressive token; `<tool_call>` switches a block to
-    /// verified mode until the block in which `</tool_call>` appears ends. Top-k is not applied
-    /// (TODO).
+    /// verified mode until the block in which `</tool_call>` appears ends.
     fn generate_hybrid(
         &self,
         hybrid: &mut HybridState,
@@ -976,6 +975,7 @@ impl Core {
         let opts = ncm_model::hybrid::DecodeOptions {
             temperature: if params.is_greedy() { 0.0 } else { f64::from(params.temperature) },
             top_p: f64::from(params.top_p),
+            top_k: params.top_k,
             seed: params.seed.unwrap_or_else(crate::sampling::entropy),
             verified: run.constraint.is_some(),
             stop: [ids.im_end, ids.end_of_text, ids.im_start].iter().map(|&t| t as i32).collect(),
