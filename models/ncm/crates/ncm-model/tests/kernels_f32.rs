@@ -162,3 +162,9 @@ fn fused_mlp_matches_unfused_f32() {
     let (device, _lock) = setup(DTYPE);
     fused_mlp_matches(&device, TOL);
 }
+
+#[test]
+fn fused_projections_match_unfused_f32() {
+    let (device, _lock) = setup(DTYPE);
+    fused_projections_match(&device, TOL);
+}

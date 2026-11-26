@@ -61,6 +61,8 @@ pub fn gemv_matches(device: &Device, tol: f32) {
         (3, 37, 70),
         (2, 5000, 64),
         (1, 2048, 77),
+        (8, 512, 1536),
+        (6, 1024, 1000),
     ] {
         let x = Tensor::<3>::random([1, rows, k], normal, device);
         let w = Tensor::<2>::random([k, n], normal, device);
@@ -120,6 +122,48 @@ pub fn fused_mlp_matches(device: &Device, tol: f32) {
                 let what = format!("fused mlp {rows}x{d}x{ff} {spec:?} delta {with_delta}");
                 assert_close(&what, &values(got), &values(unfused), &want, tol);
             }
+        }
+    }
+}
+
+/// The fused projections of the attention half against the same ops unfused, on CUDA and on
+/// the CPU in f32: [`ncm_model::mlp_fused::norm_linear`] (the pre-norm in the GEMV's prologue,
+/// with and without the gate's sigmoid in its epilogue) and
+/// [`ncm_model::mlp_fused::gated_linear`] (the output gate's product in the prologue), for one,
+/// three and eight rows (a block decoder's levels), dense and quantised weights.
+pub fn fused_projections_match(device: &Device, tol: f32) {
+    use burn::tensor::activation::sigmoid;
+    use ncm_model::layers::rms_norm;
+    use ncm_model::mlp_fused::{gated_linear, norm_linear};
+    use ncm_model::quant::QLinear;
+    let normal = Distribution::Normal(0.0, 1.0);
+    // Eight rows of 960 still fit the quantised kernel's staged row (8 * (960 + 31) slots).
+    for (rows, d, n) in [(1, 1024, 4112), (3, 512, 1536), (8, 960, 1024), (8, 128, 72)] {
+        for spec in [None, Some(quant_specs()[0]), Some(quant_specs()[1])] {
+            device.seed(7);
+            let layer = quant::build(spec, || QLinear::new(d, n, device));
+            let norm = rms_norm(d, 1e-6, device);
+            let x = Tensor::<2>::random([rows, d], normal, device);
+            let cpu_layer = cpu_copy(&layer);
+            let cpu_norm = cpu_copy(&norm);
+            for gate in [false, true] {
+                let got = norm_linear(x.clone(), norm.gamma.val(), 1e-6, &layer, gate)
+                    .expect("the fused projection takes these shapes");
+                let mut unfused = layer.forward(norm.forward(x.clone()));
+                let mut want = cpu_layer.forward(cpu_norm.forward(to_cpu(&x)));
+                if gate {
+                    unfused = sigmoid(unfused);
+                    want = sigmoid(want);
+                }
+                let what = format!("norm_linear {rows}x{d}x{n} {spec:?} sigmoid {gate}");
+                assert_close(&what, &values(got), &values(unfused), &values(want), tol);
+            }
+            let g = sigmoid(Tensor::<2>::random([rows, d], normal, device));
+            let got = gated_linear(x.clone(), g.clone(), &layer).expect("these shapes");
+            let unfused = layer.forward(x.clone() * g.clone());
+            let want = cpu_layer.forward(to_cpu(&x) * to_cpu(&g));
+            let what = format!("gated_linear {rows}x{d}x{n} {spec:?}");
+            assert_close(&what, &values(got), &values(unfused), &values(want), tol);
         }
     }
 }

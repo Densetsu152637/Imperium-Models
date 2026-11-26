@@ -9,6 +9,11 @@
 //!    epilogue, writing the activation `[rows, ff]` and the residual sum.
 //! 2. [`mlp_out`]: the down GEMV with the residual add in its epilogue.
 //!
+//! The same kernels serve the attention half: [`norm_linear`] folds the pre-attention norm
+//! into a mixer's input projection (and the gate's sigmoid into its epilogue), and
+//! [`gated_linear`] folds the output gate's product into the output projection's prologue.
+//! Up to eight rows (tokens) per launch.
+//!
 //! Dense weights take a vectorised split-K GEMV whose splits are combined deterministically by
 //! the last cube of each column tile to finish (a device fence, then an atomic arrival count in
 //! a per-thread counter buffer that the last cube resets), so no separate sum launch remains.
@@ -49,7 +54,7 @@ mod kernel {
     /// Largest `K` slice a dense cube stages.
     pub(super) const MAX_K: usize = 512;
     /// Most rows (tokens).
-    pub(super) const MAX_ROWS: usize = 4;
+    pub(super) const MAX_ROWS: usize = 8;
     /// Output features per quantised cube (one plane each).
     pub(super) const PLANES: usize = 8;
     /// Lanes per plane.
@@ -130,9 +135,13 @@ mod kernel {
         u: f32,
         rv: f32,
         #[comptime] glu: bool,
+        #[comptime] sigmoid: bool,
         #[comptime] residual: bool,
     ) -> F {
         let mut out = f32::cast_from(F::cast_from(g));
+        if comptime!(sigmoid) {
+            out = f32::cast_from(F::cast_from(1.0f32 / (1.0f32 + f32::exp(-out))));
+        }
         if comptime!(glu) {
             let gate = out;
             let silu = f32::cast_from(F::cast_from(gate / (1.0f32 + f32::exp(-gate))));
@@ -180,6 +189,7 @@ mod kernel {
         delta: &Tensor<F>,
         gamma: &Tensor<F>,
         resid: &Tensor<F>,
+        mulby: &Tensor<F>,
         w: &Tensor<Vector<F, L>>,
         out: &mut Tensor<F>,
         part: &mut Tensor<f32>,
@@ -194,6 +204,8 @@ mod kernel {
         #[comptime] add: bool,
         #[comptime] glu: bool,
         #[comptime] residual: bool,
+        #[comptime] mul: bool,
+        #[comptime] sigmoid: bool,
         #[define(F)] _dtype: ElemType,
     ) {
         let v = w.vector_size().comptime();
@@ -207,7 +219,7 @@ mod kernel {
         let k1 = select(k0 + k_split < k, k0 + k_split, k);
         let mut part_red = Shared::<[f32]>::new_slice(CUBE / 32);
         // Prologue: each row's RMS over the whole row, then the cube's K slice staged normed.
-        let mut rms = Array::<f32>::new(MAX_ROWS);
+        let mut rms = Array::<f32>::new(rows);
         #[unroll]
         for r in 0..rows {
             rms[r] = 1.0f32;
@@ -235,6 +247,10 @@ mod kernel {
                 if comptime!(norm) {
                     val = normed::<F>(sv, rms[r], gamma[kk * gamma.stride(0)]);
                 }
+                if comptime!(mul) {
+                    let m = f32::cast_from(mulby[r * mulby.stride(0) + kk * mulby.stride(1)]);
+                    val = f32::cast_from(F::cast_from(val * m));
+                }
                 xs[r * MAX_K + i % k_split] = val;
             }
             i += CUBE;
@@ -243,8 +259,8 @@ mod kernel {
         // The GEMV: gate (or plain) accumulators `a`, up accumulators `b` with `glu`.
         let w0 = w.stride(0);
         let zero = Vector::<f32, L>::new(0.0f32);
-        let mut a = Array::<Vector<f32, L>>::new(MAX_ROWS);
-        let mut b = Array::<Vector<f32, L>>::new(MAX_ROWS);
+        let mut a = Array::<Vector<f32, L>>::new(rows);
+        let mut b = Array::<Vector<f32, L>>::new(rows);
         #[unroll]
         for r in 0..rows {
             a[r] = zero;
@@ -285,7 +301,7 @@ mod kernel {
                     if comptime!(residual) {
                         rv = f32::cast_from(resid[r * resid.stride(0) + col * resid.stride(1)]);
                     }
-                    out[r * n + col] = epilogue::<F>(g, u, rv, glu, residual);
+                    out[r * n + col] = epilogue::<F>(g, u, rv, glu, sigmoid, residual);
                 }
             }
             terminate!();
@@ -329,7 +345,7 @@ mod kernel {
                 if comptime!(residual) {
                     rv = f32::cast_from(resid[r * resid.stride(0) + col * resid.stride(1)]);
                 }
-                out[r * n + col] = epilogue::<F>(g, u, rv, glu, residual);
+                out[r * n + col] = epilogue::<F>(g, u, rv, glu, sigmoid, residual);
             }
         }
         if tid == 0 {
@@ -395,6 +411,7 @@ mod kernel {
         delta: &Tensor<F>,
         gamma: &Tensor<F>,
         resid: &Tensor<F>,
+        mulby: &Tensor<F>,
         packed: &Tensor<Vector<i32, Q>>,
         scales: &Tensor<f32>,
         out: &mut Tensor<F>,
@@ -409,6 +426,8 @@ mod kernel {
         #[comptime] add: bool,
         #[comptime] glu: bool,
         #[comptime] residual: bool,
+        #[comptime] mul: bool,
+        #[comptime] sigmoid: bool,
         #[define(F)] _dtype: ElemType,
     ) {
         let tid = UNIT_POS as usize;
@@ -428,6 +447,10 @@ mod kernel {
                 let mut val = f32::cast_from(sv);
                 if comptime!(norm) {
                     val = normed::<F>(sv, rms, gamma[kk * gamma.stride(0)]);
+                }
+                if comptime!(mul) {
+                    let m = f32::cast_from(mulby[r * mulby.stride(0) + kk * mulby.stride(1)]);
+                    val = f32::cast_from(F::cast_from(val * m));
                 }
                 xs[r * stride + kk + kk / 32] = val;
                 if comptime!(add) {
@@ -466,7 +489,7 @@ mod kernel {
                 if comptime!(residual) {
                     rv = f32::cast_from(resid[r * resid.stride(0) + feature * resid.stride(1)]);
                 }
-                out[r * n + feature] = epilogue::<F>(g, u, rv, glu, residual);
+                out[r * n + feature] = epilogue::<F>(g, u, rv, glu, sigmoid, residual);
             }
         }
     }
@@ -492,6 +515,10 @@ pub struct Fusion {
     pub glu: bool,
     /// Add `resid` to the output.
     pub residual: bool,
+    /// Multiply the input by `mulby` elementwise first (an output gate).
+    pub mul: bool,
+    /// Apply the logistic sigmoid to the output (a gate projection).
+    pub sigmoid: bool,
     pub eps: f64,
     /// q8/q4 weights: bits and words per scale group (0 for dense).
     pub bits: u32,
@@ -509,6 +536,7 @@ pub trait NcmFusedMlp: Backend {
         delta: FloatTensor<Self>,
         gamma: FloatTensor<Self>,
         resid: FloatTensor<Self>,
+        mulby: FloatTensor<Self>,
         w: FloatTensor<Self>,
         counters: IntTensor<Self>,
         fusion: Fusion,
@@ -521,6 +549,7 @@ pub trait NcmFusedMlp: Backend {
         delta: FloatTensor<Self>,
         gamma: FloatTensor<Self>,
         resid: FloatTensor<Self>,
+        mulby: FloatTensor<Self>,
         packed: IntTensor<Self>,
         scales: FloatTensor<Self>,
         fusion: Fusion,
@@ -540,6 +569,7 @@ impl NcmFusedMlp for CubeBackend {
         delta: CubeTensor,
         gamma: CubeTensor,
         resid: CubeTensor,
+        mulby: CubeTensor,
         w: CubeTensor,
         counters: CubeTensor,
         f: Fusion,
@@ -581,6 +611,7 @@ impl NcmFusedMlp for CubeBackend {
                 delta.into_tensor_arg(),
                 gamma.into_tensor_arg(),
                 resid.into_tensor_arg(),
+                mulby.into_tensor_arg(),
                 w.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
                 part.into_tensor_arg(),
@@ -595,6 +626,8 @@ impl NcmFusedMlp for CubeBackend {
                 f.add,
                 f.glu,
                 f.residual,
+                f.mul,
+                f.sigmoid,
                 dtype,
             );
         }
@@ -606,6 +639,7 @@ impl NcmFusedMlp for CubeBackend {
         delta: CubeTensor,
         gamma: CubeTensor,
         resid: CubeTensor,
+        mulby: CubeTensor,
         packed: CubeTensor,
         scales: CubeTensor,
         f: Fusion,
@@ -627,6 +661,7 @@ impl NcmFusedMlp for CubeBackend {
                 delta.into_tensor_arg(),
                 gamma.into_tensor_arg(),
                 resid.into_tensor_arg(),
+                mulby.into_tensor_arg(),
                 packed.into_tensor_arg(),
                 scales.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
@@ -641,6 +676,8 @@ impl NcmFusedMlp for CubeBackend {
                 f.add,
                 f.glu,
                 f.residual,
+                f.mul,
+                f.sigmoid,
                 dtype,
             );
         }
@@ -703,6 +740,7 @@ fn launch(
     delta: Option<Tensor<2>>,
     gamma: Option<Tensor<1>>,
     resid: Option<Tensor<2>>,
+    mulby: Option<Tensor<2>>,
     weight: Weight,
     fusion: Fusion,
 ) -> (Tensor<2>, Option<Tensor<2>>) {
@@ -712,12 +750,14 @@ fn launch(
     let delta = delta.unwrap_or_else(|| x.clone());
     let gamma = gamma.unwrap_or_else(|| x.clone().reshape([rows * k]));
     let resid = resid.unwrap_or_else(|| x.clone());
+    let mulby = mulby.unwrap_or_else(|| x.clone());
     let out = match weight {
         Weight::Dense(w) => <Dispatch as NcmFusedMlp>::ncm_fmlp_dense(
             x.into_dispatch(),
             delta.into_dispatch(),
             gamma.into_dispatch(),
             resid.into_dispatch(),
+            mulby.into_dispatch(),
             w.into_dispatch(),
             counters(&device).into_dispatch(),
             fusion,
@@ -729,6 +769,7 @@ fn launch(
                 delta.into_dispatch(),
                 gamma.into_dispatch(),
                 resid.into_dispatch(),
+                mulby.into_dispatch(),
                 packed.into_dispatch(),
                 scales.into_dispatch(),
                 fusion,
@@ -759,9 +800,19 @@ pub fn mlp_in(
     let ff = d_out / 2;
     let weight = weight(gate_up, rows, d, ff)?;
     let add = delta.is_some();
-    let fusion =
-        Fusion { norm: true, add, glu: true, residual: false, eps, bits: 0, group_words: 0, n: ff };
-    Some(launch(x, delta, Some(gamma), None, weight, fusion))
+    let fusion = Fusion {
+        norm: true,
+        add,
+        glu: true,
+        residual: false,
+        mul: false,
+        sigmoid: false,
+        eps,
+        bits: 0,
+        group_words: 0,
+        n: ff,
+    };
+    Some(launch(x, delta, Some(gamma), None, None, weight, fusion))
 }
 
 /// The MLP's second half: `resid + h W_down` for `h` `[rows, ff]`. None when the fused kernels
@@ -778,10 +829,70 @@ pub fn mlp_out(h: Tensor<2>, down: &QLinear, resid: Tensor<2>) -> Option<Tensor<
         add: false,
         glu: false,
         residual: true,
+        mul: false,
+        sigmoid: false,
         eps: 0.0,
         bits: 0,
         group_words: 0,
         n: d,
     };
-    Some(launch(h, None, None, Some(resid), weight, fusion).0)
+    Some(launch(h, None, None, Some(resid), None, weight, fusion).0)
+}
+
+/// A projection of the RMS-normed `x` `[rows, d]`: `norm(x) W`, with the norm in the GEMV's
+/// prologue, and with `sigmoid` the logistic function in its epilogue (an output-gate
+/// projection). The pre-attention half of a block: DeltaNet's and retrieval's input
+/// projections, attention's QKV and gate projections. None when the fused kernels do not take
+/// this layer or row count.
+pub fn norm_linear(
+    x: Tensor<2>,
+    gamma: Tensor<1>,
+    eps: f64,
+    layer: &QLinear,
+    sigmoid: bool,
+) -> Option<Tensor<2>> {
+    let [rows, d] = x.dims();
+    let (d_in, n) = layer.dims();
+    if d_in != d {
+        return None;
+    }
+    let weight = weight(layer, rows, d, n)?;
+    let fusion = Fusion {
+        norm: true,
+        add: false,
+        glu: false,
+        residual: false,
+        mul: false,
+        sigmoid,
+        eps,
+        bits: 0,
+        group_words: 0,
+        n,
+    };
+    Some(launch(x, None, Some(gamma), None, None, weight, fusion).0)
+}
+
+/// An output projection of the gated attention output: `(x * gate) W` for `x`, `gate`
+/// `[rows, d_in]`, the product in the GEMV's prologue. None when the fused kernels do not take
+/// this layer or row count.
+pub fn gated_linear(x: Tensor<2>, gate: Tensor<2>, layer: &QLinear) -> Option<Tensor<2>> {
+    let [rows, d] = x.dims();
+    let (d_in, n) = layer.dims();
+    if d_in != d || gate.dims() != [rows, d] {
+        return None;
+    }
+    let weight = weight(layer, rows, d, n)?;
+    let fusion = Fusion {
+        norm: false,
+        add: false,
+        glu: false,
+        residual: false,
+        mul: true,
+        sigmoid: false,
+        eps: 0.0,
+        bits: 0,
+        group_words: 0,
+        n,
+    };
+    Some(launch(x, None, None, None, Some(gate), weight, fusion).0)
 }

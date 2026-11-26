@@ -382,19 +382,33 @@ impl GatedDeltaNet {
     /// `x` `[B, T, d]`. With a cache the layer continues from its state (one-token steps use
     /// the recurrent form) and updates it. On CUDA with the fused kernels on, cached runs of up
     /// to a chunk take [`crate::kernels::delta_step`] instead.
+    pub fn forward(&self, x: Tensor<3>, cache: Option<&mut DeltaCache>) -> Tensor<3> {
+        self.forward_projected(self.proj.forward(x), cache)
+    }
+
+    /// The input projection, which [`Self::forward_projected`] expects applied (a caller may
+    /// fuse the pre-norm into it, [`crate::mlp_fused::norm_linear`]).
+    pub(crate) fn input_projection(&self) -> &Linear {
+        &self.proj
+    }
+
+    /// [`Self::forward`] from the input projection `p` `[B, T, W]`.
     #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    pub fn forward(&self, x: Tensor<3>, mut cache: Option<&mut DeltaCache>) -> Tensor<3> {
+    pub(crate) fn forward_projected(
+        &self,
+        p: Tensor<3>,
+        mut cache: Option<&mut DeltaCache>,
+    ) -> Tensor<3> {
         #[cfg(feature = "cuda")]
         if let Some(c) = cache.as_deref_mut()
-            && x.dims()[1] <= self.chunk
-            && crate::fused::active(&x.device())
+            && p.dims()[1] <= self.chunk
+            && crate::fused::active(&p.device())
         {
-            return self.forward_fused(x, c);
+            return self.forward_fused(p, c);
         }
-        let [b, t, _] = x.dims();
+        let [b, t, _] = p.dims();
         let (h, hd) = (self.heads, self.head_dim);
-        let device = x.device();
-        let p = self.proj.forward(x);
+        let device = p.device();
         let mixed = p.clone().narrow(2, 0, 3 * h * hd);
         let gate = p.clone().narrow(2, 3 * h * hd, h * hd);
         let a = p.clone().narrow(2, 4 * h * hd, h);
@@ -433,14 +447,14 @@ impl GatedDeltaNet {
     /// The cached path of [`Self::forward`] as one fused kernel between the two projections:
     /// decode steps and short runs (up to a chunk), token by token.
     #[cfg(feature = "cuda")]
-    fn forward_fused(&self, x: Tensor<3>, cache: &mut DeltaCache) -> Tensor<3> {
-        let t = x.dims()[1];
+    fn forward_fused(&self, p: Tensor<3>, cache: &mut DeltaCache) -> Tensor<3> {
+        let t = p.dims()[1];
         // The kernel updates the cache in place, so it must own packed buffers (a reference
         // prefill leaves views and pitched rows); after the first step this is a no-op.
         cache.state = crate::kernels::packed(cache.state.clone());
         cache.conv = crate::kernels::packed(cache.conv.clone());
         let out = crate::kernels::delta_step(
-            self.proj.forward(x),
+            p,
             self.conv.val(),
             &cache.conv,
             &cache.state,

@@ -419,9 +419,14 @@ impl Attention {
     }
 
     pub fn forward(&self, x: Tensor<3>, rope: &Rope, cache: Option<&mut KvCache>) -> Tensor<3> {
-        let t = x.dims()[1];
-        let device = x.device();
-        let (gate, q, k, v) = self.project(x, rope);
+        self.forward_in(self.input(x), rope, cache)
+    }
+
+    /// [`Self::forward`] from the input projections ([`Self::input`]).
+    fn forward_in(&self, input: AttnIn, rope: &Rope, cache: Option<&mut KvCache>) -> Tensor<3> {
+        let t = input.qkv.dims()[1];
+        let device = input.qkv.device();
+        let (gate, q, k, v) = self.project_from(input, rope);
         let out = match cache {
             None => {
                 let pos: Vec<i32> = (0..t as i32).collect();
@@ -443,13 +448,13 @@ impl Attention {
     #[cfg(feature = "cuda")]
     fn forward_step(
         &self,
-        x: Tensor<3>,
+        input: AttnIn,
         rope: &Rope,
         cache: &mut KvCache,
         step: &KvStep,
     ) -> Tensor<3> {
-        let t = x.dims()[1];
-        let (gate, q, k, v) = self.project(x, rope);
+        let t = input.qkv.dims()[1];
+        let (gate, q, k, v) = self.project_from(input, rope);
         let (keys, values) = if t == 1 {
             crate::graph::write_kv(cache, k, v, step);
             let (ck, cv) = cache.buffers();
@@ -483,10 +488,44 @@ impl Attention {
         x: Tensor<3>,
         rope: &Rope,
     ) -> (Option<Tensor<3>>, Tensor<4>, Tensor<4>, Tensor<4>) {
-        let [b, t, _] = x.dims();
-        let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
+        self.project_from(self.input(x), rope)
+    }
+
+    /// The input projections of `x`: the sigmoid output gate (v2) and the joint QKV.
+    fn input(&self, x: Tensor<3>) -> AttnIn {
         let gate = self.gate.as_ref().map(|g| sigmoid(g.forward(x.clone())));
-        let qkv = self.qkv.forward(x);
+        AttnIn { gate, qkv: self.qkv.forward(x) }
+    }
+
+    /// [`Self::input`] of the RMS-normed `x` `[B, T, d]` with the norm (and the gate's sigmoid)
+    /// fused into the projections' GEMVs ([`crate::mlp_fused::norm_linear`]); None when the
+    /// fused kernels do not take them.
+    #[cfg(feature = "cuda")]
+    fn fused_input(&self, norm: &RmsNorm, x: &Tensor<3>) -> Option<AttnIn> {
+        let [b, t, d] = x.dims();
+        let x2 = x.clone().reshape([b * t, d]);
+        let (gamma, eps) = (norm.gamma.val(), norm.epsilon);
+        let project = |layer: &Linear, sigmoid: bool| {
+            let y = crate::mlp_fused::norm_linear(x2.clone(), gamma.clone(), eps, layer, sigmoid)?;
+            let n = y.dims()[1];
+            Some(y.reshape([b, t, n]))
+        };
+        let gate = match &self.gate {
+            Some(g) => Some(project(g, true)?),
+            None => None,
+        };
+        Some(AttnIn { gate, qkv: project(&self.qkv, false)? })
+    }
+
+    /// The queries, keys (with QK-norm and RoPE) and values from the input projections.
+    fn project_from(
+        &self,
+        input: AttnIn,
+        rope: &Rope,
+    ) -> (Option<Tensor<3>>, Tensor<4>, Tensor<4>, Tensor<4>) {
+        let AttnIn { gate, qkv } = input;
+        let [b, t, _] = qkv.dims();
+        let (h, kvh, hd) = (self.heads, self.kv_heads, self.head_dim);
         let (q, k) = match (&self.q_norm, &self.k_norm) {
             (Some(q_norm), Some(k_norm)) => {
                 let q = qkv.clone().narrow(2, 0, h * hd).reshape([b, t, h, hd]);
@@ -509,12 +548,44 @@ impl Attention {
     fn output(&self, out: Tensor<4>, gate: Option<Tensor<3>>) -> Tensor<3> {
         let [b, h, t, hd] = out.dims();
         let out = out.swap_dims(1, 2).reshape([b, t, h * hd]);
+        // The gate's product in the output GEMV's prologue (CUDA, decode-sized runs).
+        #[cfg(feature = "cuda")]
+        if let Some(gate) = &gate
+            && crate::fused::fused_mlp_active(&out.device())
+        {
+            let rows = b * t;
+            let (x2, g2) =
+                (out.clone().reshape([rows, h * hd]), gate.clone().reshape([rows, h * hd]));
+            if let Some(y) = crate::mlp_fused::gated_linear(x2, g2, &self.o) {
+                let d = y.dims()[1];
+                return y.reshape([b, t, d]);
+            }
+        }
         let out = match gate {
             Some(gate) => out * gate,
             None => out,
         };
         self.o.forward(out)
     }
+}
+
+/// An attention layer's input projections: the sigmoid output gate (v2) and the joint QKV
+/// `[B, T, ..]`.
+pub(crate) struct AttnIn {
+    gate: Option<Tensor<3>>,
+    qkv: Tensor<3>,
+}
+
+/// What a block's mixer starts from: the normed residual stream, or its input projections
+/// already computed with the norm fused in ([`Block::fused_input`]).
+// One per block step, short-lived: not worth boxing the larger variant.
+#[allow(clippy::large_enum_variant)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+enum MixInput {
+    Normed(Tensor<3>),
+    /// DeltaNet's or retrieval's input projection.
+    Projected(Tensor<3>),
+    Attention(AttnIn),
 }
 
 /// Queries from the local decoder; keys and values from local-encoder states.
@@ -681,7 +752,7 @@ impl Block {
     /// `step`: the layer's cache position in a captured graph (attention layers only).
     fn mix(
         &self,
-        x: Tensor<3>,
+        input: MixInput,
         start: usize,
         ropes: &Ropes,
         cache: Option<&mut LayerCache>,
@@ -693,22 +764,68 @@ impl Block {
         match &self.attn {
             Mixer::Attention(attn) => {
                 let rope = table(if attn.window().is_some() { &ropes.local } else { &ropes.full });
+                let input = match input {
+                    MixInput::Normed(h) => attn.input(h),
+                    MixInput::Attention(input) => input,
+                    MixInput::Projected(_) => unreachable!("an attention layer's projections"),
+                };
                 match step {
                     #[cfg(feature = "cuda")]
                     Some(step) => {
                         let cache = cache.expect("a graphed step has caches").kv();
-                        attn.forward_step(x, rope, cache, step)
+                        attn.forward_step(input, rope, cache, step)
                     }
                     #[cfg(not(feature = "cuda"))]
                     Some(step) => match *step {},
-                    None => attn.forward(x, rope, cache.map(LayerCache::kv)),
+                    None => attn.forward_in(input, rope, cache.map(LayerCache::kv)),
                 }
             }
-            Mixer::DeltaNet(delta) => delta.forward(x, cache.map(LayerCache::delta)),
+            Mixer::DeltaNet(delta) => {
+                let p = match input {
+                    MixInput::Normed(h) => delta.input_projection().forward(h),
+                    MixInput::Projected(p) => p,
+                    MixInput::Attention(_) => unreachable!("a DeltaNet layer's projection"),
+                };
+                delta.forward_projected(p, cache.map(LayerCache::delta))
+            }
             Mixer::Retrieval(ret) => {
-                ret.forward(x, start, table(&ropes.retrieval), cache.map(LayerCache::latent))
+                let p = match input {
+                    MixInput::Normed(h) => ret.input_projection().forward(h),
+                    MixInput::Projected(p) => p,
+                    MixInput::Attention(_) => unreachable!("a retrieval layer's projection"),
+                };
+                let rope = table(&ropes.retrieval);
+                ret.forward_projected(p, start, rope, cache.map(LayerCache::latent))
             }
         }
+    }
+
+    /// The mixer's input projections of the `n1`-normed `x` with the norm folded into their
+    /// GEMVs (CUDA, decode-sized runs, [`crate::mlp_fused::norm_linear`]); None when the fused
+    /// kernels do not take them.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn fused_input(&self, x: &Tensor<3>) -> Option<MixInput> {
+        #[cfg(feature = "cuda")]
+        {
+            if !crate::fused::fused_mlp_active(&x.device()) {
+                return None;
+            }
+            let [b, t, d] = x.dims();
+            let single = |layer: &Linear| {
+                let x2 = x.clone().reshape([b * t, d]);
+                let (gamma, eps) = (self.n1.gamma.val(), self.n1.epsilon);
+                let p = crate::mlp_fused::norm_linear(x2, gamma, eps, layer, false)?;
+                let n = p.dims()[1];
+                Some(MixInput::Projected(p.reshape([b, t, n])))
+            };
+            match &self.attn {
+                Mixer::Attention(attn) => attn.fused_input(&self.n1, x).map(MixInput::Attention),
+                Mixer::DeltaNet(delta) => single(delta.input_projection()),
+                Mixer::Retrieval(ret) => single(ret.input_projection()),
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        None
     }
 
     /// The block on `x` plus `pending` (the previous block's MLP output, not yet added: the add
@@ -725,8 +842,17 @@ impl Block {
         cache: Option<&mut LayerCache>,
         step: Option<&KvStep>,
     ) -> (Tensor<3>, Option<Tensor<3>>) {
-        let (x, h) = norm_after(&self.n1, x, pending);
-        let mixed = self.mix(h, start, ropes, cache, step);
+        // The pre-mixer norm folded into the mixer's input projections when nothing is pending
+        // (the fused MLP leaves nothing pending), else run before it.
+        let fused = if pending.is_none() { self.fused_input(&x) } else { None };
+        let (x, input) = match fused {
+            Some(input) => (x, input),
+            None => {
+                let (x, h) = norm_after(&self.n1, x, pending);
+                (x, MixInput::Normed(h))
+            }
+        };
+        let mixed = self.mix(input, start, ropes, cache, step);
         if let Some(x) = self.mlp.residual_step(&self.n2, &x, Some(&mixed)) {
             return (x, None);
         }

@@ -400,7 +400,7 @@ impl SparseRetrieval {
     /// The fused one-token decode ([`crate::kernels::retrieval_decode`]): the same cache write,
     /// selection and attention as the reference, between the two projections.
     #[cfg(feature = "cuda")]
-    fn decode_fused(&self, x: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
+    fn decode_fused(&self, p: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
         let pos = cache.length;
         assert!(pos < cache.capacity, "cache capacity {} exceeded", cache.capacity);
         let dims = self.kernel_dims();
@@ -410,7 +410,7 @@ impl SparseRetrieval {
             cache.refresh_position();
         }
         let out = crate::kernels::retrieval_decode(
-            self.proj.forward(x),
+            p,
             norms,
             rope.tables(),
             self.uk.weight.val(),
@@ -428,26 +428,42 @@ impl SparseRetrieval {
     /// positions for the decoupled key width. With a cache, the new positions are appended and
     /// the queries see everything cached before them. On CUDA with the fused kernels on,
     /// one-token steps with a cache take [`Self::decode_fused`].
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     pub fn forward(
         &self,
         x: Tensor<3>,
+        start: usize,
+        rope: &Rope,
+        cache: Option<&mut LatentCache>,
+    ) -> Tensor<3> {
+        self.forward_projected(self.proj.forward(x), start, rope, cache)
+    }
+
+    /// The input projection, which [`Self::forward_projected`] expects applied (a caller may
+    /// fuse the pre-norm into it, [`crate::mlp_fused::norm_linear`]).
+    pub(crate) fn input_projection(&self) -> &Linear {
+        &self.proj
+    }
+
+    /// [`Self::forward`] from the input projection `p` `[B, T, W]`.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    pub(crate) fn forward_projected(
+        &self,
+        p: Tensor<3>,
         start: usize,
         rope: &Rope,
         mut cache: Option<&mut LatentCache>,
     ) -> Tensor<3> {
         #[cfg(feature = "cuda")]
         if let Some(c) = cache.as_deref_mut()
-            && x.dims()[1] == 1
-            && crate::fused::active(&x.device())
+            && p.dims()[1] == 1
+            && crate::fused::active(&p.device())
         {
-            return self.decode_fused(x, rope, c);
+            return self.decode_fused(p, rope, c);
         }
-        let [b, t, _] = x.dims();
+        let [b, t, _] = p.dims();
         let (h, dn, dr, dv, l) =
             (self.heads, self.nope_dim, self.rope_dim, self.v_dim, self.latent);
         let (hi, di) = (self.index_heads, self.index_dim);
-        let p = self.proj.forward(x);
         let mut offset = 0;
         let mut take = |n: usize| {
             let part = p.clone().narrow(2, offset, n);
