@@ -14,7 +14,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use burn::module::{Module, ModuleMapper, Param};
-use burn::tensor::{Device, Distribution, FloatDType, Int, Tensor, TensorData};
+use burn::tensor::{Bool, Device, Distribution, FloatDType, Int, Tensor, TensorData};
 use ncm_model::delta::{
     DeltaCache, DeltaSpec, GatedDeltaNet, delta_rule_chunked, delta_rule_recurrent,
 };
@@ -903,4 +903,45 @@ pub fn retrieval_prefill_matches(device: &Device, case: &RetrievalCase, tol: f32
          {worst_reference:.2e}; {flips} rows matched neither",
         case.name
     );
+}
+
+/// The fused decode attention against matmul-softmax-matmul on the CPU in f32: the NCM
+/// decoder's shapes (cross-attention over a 512-position ring, self-attention over a few
+/// positions), grouped heads folded into the rows, strided (narrowed) caches.
+pub fn attend_decode_matches(device: &Device, tol: f32) {
+    use burn::tensor::activation::softmax;
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (b, kvh, rows, keys, d) in [(1, 4, 2, 512, 64), (2, 4, 8, 3, 64), (1, 1, 2, 37, 16)] {
+        device.seed(keys as u64);
+        let q = Tensor::<4>::random([b, kvh, rows, d], normal, device);
+        // Caches with spare capacity, narrowed like a growing cache's view.
+        let k = Tensor::<4>::random([b, kvh, keys + 5, d], normal, device).narrow(2, 0, keys);
+        let v = Tensor::<4>::random([b, kvh, keys + 5, d], normal, device).narrow(2, 0, keys);
+        assert!(ncm_model::kernels::attend_decode_fits(rows, d, keys));
+        let (qc, kc, vc) = (to_cpu(&q), to_cpu(&k), to_cpu(&v));
+        let scores = qc.matmul(kc.swap_dims(2, 3)) * (1.0 / (d as f64).sqrt());
+        let kernel = |mask: Option<Tensor<2, Bool>>, t: usize| {
+            values(ncm_model::kernels::attend_decode(q.clone(), k.clone(), v.clone(), mask, t))
+        };
+        let got = kernel(None, 1);
+        let want = values(softmax(scores.clone(), 3).matmul(vc.clone()));
+        let what = format!("attend decode rows {rows} keys {keys} d {d}");
+        assert_close(&what, &got, &want, &want, tol);
+        // Masked, two query positions (rows = groups x 2): each hides every third key and the
+        // keys after its own position (the last one, then the last two).
+        let t = 2;
+        let hidden = |pos: usize, key: usize| key % 3 == 1 || key + t > keys + pos;
+        let hide: Vec<bool> = (0..t * keys).map(|i| hidden(i / keys, i % keys)).collect();
+        let mask = Tensor::<2, Bool>::from_data(TensorData::new(hide, [t, keys]), device);
+        let got = kernel(Some(mask), t);
+        let rows_mask: Vec<bool> =
+            (0..rows * keys).map(|i| hidden((i / keys) % t, i % keys)).collect();
+        let mask_cpu =
+            Tensor::<2, Bool>::from_data(TensorData::new(rows_mask, [rows, keys]), &cpu())
+                .reshape([1, 1, rows, keys])
+                .expand([b, kvh, rows, keys]);
+        let want = values(softmax(scores.mask_fill(mask_cpu, f32::NEG_INFINITY), 3).matmul(vc));
+        let what = format!("attend decode masked rows {rows} keys {keys} d {d}");
+        assert_close(&what, &got, &want, &want, tol);
+    }
 }

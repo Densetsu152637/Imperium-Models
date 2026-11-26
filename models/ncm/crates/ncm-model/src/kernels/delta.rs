@@ -119,7 +119,8 @@ pub(crate) fn delta_step_kernel<F: Float>(
         let row = b * proj.stride(0) + t * proj.stride(1);
         let pc = proj.stride(2);
         if lead {
-            q_sh[j] = conv_silu::<F>(proj[row + cq * pc], conv_w, conv, c_base, channels, cq, width);
+            q_sh[j] =
+                conv_silu::<F>(proj[row + cq * pc], conv_w, conv, c_base, channels, cq, width);
             k_sh[j] = conv_silu::<F>(
                 proj[row + (hk + cq) * pc],
                 conv_w,

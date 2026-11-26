@@ -291,6 +291,11 @@ pub fn attend(
     let [_, kvh, s, _] = k.dims();
     let groups = h / kvh;
     let q = q.reshape([b, kvh, groups * t, d]);
+    // Decode steps on CUDA: one fused kernel instead of matmul, softmax and matmul.
+    #[cfg(feature = "cuda")]
+    if crate::kernels::attend_decode_fits(groups * t, d, s) && crate::fused::active(&q.device()) {
+        return crate::kernels::attend_decode(q, k, v, mask, t).reshape([b, h, t, d]);
+    }
     let mask = mask.map(|m| {
         m.repeat_dim(0, groups).reshape([1, 1, groups * t, s]).expand([b, kvh, groups * t, s])
     });

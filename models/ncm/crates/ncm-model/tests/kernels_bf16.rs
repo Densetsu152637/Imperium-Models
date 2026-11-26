@@ -145,3 +145,9 @@ fn sampler_matches_distribution_bf16() {
     let (device, _lock) = setup(DTYPE);
     sampler_matches_distribution(&device);
 }
+
+#[test]
+fn attend_decode_matches_cpu_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    attend_decode_matches(&device, TOL);
+}

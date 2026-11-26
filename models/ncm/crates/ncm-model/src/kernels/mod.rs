@@ -7,15 +7,16 @@
 
 mod argmax;
 mod assign;
+mod attend;
 mod delta;
 mod gemv;
 mod norm;
 mod quant;
 mod retrieval;
 
-use burn::backend::tensor::{FloatTensor, IntTensor};
+use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
 use burn::backend::{Backend, Dispatch, backend_extension};
-use burn::tensor::{DType, Int, Tensor};
+use burn::tensor::{Bool, DType, Int, Tensor};
 use burn_cubecl::cubecl::prelude::*;
 use burn_cubecl::cubecl::{CubeCount, CubeDim};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
@@ -283,6 +284,22 @@ pub trait NcmKernels: Backend {
         count: IntTensor<Self>,
         start: usize,
         dims: RetrievalDims,
+    ) -> FloatTensor<Self>;
+
+    /// See [`attend_decode`].
+    fn ncm_attend_decode(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
+    /// See [`attend_decode`], with a mask.
+    fn ncm_attend_decode_masked(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: BoolTensor<Self>,
+        t: usize,
     ) -> FloatTensor<Self>;
 
     /// See [`retrieval_decode`].
@@ -777,6 +794,20 @@ impl NcmKernels for CubeBackend {
         out
     }
 
+    fn ncm_attend_decode(q: CubeTensor, k: CubeTensor, v: CubeTensor) -> CubeTensor {
+        launch_attend_decode(q, k, v, None, 1)
+    }
+
+    fn ncm_attend_decode_masked(
+        q: CubeTensor,
+        k: CubeTensor,
+        v: CubeTensor,
+        mask: CubeTensor,
+        t: usize,
+    ) -> CubeTensor {
+        launch_attend_decode(q, k, v, Some(mask), t)
+    }
+
     fn ncm_retrieval_decode(
         proj: CubeTensor,
         q_gamma: CubeTensor,
@@ -999,6 +1030,73 @@ pub fn delta_scan(
 pub fn scratch_i32<const D: usize>(like: &Tensor<3>, shape: [usize; D]) -> Tensor<D, Int> {
     let t = <Dispatch as NcmKernels>::ncm_scratch_i32(like.clone().into_dispatch(), shape.to_vec());
     Tensor::from_dispatch(t)
+}
+
+/// Launches [`attend::attend_decode_kernel`] (see [`attend_decode`]).
+fn launch_attend_decode(
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    mask: Option<CubeTensor>,
+    t: usize,
+) -> CubeTensor {
+    let [b, kvh, rows, d] = q.meta.shape().dims::<4>();
+    let masked = mask.is_some();
+    // Without a mask the kernel reads none: any u8 tensor stands in.
+    let mask = mask.unwrap_or_else(|| scratch(&q, vec![1, 1], DType::U8));
+    let keys = k.meta.shape().dims::<4>()[2];
+    let out = empty_like(&q, vec![b, kvh, rows, d]);
+    let dtype = elem(q.dtype);
+    let client = q.client.clone();
+    unsafe {
+        attend::attend_decode_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static((b * kvh * rows) as u32, 1, 1),
+            CubeDim::new_1d(attend::CUBE as u32),
+            q.into_tensor_arg(),
+            k.into_tensor_arg(),
+            v.into_tensor_arg(),
+            mask.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            kvh,
+            rows,
+            keys,
+            t,
+            1.0 / (d as f32).sqrt(),
+            d,
+            masked,
+            dtype,
+        );
+    }
+    out
+}
+
+/// Whether [`attend_decode`] takes `rows` query rows per key/value head of width `d` against
+/// `keys` cached positions.
+pub fn attend_decode_fits(rows: usize, d: usize, keys: usize) -> bool {
+    rows <= 16 && d <= attend::CUBE && keys >= 1 && keys <= attend::MAX_KEYS
+}
+
+/// Attention of a decode step in one kernel: `q` `[B, KVH, R, d]` (a group's query heads
+/// folded into the rows, `R = G t`), `k`, `v` `[B, KVH, S, d]`, and optionally the `[t, S]`
+/// mask (`true` hides a key) shared by the group's heads; returns
+/// `softmax(q k^T / sqrt(d)) v` `[B, KVH, R, d]`. Only for shapes [`attend_decode_fits`]
+/// accepts.
+pub fn attend_decode(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    t: usize,
+) -> Tensor<4> {
+    let (q, k, v) = (q.into_dispatch(), k.into_dispatch(), v.into_dispatch());
+    let out = match mask {
+        None => <Dispatch as NcmKernels>::ncm_attend_decode(q, k, v),
+        Some(m) => {
+            <Dispatch as NcmKernels>::ncm_attend_decode_masked(q, k, v, m.into_dispatch(), t)
+        }
+    };
+    Tensor::from_dispatch(out)
 }
 
 /// Block selection of prefill queries `t0 .. t0 + q` of a chunk whose first query sits at
