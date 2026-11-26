@@ -140,43 +140,103 @@ pub fn tiny_models_match(device: &Device, q8_tol: f32, path_tol: f32) {
     }
 }
 
-/// One-row products through a dense layer and its q8 and q4 versions, timed over many calls
-/// queued back to back: microseconds per call and weight bytes streamed per second. Large
-/// layers, so the GPU rather than the host sets the pace. Printed only.
+/// The decode products at the 250M models' shapes (token baseline and NCM backbone at d = 1024
+/// one row, NCM local layers at d = 512 four rows), dense, q8 and q4-g64, and the tied
+/// logits: microseconds per call and weight bytes streamed per second. Twenty calls are
+/// recorded as one CUDA graph and replayed, so the time is the GPU's (the best of five runs: the
+/// GPU may be shared), and the calls cycle through twenty copies of each weight so that they
+/// stream from memory rather than the 64 MiB L2 of an RTX 5080. Printed only.
 pub fn time_gemv(device: &Device, dtype: FloatDType) {
-    use std::time::Instant;
-    const CALLS: usize = 200;
-    // The last exceeds the 64 MiB L2 of an RTX 5080 in every format; the others fit it partly.
-    for (d_in, d_out) in [(1024, 4112), (4096, 16384), (8192, 24576)] {
-        let w = random(d_out * d_in, 9, 0.05);
-        let dense = Tensor::<2>::from_data(TensorData::new(w.clone(), [d_out, d_in]), device);
-        let layers = [
-            ("dense", dense_layer(dense.cast(dtype).transpose(), d_in, d_out, device)),
-            ("q8", QLinear::from_packed(&quantize(&w, d_out, d_in, Format::q8()), device)),
-            ("q4-g64", QLinear::from_packed(&quantize(&w, d_out, d_in, Format::q4(64)), device)),
-        ];
-        let x = Tensor::<2>::from_data(TensorData::new(random(d_in, 3, 1.0), [1, d_in]), device)
-            .cast(dtype);
-        for (name, layer) in &layers {
-            for _ in 0..10 {
-                let _ = layer.forward(x.clone());
-            }
-            device.sync().expect("sync");
-            let start = Instant::now();
-            for _ in 0..CALLS {
-                let _ = layer.forward(x.clone());
-            }
-            device.sync().expect("sync");
-            let per_call = start.elapsed().as_secs_f64() / CALLS as f64;
-            let bytes = ncm_model::quant::weight_bytes(layer);
+    const COPIES: usize = 20;
+    let shapes = [
+        (1, 1024, 4112),
+        (1, 1024, 5376),
+        (1, 2688, 1024),
+        (1, 1024, 1024),
+        (1, 1024, 6400),
+        (1, 3200, 1024),
+        (4, 512, 3072),
+        (4, 1536, 512),
+    ];
+    for (rows, d_in, d_out) in shapes {
+        let x = Tensor::<2>::from_data(
+            TensorData::new(random(rows * d_in, 3, 1.0), [rows, d_in]),
+            device,
+        )
+        .cast(dtype);
+        let weights: Vec<Vec<f32>> =
+            (0..COPIES).map(|i| random(d_out * d_in, 9 + i as u64, 0.05)).collect();
+        let formats =
+            [("dense", None), ("q8", Some(Format::q8())), ("q4-g64", Some(Format::q4(64)))];
+        for (name, format) in formats {
+            let layers: Vec<QLinear> = weights
+                .iter()
+                .map(|w| match format {
+                    None => {
+                        // Row-major `[d_in, d_out]`, as the models hold their dense weights.
+                        let t = TensorData::new(w.clone(), [d_in, d_out]);
+                        let t = Tensor::<2>::from_data(t, device).cast(dtype);
+                        dense_layer(t, d_in, d_out, device)
+                    }
+                    Some(f) => QLinear::from_packed(&quantize(w, d_out, d_in, f), device),
+                })
+                .collect();
+            let bytes = ncm_model::quant::weight_bytes(&layers[0]);
+            let us = time_graphed(device, |i| drop(layers[i % COPIES].forward(x.clone())));
             eprintln!(
-                "[{d_in} -> {d_out}] {name:<7} {:>8.1} us/call  {:>6.1} GB/s of weights ({:.1} MiB)",
-                per_call * 1e6,
-                bytes as f64 / per_call / 1e9,
-                bytes as f64 / (1u64 << 20) as f64
+                "[{rows} x {d_in} -> {d_out}] {name:<7} {us:>7.2} us/call  {:>6.1} GB/s of weights",
+                bytes as f64 / (us * 1e-6) / 1e9,
             );
         }
     }
+    let x = Tensor::<3>::from_data(TensorData::new(random(1024, 3, 1.0), [1, 1, 1024]), device)
+        .cast(dtype);
+    let embs: Vec<Tensor<2>> = (0..3)
+        .map(|i| {
+            let e = random(32000 * 1024, 20 + i, 0.05);
+            Tensor::<2>::from_data(TensorData::new(e, [32000, 1024]), device).cast(dtype)
+        })
+        .collect();
+    let us = time_graphed(device, |i| {
+        drop(ncm_model::fused::linear_transposed(embs[i % 3].clone(), x.clone()))
+    });
+    let bytes = 32000 * 1024 * embs[0].dtype().size();
+    eprintln!(
+        "[1 x 1024 -> 32000] logits  {us:>7.2} us/call  {:>6.1} GB/s",
+        bytes as f64 / (us * 1e-6) / 1e9
+    );
+}
+
+/// GPU microseconds per call of `f(i)`: twenty calls (`i` = 0..20) recorded as one CUDA graph,
+/// replayed, best of five timings.
+fn time_graphed(device: &Device, f: impl Fn(usize)) -> f64 {
+    use burn::backend::{Backend, Dispatch};
+    use std::time::Instant;
+    let dispatch = device.as_dispatch();
+    Dispatch::graph_prepare(dispatch).expect("graph_prepare");
+    for i in 0..20 {
+        f(i);
+    }
+    device.sync().expect("sync");
+    Dispatch::graph_start_capture(dispatch).expect("graph_start_capture");
+    for i in 0..20 {
+        f(i);
+    }
+    let graph = Dispatch::graph_stop_capture(dispatch).expect("graph_stop_capture");
+    // Safety: every buffer the graph touched is held by the caller's layers and inputs.
+    let replay = || unsafe { Dispatch::graph_replay(dispatch, &graph) }.expect("replay");
+    replay();
+    device.sync().expect("sync");
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let start = Instant::now();
+        for _ in 0..20 {
+            replay();
+        }
+        device.sync().expect("sync");
+        best = best.min(start.elapsed().as_secs_f64() * 1e6 / 400.0);
+    }
+    best
 }
 
 /// A dense layer holding `w` `[d_in, d_out]`: a dense `QLinear` with its weight replaced.

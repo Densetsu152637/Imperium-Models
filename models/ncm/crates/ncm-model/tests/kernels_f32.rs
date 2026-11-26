@@ -100,3 +100,15 @@ fn graphed_tok_step_matches_eager_f32() {
         graphed_tok_matches(&device, Some(spec));
     }
 }
+
+#[test]
+fn norm_matches_reference_f32() {
+    let (device, _lock) = setup(DTYPE);
+    norm_matches(&device, TOL);
+}
+
+#[test]
+fn graphed_step_survives_reset_f32() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_step_survives_reset(&device);
+}

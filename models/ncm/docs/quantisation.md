@@ -27,7 +27,7 @@ A code `u` decodes to `(u - 2^(bits-1)) * scale`. Quantisation happens on the ho
 
 On a `--features cuda` build the quantised layers multiply through two CubeCL kernels (`src/kernels/quant.rs`, launched by `kernels::qmatmul` through the same Burn backend extension as the other fused decode kernels, see `docs/attention.md`):
 
-* **GEMV** (up to 8 rows, `quant::GEMV_ROWS`: decode steps, the NCM's per-concept calls): one warp per output feature streams that feature's packed row once, each lane decoding its words in registers and accumulating every input row against them in f32; a warp sum finishes each dot product. The weight is read once per call whatever the row count.
+* **GEMV** (up to 8 rows, `quant::GEMV_ROWS`: decode steps, the NCM's per-concept calls): one warp per output feature streams that feature's packed row once, each lane decoding its words in registers and accumulating every input row against them in f32; a warp sum finishes each dot product. The weight is read once per call whatever the row count. `qgemv_vec_kernel`, used when `x` fits in shared memory (`rows * d_in` up to about 7,900) and the word count and group length allow, stages `x` once per cube of eight features (skewed by one slot every 32 values, so the lanes' strided reads hit distinct banks) and reads each lane's words as one vector, four words for q8 and two for q4 (whose decoding rather than its loads limits it); otherwise `qgemv_kernel` reads `x` from global memory.
 * **GEMM fallback** (more rows: prefill and training-length runs): a kernel decodes the weight to `[d_in, d_out]` at the run dtype and Burn's tuned matmul multiplies. Prefill is compute-bound, so the extra weight write and read cost little there.
 
 Everywhere else (CPU, CI, wgpu, with the fused kernels off by `fused::set_fused_kernels(false)` or `ncm-bench --reference-kernels`, or with `quant::set_quant_kernels(false)`) the reference path decodes the weight with tensor ops (`quant::dequantize`) and multiplies.
@@ -36,7 +36,19 @@ Everywhere else (CPU, CI, wgpu, with the fused kernels off by `fused::set_fused_
 
 **CUDA graphs.** The kernels only read their codes and scales, which are parameters and keep their buffers, and index every operand through its strides (cubecl pitches the rows of new 2-D buffers), so the captured decode graphs (NCM decoder, v2 backbone step, draft and verify passes of self-speculation) record and replay quantised layers as they do dense ones; `ncm-bench --quant q8|q4` runs them graphed by default. Short runs on an RTX 5080 (`--model ncm --design v2 --device cuda --context 2048 --new-tokens 128`, bf16, graphs on, no speculation): about 410 to 450 tok/s dense, 480 q8, 495 q4-g64, all at a 92% host share, so decode remains bound by host dispatch outside the graphs and the saved weight traffic shows only as a modest gain.
 
-One-row products on an RTX 5080 in bf16 (`tests/quant_cuda_bf16.rs`, `gemv_timing_bf16`, release build, calls queued back to back):
+Products at the 250M models' shapes on an RTX 5080 in bf16 (`tests/quant_cuda_bf16.rs`, `gemv_timing_bf16`, release build): twenty calls recorded as a CUDA graph and replayed, so the time is the GPU's, cycling through twenty copies of each weight so they stream from memory rather than L2:
+
+| Layer `rows x d_in -> d_out` | dense GEMV | q8 GEMV | q4-g64 GEMV |
+|---|---|---|---|
+| 1 x 1024 -> 4112 | 12.4 us, 677 GB/s | 6.5 us, 646 GB/s | 3.7 us, 639 GB/s |
+| 1 x 1024 -> 5376 | 13.5 us, 816 GB/s | 7.3 us, 758 GB/s | 4.4 us, 700 GB/s |
+| 1 x 3200 -> 1024 | 10.3 us, 639 GB/s | 4.5 us, 725 GB/s | 3.9 us, 471 GB/s |
+| 4 x 512 -> 3072 | 4.5 us, 700 GB/s | 4.5 us, 352 GB/s | 4.4 us, 202 GB/s |
+| 4 x 1536 -> 512 | 3.8 us, 411 GB/s | 4.4 us, 178 GB/s | 4.3 us, 102 GB/s |
+
+The dense kernel before vectorisation streamed 240 to 340 GB/s at these shapes; the earlier quantised kernels were within 10 to 20% of the table's (q4 at four rows slightly faster, the rest slower). Small four-row layers are bound by latency and decoding, not bandwidth.
+
+An earlier measurement (calls queued back to back, before the vectorised kernels):
 
 | Layer `d_in -> d_out` | dense (Burn matmul) | q8 GEMV | q4-g64 GEMV |
 |---|---|---|---|

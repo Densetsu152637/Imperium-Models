@@ -186,6 +186,19 @@ pub(crate) fn rope_values(
     }
 }
 
+/// `x + pending` (or `x`) and its norm, through [`crate::fused::add_rms_norm`] when there is a
+/// pending residual.
+pub(crate) fn norm_after(
+    norm: &RmsNorm,
+    x: Tensor<3>,
+    pending: Option<Tensor<3>>,
+) -> (Tensor<3>, Tensor<3>) {
+    match pending {
+        Some(delta) => crate::fused::add_rms_norm(norm, x, delta),
+        None => (x.clone(), crate::fused::rms_norm(norm, x)),
+    }
+}
+
 /// Rotate `x` `[B, H, T, D]` by the position tables.
 pub fn apply_rope(x: Tensor<4>, rope: &Rope) -> Tensor<4> {
     x.clone().matmul(rope.rot.clone()) * rope.sin.clone() + x * rope.cos.clone()
@@ -369,8 +382,8 @@ impl Attention {
             (Some(q_norm), Some(k_norm)) => {
                 let q = qkv.clone().narrow(2, 0, h * hd).reshape([b, t, h, hd]);
                 let k = qkv.clone().narrow(2, h * hd, kvh * hd).reshape([b, t, kvh, hd]);
-                let q = apply_rope(q_norm.forward(q).swap_dims(1, 2), rope);
-                (q, apply_rope(k_norm.forward(k).swap_dims(1, 2), rope))
+                let q = apply_rope(crate::fused::rms_norm(q_norm, q).swap_dims(1, 2), rope);
+                (q, apply_rope(crate::fused::rms_norm(k_norm, k).swap_dims(1, 2), rope))
             }
             _ => {
                 // Queries and keys share positions, so one RoPE pass covers both.
@@ -589,16 +602,23 @@ impl Block {
         }
     }
 
+    /// The block on `x` plus `pending` (the previous block's MLP output, not yet added: the add
+    /// runs in one kernel with this block's first norm, [`crate::fused::add_rms_norm`]).
+    /// Returns the residual stream after the mixer and this block's MLP output, likewise
+    /// pending.
     fn forward(
         &self,
         x: Tensor<3>,
+        pending: Option<Tensor<3>>,
         start: usize,
         ropes: &Ropes,
         cache: Option<&mut LayerCache>,
         step: Option<&KvStep>,
-    ) -> Tensor<3> {
-        let x = x.clone() + self.mix(self.n1.forward(x), start, ropes, cache, step);
-        x.clone() + self.mlp.forward(self.n2.forward(x))
+    ) -> (Tensor<3>, Tensor<3>) {
+        let (x, h) = norm_after(&self.n1, x, pending);
+        let mixed = self.mix(h, start, ropes, cache, step);
+        let (x, h) = crate::fused::add_rms_norm(&self.n2, x, mixed);
+        (x, self.mlp.forward(h))
     }
 
     fn make_cache(&self, max_positions: usize, batch: usize, device: &Device) -> LayerCache {
@@ -794,13 +814,14 @@ impl Stack {
         mut caches: Option<&mut [LayerCache]>,
         steps: Option<&[Option<KvStep>]>,
     ) -> Tensor<3> {
-        let mut x = x;
+        let (mut x, mut pending) = (x, None);
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = caches.as_mut().map(|c| &mut c[i]);
             let step = steps.and_then(|s| s[i].as_ref());
-            x = block.forward(x, start, ropes, cache, step);
+            let (next, out) = block.forward(x, pending, start, ropes, cache, step);
+            (x, pending) = (next, Some(out));
         }
-        self.norm.forward(x)
+        norm_after(&self.norm, x, pending).1
     }
 
     /// One cache per layer for runs of up to `max_positions`.

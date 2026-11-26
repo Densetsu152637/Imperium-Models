@@ -2,9 +2,10 @@
 //! concept's k tokens). Burn's tiled matmul runs these at a fraction of the memory bandwidth,
 //! and at batch 1 they are most of the GPU time of a decode step.
 //!
-//! [`gemv_cols_kernel`] reads `W` `[K, N]` with consecutive units on consecutive columns
-//! (coalesced for a row-major weight) and splits `K` over a second grid axis when `N` alone gives
-//! too few cubes; [`gemv_sum_kernel`] then adds the splits. [`gemv_rows_kernel`] is for a weight
+//! [`gemv_vec_kernel`] reads a row-major `W` `[K, N]` in vectors of consecutive columns (16
+//! bytes per load where the width allows), eight units striding `K` per vector, and splits `K`
+//! over a second grid axis for about two cubes per SM; [`gemv_sum_kernel`] then adds the splits.
+//! [`gemv_cols_kernel`] is its scalar form (one column per unit), for widths no vector divides. [`gemv_rows_kernel`] is for a weight
 //! stored transposed (`W[k, n]` at `n * K + k`, as the tied embedding in the logits): one plane
 //! per output, its units along `K`.
 
@@ -187,5 +188,122 @@ pub(crate) fn gemv_rows_kernel<F: Float>(
         if valid && lane == 0 {
             y[r * n + col] = F::cast_from(total);
         }
+    }
+}
+
+/// Column units per cube of [`gemv_vec_kernel`], each owning one vector of columns.
+pub(crate) const VEC_COLS: usize = 32;
+/// Units per column unit of [`gemv_vec_kernel`], striding `K`.
+pub(crate) const VEC_LANES: usize = CUBE / VEC_COLS;
+/// Largest `K` slice one cube of [`gemv_vec_kernel`] stages.
+pub(crate) const VEC_K: usize = 512;
+
+/// Writes one row's totals: the `VEC_LANES` partial vectors of each column unit, summed.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn vec_store<F: Float, L: Size>(
+    red: &mut Shared<[f32]>,
+    acc: Vector<f32, L>,
+    y: &mut Tensor<F>,
+    part: &mut Tensor<f32>,
+    r: usize,
+    rows: usize,
+    n: usize,
+    #[comptime] split: bool,
+) {
+    let v = acc.vector_size().comptime();
+    let tid = UNIT_POS as usize;
+    let (cu, lane) = (tid % VEC_COLS, tid / VEC_COLS);
+    let width = VEC_COLS * v;
+    #[unroll]
+    for i in 0..v {
+        red[lane * width + cu * v + i] = acc.extract(i);
+    }
+    sync_cube();
+    if tid < width {
+        let col = CUBE_POS_X as usize * width + tid;
+        if col < n {
+            let mut total = 0.0f32;
+            for l in 0..VEC_LANES {
+                total += red[l * width + tid];
+            }
+            if comptime!(split) {
+                part[(CUBE_POS_Y as usize * rows + r) * n + col] = total;
+            } else {
+                y[r * n + col] = F::cast_from(total);
+            }
+        }
+    }
+    sync_cube();
+}
+
+/// `y = x L` for a packed row-major `L` `[K, L]` read as vectors of `L`'s columns (16 bytes per
+/// load). Cube `(tile, split)`: column unit `u` owns the vector of columns `(tile * VEC_COLS +
+/// u) * v ..`, its `VEC_LANES` units stride `K` in `split * k_split ..`, and a shared-memory sum
+/// merges them. With one split it writes `y` `[rows, L]`, otherwise f32 partials `part`
+/// `[splits, rows, L]` for [`gemv_sum_kernel`].
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemv_vec_kernel<F: Float, L: Size>(
+    x: &Tensor<F>,
+    w: &Tensor<Vector<F, L>>,
+    y: &mut Tensor<F>,
+    part: &mut Tensor<f32>,
+    k: usize,
+    n: usize,
+    k_split: usize,
+    #[comptime] rows: usize,
+    #[comptime] split: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let v = w.vector_size().comptime();
+    let tid = UNIT_POS as usize;
+    let (cu, lane) = (tid % VEC_COLS, tid / VEC_COLS);
+    let col0 = (CUBE_POS_X as usize * VEC_COLS + cu) * v;
+    let k0 = CUBE_POS_Y as usize * k_split;
+    let k1 = select(k0 + k_split < k, k0 + k_split, k);
+    let mut xs = Shared::<[f32]>::new_slice(MAX_ROWS * VEC_K);
+    let (x0, x1) = (x.stride(0), x.stride(1));
+    let mut i = tid;
+    while i < rows * k_split {
+        let r = i / k_split;
+        let kk = k0 + i % k_split;
+        if kk < k1 {
+            xs[r * VEC_K + i % k_split] = f32::cast_from(x[r * x0 + kk * x1]);
+        }
+        i += CUBE;
+    }
+    sync_cube();
+    let w0 = w.stride(0);
+    let zero = Vector::<f32, L>::new(0.0f32);
+    let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+    if col0 < n {
+        let mut kk = k0 + lane;
+        while kk < k1 {
+            let wv = Vector::<f32, L>::cast_from(w[(kk * w0 + col0) / v]);
+            let at = kk - k0;
+            a0 += wv * Vector::new(xs[at]);
+            if comptime!(rows > 1) {
+                a1 += wv * Vector::new(xs[VEC_K + at]);
+            }
+            if comptime!(rows > 2) {
+                a2 += wv * Vector::new(xs[2 * VEC_K + at]);
+            }
+            if comptime!(rows > 3) {
+                a3 += wv * Vector::new(xs[3 * VEC_K + at]);
+            }
+            kk += VEC_LANES;
+        }
+    }
+    let mut red = Shared::<[f32]>::new_slice(CUBE * 8);
+    vec_store::<F, L>(&mut red, a0, y, part, 0, rows, n, split);
+    if comptime!(rows > 1) {
+        vec_store::<F, L>(&mut red, a1, y, part, 1, rows, n, split);
+    }
+    if comptime!(rows > 2) {
+        vec_store::<F, L>(&mut red, a2, y, part, 2, rows, n, split);
+    }
+    if comptime!(rows > 3) {
+        vec_store::<F, L>(&mut red, a3, y, part, 3, rows, n, split);
     }
 }

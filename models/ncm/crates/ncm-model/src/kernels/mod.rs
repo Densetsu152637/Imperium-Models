@@ -9,6 +9,7 @@ mod argmax;
 mod assign;
 mod delta;
 mod gemv;
+mod norm;
 mod quant;
 mod retrieval;
 
@@ -20,6 +21,65 @@ use burn_cubecl::cubecl::{CubeCount, CubeDim};
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 use burn_cubecl::{CubeBackend, cubecl};
+
+/// [`norm::rms_norm_kernel`] over `x` `[rows, d]`, after adding `delta` when given.
+fn launch_rms_norm(
+    x: CubeTensor,
+    delta: Option<CubeTensor>,
+    gamma: CubeTensor,
+    eps: f64,
+) -> CubeTensor {
+    let [rows, d] = x.meta.shape().dims::<2>();
+    let add = delta.is_some();
+    let out = empty_like(&x, if add { vec![2, rows, d] } else { vec![rows, d] });
+    let units = d.div_ceil(4).next_power_of_two().clamp(32, norm::MAX_UNITS);
+    let dtype = elem(x.dtype);
+    let client = x.client.clone();
+    let delta = delta.unwrap_or_else(|| x.clone());
+    unsafe {
+        norm::rms_norm_kernel::launch_unchecked(
+            &client,
+            CubeCount::Static(rows as u32, 1, 1),
+            CubeDim::new_1d(units as u32),
+            x.into_tensor_arg(),
+            delta.into_tensor_arg(),
+            gamma.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            d,
+            if add { rows * d } else { 0 },
+            eps as f32,
+            add,
+            dtype,
+        );
+    }
+    out
+}
+
+/// Cubes per SM the GEMV grids aim for.
+const GEMV_WAVES: usize = 2;
+
+/// Adds the `splits` f32 partials `part` `[splits, count]` into `y` (`count` elements).
+fn gemv_sum(
+    client: &cubecl::client::Client,
+    part: CubeTensor,
+    y: CubeTensor,
+    count: usize,
+    splits: usize,
+    dtype: ElemType,
+) {
+    unsafe {
+        gemv::gemv_sum_kernel::launch_unchecked(
+            client,
+            CubeCount::Static(count.div_ceil(gemv::CUBE) as u32, 1, 1),
+            CubeDim::new_1d(gemv::CUBE as u32),
+            part.into_tensor_arg(),
+            y.into_tensor_arg(),
+            count,
+            splits,
+            dtype,
+        );
+    }
+}
 
 /// The element type a kernel is defined for, from a tensor's dtype.
 fn elem(dtype: DType) -> ElemType {
@@ -128,6 +188,18 @@ pub trait NcmKernels: Backend {
         at: usize,
     ) -> FloatTensor<Self>;
 
+    /// See [`rms_norm`]: `x` `[rows, d]` to `[rows, d]`.
+    fn ncm_rms_norm(x: FloatTensor<Self>, gamma: FloatTensor<Self>, eps: f64) -> FloatTensor<Self>;
+
+    /// See [`add_rms_norm`]: `x`, `delta` `[rows, d]` to `[2, rows, d]` (the sum, then the
+    /// normed sum).
+    fn ncm_add_rms_norm(
+        x: FloatTensor<Self>,
+        delta: FloatTensor<Self>,
+        gamma: FloatTensor<Self>,
+        eps: f64,
+    ) -> FloatTensor<Self>;
+
     /// See [`assign_into_at`].
     fn ncm_assign_at(
         dst: FloatTensor<Self>,
@@ -197,6 +269,46 @@ impl NcmKernels for CubeBackend {
             }
             return y;
         }
+        // Row-major weight: vector loads of consecutive columns, 16 bytes when the width allows
+        // (else 8 or 4).
+        let widest = 16 / x.dtype.size();
+        let fits = |v: usize| n.is_multiple_of(v) && strides[0].is_multiple_of(v);
+        let v = [widest, widest / 2, widest / 4].into_iter().find(|&v| v >= 2 && fits(v));
+        if let (1, Some(v)) = (strides[1], v) {
+            use gemv::{VEC_COLS, VEC_K, VEC_LANES};
+            let sms = client.properties().hardware.num_streaming_multiprocessors.unwrap_or(84);
+            let tiles = n.div_ceil(VEC_COLS * v);
+            // About GEMV_WAVES cubes per SM, each lane at least a few K rows, at most VEC_K per cube.
+            let want = (GEMV_WAVES * sms as usize).div_ceil(tiles);
+            let most = k.div_ceil(VEC_LANES * 4).max(1);
+            let splits = want.clamp(1, most).max(k.div_ceil(VEC_K));
+            let k_split = k.div_ceil(splits);
+            let splits = k.div_ceil(k_split);
+            let part =
+                scratch(&x, vec![if splits > 1 { splits * rows * n } else { 1 }], DType::F32);
+            unsafe {
+                gemv::gemv_vec_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(tiles as u32, splits as u32, 1),
+                    CubeDim::new_1d(CUBE as u32),
+                    v,
+                    x.into_tensor_arg(),
+                    w.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    part.clone().into_tensor_arg(),
+                    k,
+                    n,
+                    k_split,
+                    rows,
+                    splits > 1,
+                    dtype,
+                );
+            }
+            if splits > 1 {
+                gemv_sum(&client, part, y.clone(), rows * n, splits, dtype);
+            }
+            return y;
+        }
         // Enough cubes to keep every SM reading: split K when N alone gives too few tiles.
         let tiles = n.div_ceil(COLS);
         let mut splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(COLS).max(1));
@@ -251,6 +363,37 @@ impl NcmKernels for CubeBackend {
         let out = empty_like(&x, vec![rows, n_len]);
         let dtype = elem(x.dtype);
         let client = x.client.clone();
+        // Vectors of words per load when every vector lies in one scale group: four (16 bytes)
+        // for q8; two for q4, whose decoding rather than its loads limits it.
+        let vec = if bits == 4 { 2 } else { 4 };
+        let strides = packed.meta.strides().to_vec();
+        if rows * (d_in + d_in / 32 + 1) <= quant::QX
+            && strides[1] == 1
+            && strides[0].is_multiple_of(vec)
+            && words.is_multiple_of(vec)
+            && group_words.is_multiple_of(vec)
+        {
+            unsafe {
+                quant::qgemv_vec_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(n_len.div_ceil(quant::QPLANES) as u32, 1, 1),
+                    CubeDim::new_2d(PLANE as u32, quant::QPLANES as u32),
+                    vec,
+                    x.into_tensor_arg(),
+                    packed.into_tensor_arg(),
+                    scales.into_tensor_arg(),
+                    out.clone().into_tensor_arg(),
+                    d_in,
+                    n_len,
+                    words,
+                    bits,
+                    rows,
+                    group_words,
+                    dtype,
+                );
+            }
+            return out;
+        }
         unsafe {
             quant::qgemv_kernel::launch_unchecked(
                 &client,
@@ -359,6 +502,19 @@ impl NcmKernels for CubeBackend {
             );
         }
         dst
+    }
+
+    fn ncm_rms_norm(x: CubeTensor, gamma: CubeTensor, eps: f64) -> CubeTensor {
+        launch_rms_norm(x, None, gamma, eps)
+    }
+
+    fn ncm_add_rms_norm(
+        x: CubeTensor,
+        delta: CubeTensor,
+        gamma: CubeTensor,
+        eps: f64,
+    ) -> CubeTensor {
+        launch_rms_norm(x, Some(delta), gamma, eps)
     }
 
     fn ncm_argmax(x: CubeTensor) -> CubeTensor {
@@ -668,6 +824,38 @@ pub fn assign_into_at<const D: usize>(
 ) {
     let (dst, at) = (dst.clone().into_dispatch(), at.clone().into_dispatch());
     drop(<Dispatch as NcmKernels>::ncm_assign_at(dst, src.into_dispatch(), axis, at));
+}
+
+/// RMSNorm of `x` `[..., d]` over its last axis with weight `gamma` `[d]` in one kernel, as
+/// `burn::nn::RmsNorm` computes it at the run dtype (only the order of the f32 sum differs).
+pub fn rms_norm<const D: usize>(x: Tensor<D>, gamma: Tensor<1>, eps: f64) -> Tensor<D> {
+    let dims = x.dims();
+    let d = dims[D - 1];
+    let x = x.reshape([dims.iter().product::<usize>() / d, d]);
+    let y = <Dispatch as NcmKernels>::ncm_rms_norm(x.into_dispatch(), gamma.into_dispatch(), eps);
+    Tensor::<2>::from_dispatch(y).reshape(dims)
+}
+
+/// The residual add `s = x + delta` and the RMSNorm of `s` (as [`rms_norm`]) in one kernel;
+/// returns `(s, norm(s))`.
+pub fn add_rms_norm<const D: usize>(
+    x: Tensor<D>,
+    delta: Tensor<D>,
+    gamma: Tensor<1>,
+    eps: f64,
+) -> (Tensor<D>, Tensor<D>) {
+    let dims = x.dims();
+    let d = dims[D - 1];
+    let rows = dims.iter().product::<usize>() / d;
+    let (x, delta) = (x.reshape([rows, d]), delta.reshape([rows, d]));
+    let out = <Dispatch as NcmKernels>::ncm_add_rms_norm(
+        x.into_dispatch(),
+        delta.into_dispatch(),
+        gamma.into_dispatch(),
+        eps,
+    );
+    let out = Tensor::<3>::from_dispatch(out);
+    (out.clone().narrow(0, 0, 1).reshape(dims), out.narrow(0, 1, 1).reshape(dims))
 }
 
 /// `x` itself when its layout is packed row-major, otherwise a packed copy (cubecl pitches the

@@ -101,3 +101,15 @@ fn graphed_tok_step_matches_eager_bf16() {
         graphed_tok_matches(&device, Some(spec));
     }
 }
+
+#[test]
+fn norm_matches_reference_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    norm_matches(&device, TOL);
+}
+
+#[test]
+fn graphed_step_survives_reset_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_step_survives_reset(&device);
+}

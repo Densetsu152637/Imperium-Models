@@ -77,12 +77,12 @@ impl DraftBlock {
         mask: Option<Tensor<2, Bool>>,
     ) -> Tensor<4> {
         let [b, m, k, d] = x.dims();
-        let h = self.n1.forward(x.clone()).reshape([b * m, k, d]);
+        let h = crate::fused::rms_norm(&self.n1, x.clone()).reshape([b * m, k, d]);
         // Every slot sees every other: no slot holds a token yet.
         let x = x + self.self_attn.forward_masked(h, rope_self, None).reshape([b, m, k, d]);
-        let h = self.n2.forward(x.clone()).reshape([b, m * k, d]);
+        let h = crate::fused::rms_norm(&self.n2, x.clone()).reshape([b, m * k, d]);
         let x = x + self.cross.forward(h, rope_q, keys, values, mask).reshape([b, m, k, d]);
-        x.clone() + self.mlp.forward(self.n3.forward(x))
+        x.clone() + self.mlp.forward(crate::fused::rms_norm(&self.n3, x))
     }
 }
 
@@ -128,7 +128,7 @@ impl DraftHead {
     /// Logits for states `[B, T, d]` through `model`'s output head (the tied embedding, or its
     /// quantised copy).
     pub(crate) fn logits(&self, model: &NcmLm, x: Tensor<3>) -> Tensor<3> {
-        model.project(self.norm.forward(x))
+        model.project(crate::fused::rms_norm(&self.norm, x))
     }
 }
 

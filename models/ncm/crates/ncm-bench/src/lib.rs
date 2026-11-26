@@ -252,7 +252,13 @@ enum Decode {
 /// Prefill the prompt, then greedily decode `new_tokens` tokens; returns the timings.
 ///
 /// The token baseline prefills all but the last prompt token and decodes from that one, so its
-/// decode loop produces exactly `new_tokens` tokens like the NCM loop does. It ignores `mode`.
+/// decode loop produces `new_tokens` tokens like the NCM loop does. It ignores `mode`.
+///
+/// Graph captures stay out of the timed decode: the decode graphs are captured (their warm-up
+/// runs undone) before the clock starts. The NCM's first concept, written from the prompt's
+/// condition before the concept step can serve, is untimed as well, and so is the first
+/// speculative concept (which captures the draft and verify graphs); the rate counts the
+/// tokens of the timed loop only.
 fn run_once(
     model: &Model,
     prompt: &Tensor<2, Int>,
@@ -262,68 +268,82 @@ fn run_once(
 ) -> Run {
     let context = prompt.dims()[1];
     let mut spec = None;
-    let (started, prefilled) = match model {
+    // Host time of each step call of the timed loop.
+    let mut calls = Vec::new();
+    let mut timed = |f: &mut dyn FnMut()| {
+        let t0 = Instant::now();
+        f();
+        calls.push(t0.elapsed().as_secs_f64());
+    };
+    let (started, prefilled, from, timed_tokens) = match model {
         Model::Ncm(m) => {
             let mut cache = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let mut cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK);
+            let cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK);
             sync(device);
             let prefilled = Instant::now();
-            let concepts = new_tokens / m.concept_size();
+            let k = m.concept_size();
+            let concepts = new_tokens / k;
             match mode {
                 Decode::Plain => {
-                    // The first concept decodes eagerly from the prompt's condition. On CUDA
-                    // with the fused kernels on, every later concept is one captured graph
-                    // replay: append the concept just written, then decode the next one
-                    // (captured once the cross-attention ring is full).
+                    // On CUDA with the fused kernels on, every concept after the first is one
+                    // captured graph replay: append the concept just written, then decode the
+                    // next one (captured once the cross-attention ring is full).
                     let (mut tokens, _) = m.decode_concept(cond, &mut cache, None, false);
                     #[cfg(feature = "cuda")]
                     let mut graphed = ncm_model::ncm::GraphedStep::default();
+                    #[cfg(feature = "cuda")]
+                    graphed.prepare(m, &tokens, &mut cache);
+                    sync(device);
+                    let from = Instant::now();
                     for _ in 1..concepts {
-                        #[cfg(feature = "cuda")]
-                        {
-                            tokens = graphed.step(m, tokens, &mut cache);
-                        }
-                        #[cfg(not(feature = "cuda"))]
-                        {
-                            let cond = m.append_tokens(tokens, &mut cache);
-                            tokens = m.decode_concept(cond, &mut cache, None, false).0;
-                        }
+                        timed(&mut || {
+                            #[cfg(feature = "cuda")]
+                            {
+                                tokens = graphed.step(m, tokens.clone(), &mut cache);
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            {
+                                let cond = m.append_tokens(tokens.clone(), &mut cache);
+                                tokens = m.decode_concept(cond, &mut cache, None, false).0;
+                            }
+                        });
                     }
-                    drop(tokens);
                     #[cfg(feature = "cuda")]
                     if let Some(why) = graphed.failure() {
                         eprintln!("ncm-bench: concept step not captured, eager: {why}");
                     }
+                    (started, prefilled, from, (concepts - 1) * k)
                 }
                 Decode::Speculative(acceptance) => {
                     // The draft and verify passes replay CUDA graphs likewise, and so does
                     // appending each written concept.
                     let mut speculator = Speculator::new(acceptance);
+                    let mut tokens = speculator.decode(m, cond, &cache);
                     #[cfg(feature = "cuda")]
                     let mut append = ncm_model::ncm::GraphedAppend::default();
-                    for c in 0..concepts {
-                        let tokens = speculator.decode(m, cond.clone(), &cache);
-                        if c + 1 < concepts {
+                    #[cfg(feature = "cuda")]
+                    append.prepare(m, &tokens, &mut cache);
+                    sync(device);
+                    let from = Instant::now();
+                    for _ in 1..concepts {
+                        timed(&mut || {
                             #[cfg(feature = "cuda")]
-                            {
-                                cond = append.append(m, tokens, &mut cache);
-                            }
+                            let cond = append.append(m, tokens.clone(), &mut cache);
                             #[cfg(not(feature = "cuda"))]
-                            {
-                                cond = m.append_tokens(tokens, &mut cache);
-                            }
-                        }
+                            let cond = m.append_tokens(tokens.clone(), &mut cache);
+                            tokens = speculator.decode(m, cond, &cache);
+                        });
                     }
                     #[cfg(feature = "cuda")]
                     if let Some(why) = speculator.failure().or(append.failure()) {
                         eprintln!("ncm-bench: speculative graphs not captured, eager: {why}");
                     }
                     spec = Some(speculator.stats());
+                    (started, prefilled, from, (concepts - 1) * k)
                 }
             }
-            (started, prefilled)
         }
         Model::Tok(m) => {
             let mut caches = m.make_cache(context + new_tokens, 1, device);
@@ -337,40 +357,57 @@ fn run_once(
             // (embedding, stack, logits, argmax), as the NCM's concept steps are.
             #[cfg(feature = "cuda")]
             let mut graphed = ncm_model::tok::GraphedTok::default();
+            #[cfg(feature = "cuda")]
+            graphed.prepare(m, &token, &mut caches);
+            sync(device);
+            let from = Instant::now();
             for _ in 0..new_tokens {
-                #[cfg(feature = "cuda")]
-                {
-                    token = graphed.step(m, token, &mut caches);
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    token = argmax_last(m.step(token, &mut caches)).reshape([1, 1]);
-                }
+                timed(&mut || {
+                    #[cfg(feature = "cuda")]
+                    {
+                        token = graphed.step(m, token.clone(), &mut caches);
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        token = argmax_last(m.step(token.clone(), &mut caches)).reshape([1, 1]);
+                    }
+                });
             }
             #[cfg(feature = "cuda")]
             if let Some(why) = graphed.failure() {
                 eprintln!("ncm-bench: token step not captured, eager: {why}");
             }
-            (started, prefilled)
+            (started, prefilled, from, new_tokens)
         }
     };
     let enqueued = Instant::now();
     sync(device);
     let done = Instant::now();
+    let steps = calls.len();
     Run {
         prefill_s: prefilled.duration_since(started).as_secs_f64(),
-        decode_s: done.duration_since(prefilled).as_secs_f64(),
-        enqueue_s: enqueued.duration_since(prefilled).as_secs_f64(),
+        decode_s: done.duration_since(from).as_secs_f64(),
+        enqueue_s: enqueued.duration_since(from).as_secs_f64(),
+        host_s: if steps == 0 { 0.0 } else { median(&mut calls) * steps as f64 },
+        timed_tokens,
         spec,
     }
 }
 
-/// Timings of one run. `enqueue_s` is the decode time before the final device sync: close to
-/// `decode_s` means the host, not the GPU, is the bottleneck.
+/// Timings of one run, decode counted over the timed loop only.
+///
+/// `enqueue_s` is the decode time before the final device sync. It overstates the host's work
+/// when the GPU is the bottleneck: the host then blocks inside launches once the launch queue
+/// is full. `host_s` estimates the host's own work instead: the median host time of one step
+/// call (the unblocked cost) times the steps. `host_s` near `decode_s` means the host is the
+/// bottleneck.
 struct Run {
     prefill_s: f64,
     decode_s: f64,
     enqueue_s: f64,
+    host_s: f64,
+    /// Tokens the timed loop wrote.
+    timed_tokens: usize,
     /// Speculative runs: what the speculator did.
     spec: Option<SpecStats>,
 }
@@ -436,23 +473,28 @@ fn bench_model(
         // Warm-up: compile kernels, fill pools.
         run_once(&model, &warm, 2 * unit, Decode::Plain, device);
         let (mut prefills, mut decodes, mut enqueues) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut hosts, mut rates) = (Vec::new(), Vec::new());
         for _ in 0..cli.repeats {
             let run = run_once(&model, &prompt, new_tokens, Decode::Plain, device);
             prefills.push(run.prefill_s);
             decodes.push(run.decode_s);
             enqueues.push(run.enqueue_s);
+            hosts.push(run.host_s / run.decode_s);
+            rates.push(run.timed_tokens as f64 / run.decode_s);
         }
         let reserved = device.memory_pool_usage().map(|u| u.bytes_reserved);
         // The design's cache (8-bit indexer keys in v2) and what the reference allocates.
         let cache = cache_bytes(cfg, context + new_tokens, itemsize, 1);
         let allocated = cache_bytes_with(cfg, context + new_tokens, itemsize, itemsize, 1);
-        let decode_tok_s = new_tokens as f64 / median(&mut decodes.clone());
+        let decode_tok_s = median(&mut rates);
         let prefill_s = median(&mut prefills.clone());
-        let host_share = median(&mut enqueues.clone()) / median(&mut decodes.clone());
+        let host_share = median(&mut hosts.clone());
+        let enqueue_share = median(&mut enqueues.clone()) / median(&mut decodes.clone());
         println!(
             "  ctx {context:>7}: prefill {prefill_s:.3}s  decode {decode_tok_s:.1} tok/s  \
-             host {:.0}%  reserved {}  cache {}",
+             host {:.0}% (enqueue {:.0}%)  reserved {}  cache {}",
             host_share * 100.0,
+            enqueue_share * 100.0,
             reserved.map_or("n/a".into(), fmt_bytes),
             fmt_bytes(cache as u64),
         );
@@ -468,6 +510,7 @@ fn bench_model(
                 "prefill_s": prefill_s,
                 "decode_tok_s": decode_tok_s,
                 "decode_host_share": host_share,
+                "decode_enqueue_share": enqueue_share,
                 "decode_s_runs": decodes,
                 "prefill_s_runs": prefills,
                 "reserved_memory_bytes": reserved,
@@ -516,17 +559,18 @@ fn bench_speculative(
             Model::Tok(_) => 1,
         };
         run_once(model, warm, 2 * unit, mode, device);
-        let (mut decodes, mut stats) = (Vec::new(), SpecStats::default());
+        let (mut decodes, mut rates, mut stats) = (Vec::new(), Vec::new(), SpecStats::default());
         for _ in 0..cli.repeats {
             let run = run_once(model, prompt, new_tokens, mode, device);
             decodes.push(run.decode_s);
+            rates.push(run.timed_tokens as f64 / run.decode_s);
             let s = run.spec.expect("a speculative run reports its stats");
             stats.concepts += s.concepts;
             stats.verify_passes += s.verify_passes;
             stats.judged += s.judged;
             stats.accepted += s.accepted;
         }
-        let tok_s = new_tokens as f64 / median(&mut decodes.clone());
+        let tok_s = median(&mut rates);
         let speedup = tok_s / plain_tok_s;
         let (label, assumed) = match acceptance {
             Acceptance::Verify => ("real verification (random weights)".to_string(), None),

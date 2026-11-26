@@ -25,7 +25,7 @@ fn quantised_tiny_models_bf16() {
     tiny_models_match(&device, 0.05, 0.05);
 }
 
-/// Timing only (`--ignored --nocapture`, release build): dense, q8 and q4 one-row products.
+/// Timing only (`--ignored --nocapture`, release build): dense, q8 and q4 decode products.
 #[test]
 #[ignore = "timing run, not a check"]
 fn gemv_timing_bf16() {

@@ -170,12 +170,7 @@ impl GraphedTok {
         let device = token.device();
         let [b, t] = token.dims();
         if t == 1 && crate::fused::graphs_active(&device) {
-            if matches!(self.state, TokState::Untried) {
-                self.state = match model.capture_step(&token, caches) {
-                    Ok(graph) => TokState::Ready(Box::new(graph)),
-                    Err(e) => TokState::Failed(e),
-                };
-            }
+            self.prepare(model, &token, caches);
             if let TokState::Ready(g) = &mut self.state {
                 let token = token.cast(burn::tensor::IntDType::I32);
                 crate::kernels::assign_int_into(&g.input, token, 0, 0);
@@ -191,6 +186,25 @@ impl GraphedTok {
             }
         }
         crate::fused::argmax_last(model.step(token, caches)).reshape([b, 1])
+    }
+
+    /// Captures the graph now (if none is ready and it can serve a step from `token` `[B, 1]`),
+    /// so that the capture's warm-up runs stay out of a timed loop. Leaves the caches as they
+    /// were; returns whether a graph is ready.
+    pub fn prepare(
+        &mut self,
+        model: &TokenLm,
+        token: &Tensor<2, Int>,
+        caches: &mut [LayerCache],
+    ) -> bool {
+        let eligible = token.dims()[1] == 1 && crate::fused::graphs_active(&token.device());
+        if matches!(self.state, TokState::Untried) && eligible {
+            self.state = match model.capture_step(token, caches) {
+                Ok(graph) => TokState::Ready(Box::new(graph)),
+                Err(e) => TokState::Failed(e),
+            };
+        }
+        self.is_captured()
     }
 
     /// Why the step runs eagerly, if a capture was tried and failed.

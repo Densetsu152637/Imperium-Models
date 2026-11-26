@@ -45,7 +45,7 @@ target/release/ncm-bench --model ncm --design v2 --device cuda --context 2048 16
 
 `cuda` builds need a local CUDA toolkit. `.cargo/config.toml` sets `CUDARC_CUDA_VERSION=13040` because cudarc (under burn-cuda) only lists CUDA up to 13.4 and rejects 13.5; the 13.x runtime is ABI compatible. CI never builds the `cuda` feature.
 
-The benchmark uses random weights, batch 1 and greedy decode with caches. Prefill is timed separately, decode tok/s counts output tokens (median of `--repeats`), and the NCM/token ratio is graded PASS (1.5x or more), WEAK (1.2x to 1.5x) or FAIL. The `host` column is the share of decode time spent enqueueing work: near 100% means the run is bound by host op dispatch, not the GPU.
+The benchmark uses random weights, batch 1 and greedy decode with caches. Prefill is timed separately, decode tok/s counts output tokens (median of `--repeats`), and the NCM/token ratio is graded PASS (1.5x or more), WEAK (1.2x to 1.5x) or FAIL. Decode graphs are captured before the decode clock starts, and the NCM's first concept (written from the prompt's condition before the concept step can serve) is not timed; the rate counts the timed tokens. The `host` column estimates the host's own share of decode time (the median host time of one step call, times the steps): near 100% means the run is bound by host op dispatch, not the GPU. `enqueue` is the decode time before the final device sync, which also counts the host blocking on a full launch queue when the GPU is the bottleneck.
 
 ## Stage 1 result
 

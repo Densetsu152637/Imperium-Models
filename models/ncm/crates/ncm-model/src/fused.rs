@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use burn::nn::RmsNorm;
 use burn::tensor::{Device, Int, Tensor};
 
 static FUSED_KERNELS: AtomicBool = AtomicBool::new(true);
@@ -73,6 +74,31 @@ pub fn argmax_last<const D: usize>(x: Tensor<D>) -> Tensor<D, Int> {
         return crate::kernels::argmax_last(x);
     }
     x.argmax(D - 1)
+}
+
+/// `norm.forward(x)`: one kernel on CUDA when the fused kernels are active
+/// ([`crate::kernels::rms_norm`]), Burn's ops otherwise.
+pub fn rms_norm<const D: usize>(norm: &RmsNorm, x: Tensor<D>) -> Tensor<D> {
+    #[cfg(feature = "cuda")]
+    if active(&x.device()) {
+        return crate::kernels::rms_norm(x, norm.gamma.val(), norm.epsilon);
+    }
+    norm.forward(x)
+}
+
+/// The residual add `x + delta` and its norm, `(s, norm.forward(s))`: one kernel on CUDA when
+/// the fused kernels are active ([`crate::kernels::add_rms_norm`]), Burn's ops otherwise.
+pub fn add_rms_norm<const D: usize>(
+    norm: &RmsNorm,
+    x: Tensor<D>,
+    delta: Tensor<D>,
+) -> (Tensor<D>, Tensor<D>) {
+    #[cfg(feature = "cuda")]
+    if active(&x.device()) {
+        return crate::kernels::add_rms_norm(x, delta, norm.gamma.val(), norm.epsilon);
+    }
+    let s = x + delta;
+    (s.clone(), norm.forward(s))
 }
 
 /// `x W` for a dense weight `w` `[K, N]` (row-major, or the transpose of a row-major `[N, K]`):

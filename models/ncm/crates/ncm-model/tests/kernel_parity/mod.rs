@@ -50,9 +50,14 @@ pub fn argmax_matches(device: &Device) {
 pub fn gemv_matches(device: &Device, tol: f32) {
     device.seed(4);
     let normal = Distribution::Normal(0.0, 1.0);
-    for (rows, k, n) in
-        [(1, 1024, 4112), (1, 2240, 1024), (4, 512, 1536), (3, 37, 70), (2, 5000, 64)]
-    {
+    for (rows, k, n) in [
+        (1, 1024, 4112),
+        (1, 2240, 1024),
+        (4, 512, 1536),
+        (1, 1024, 3780),
+        (3, 37, 70),
+        (2, 5000, 64),
+    ] {
         let x = Tensor::<3>::random([1, rows, k], normal, device);
         let w = Tensor::<2>::random([k, n], normal, device);
         let got = values(ncm_model::kernels::gemv(x.clone(), w.clone()));
@@ -69,6 +74,41 @@ pub fn gemv_matches(device: &Device, tol: f32) {
         let err = rel_error(&got, &want);
         eprintln!("gemv transposed {rows}x{k}x{n}: error over scale {err:.2e}");
         assert!(err <= tol, "gemv transposed {rows}x{k}x{n}: error {err:.2e}");
+    }
+}
+
+/// The fused RMSNorm kernels (plain, and after a residual add) against Burn's `RmsNorm` on the
+/// CPU in f32 with the same weights and inputs: the models' widths at one and four rows,
+/// QK-norm's per-head rows, and a strided (narrowed) input. Also against the CUDA reference
+/// path, whose rounding the kernel mirrors.
+pub fn norm_matches(device: &Device, tol: f32) {
+    use burn::nn::RmsNormConfig;
+    device.seed(5);
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (rows, d) in [(1, 1024), (4, 512), (32, 64), (3, 1000)] {
+        let norm = RmsNormConfig::new(d).with_epsilon(1e-6).init(device);
+        let gamma = Tensor::<1>::random([d], normal, device);
+        let norm = burn::nn::RmsNorm { gamma: Param::from_tensor(gamma), ..norm };
+        let wide = Tensor::<3>::random([1, rows, d + 8], normal, device);
+        let x = wide.narrow(2, 4, d);
+        let delta = Tensor::<3>::random([1, rows, d], normal, device);
+        let cpu_norm = cpu_copy(&norm);
+        let want = values(cpu_norm.forward(to_cpu(&x)));
+        let cuda_ref = values(reference(|| norm.forward(x.clone())));
+        let got = values(ncm_model::fused::rms_norm(&norm, x.clone()));
+        assert_close(&format!("rms_norm {rows}x{d}"), &got, &cuda_ref, &want, tol);
+        let sum_want = to_cpu(&x) + to_cpu(&delta);
+        let want = values(cpu_norm.forward(sum_want.clone()));
+        let (sum, normed) = ncm_model::fused::add_rms_norm(&norm, x.clone(), delta.clone());
+        let cuda_ref = values(reference(|| norm.forward(x.clone() + delta.clone())));
+        assert_close(
+            &format!("add_rms_norm sum {rows}x{d}"),
+            &values(sum),
+            &values(sum_want.clone()),
+            &values(sum_want),
+            tol,
+        );
+        assert_close(&format!("add_rms_norm {rows}x{d}"), &values(normed), &cuda_ref, &want, tol);
     }
 }
 
@@ -145,6 +185,32 @@ pub fn graphed_step_matches(device: &Device, spec: Option<QuantSpec>) {
         for (concept, (te, tg)) in eager.iter().zip(&graphed).enumerate() {
             assert_eq!(tg, te, "{} concept {concept}: tokens differ", cfg.attention.name());
         }
+    }
+}
+
+/// One [`GraphedStep`] kept across [`ncm_model::NcmCache::reset`]: the reset replaces buffers
+/// the graph was captured against, so the step must capture anew and decode the same prompt to
+/// the same tokens as before (both designs).
+pub fn graphed_step_survives_reset(device: &Device) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        let model = build_ncm(&cfg, None, device);
+        let mut cache = model.make_cache(64 + 4 * 8 + 4, 1, device);
+        let mut graphed = GraphedStep::default();
+        let mut run = |cache: &mut ncm_model::NcmCache| {
+            let cond = model.prefill(ncm_prompt(device), cache, 16);
+            let (mut next, _) = model.decode_concept(cond, cache, None, false);
+            let mut tokens = Vec::new();
+            for _ in 0..8 {
+                next = graphed.step(&model, next, cache);
+                tokens.push(ints(next.clone()));
+            }
+            assert!(graphed.is_captured(), "concept step graph: {:?}", graphed.failure());
+            tokens
+        };
+        let first = run(&mut cache);
+        cache.reset();
+        let second = run(&mut cache);
+        assert_eq!(second, first, "{}: tokens after a reset differ", cfg.attention.name());
     }
 }
 

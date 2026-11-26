@@ -20,9 +20,10 @@ use burn::tensor::{Bool, Device, Int, Tensor};
 
 use crate::cache::{KvCache, LayerCache, build_mask, layer_cache_bytes};
 use crate::config::{Design, NcmConfig};
+use crate::fused::{add_rms_norm, rms_norm as rms_norm_fused};
 use crate::layers::{
     Attention, CrossAttention, LayerKind, Mlp, Rope, Stack, StackSpec, fallback_kinds,
-    hybrid_kinds, init_normal, linear, rms_norm,
+    hybrid_kinds, init_normal, linear, norm_after, rms_norm,
 };
 use crate::quant::{QLinear as Linear, tied_head};
 use crate::speculative::DraftHead;
@@ -65,11 +66,11 @@ impl DecoderBlock {
         mask: Option<Tensor<2, Bool>>,
     ) -> Tensor<4> {
         let [b, m, k, d] = x.dims();
-        let h = self.n1.forward(x.clone()).reshape([b * m, k, d]);
+        let h = rms_norm_fused(&self.n1, x.clone()).reshape([b * m, k, d]);
         let x = x + self.self_attn.forward_masked(h, rope_self, Some(causal)).reshape([b, m, k, d]);
-        let h = self.n2.forward(x.clone()).reshape([b, m * k, d]);
+        let h = rms_norm_fused(&self.n2, x.clone()).reshape([b, m * k, d]);
         let x = x + self.cross.forward(h, rope_q, keys, values, mask).reshape([b, m, k, d]);
-        x.clone() + self.mlp.forward(self.n3.forward(x))
+        x.clone() + self.mlp.forward(rms_norm_fused(&self.n3, x))
     }
 
     fn step(
@@ -79,11 +80,16 @@ impl DecoderBlock {
         rope_q: &Rope,
         self_cache: &mut KvCache,
         cross_cache: &KvCache,
-    ) -> Tensor<3> {
-        let x = x.clone() + self.self_attn.forward(self.n1.forward(x), rope_self, Some(self_cache));
+        pending: Option<Tensor<3>>,
+    ) -> (Tensor<3>, Tensor<3>) {
+        // As `Block::forward`: `pending`, the previous layer's MLP output, is added together with
+        // the first norm, and this layer's MLP output is returned pending.
+        let (x, h) = norm_after(&self.n1, x, pending);
+        let attn = self.self_attn.forward(h, rope_self, Some(self_cache));
+        let (x, h) = add_rms_norm(&self.n2, x, attn);
         let (keys, values) = cross_cache.view();
-        let x = x.clone() + self.cross.forward(self.n2.forward(x), rope_q, keys, values, None);
-        x.clone() + self.mlp.forward(self.n3.forward(x))
+        let (x, h) = add_rms_norm(&self.n3, x, self.cross.forward(h, rope_q, keys, values, None));
+        (x, self.mlp.forward(h))
     }
 }
 
@@ -100,6 +106,16 @@ pub struct NcmCache {
     /// One-concept backbone steps of [`NcmLm::append_tokens`] as a replayed CUDA graph (on CUDA).
     #[cfg(feature = "cuda")]
     pub backbone_graph: crate::layers::GraphedStack,
+    /// Unique to this cache's buffers: a new value on every [`Self::reset`], which replaces
+    /// buffers graphs captured against (graphs check it before replaying).
+    epoch: u64,
+}
+
+/// The source of [`NcmCache`] epochs.
+static EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_epoch() -> u64 {
+    EPOCHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl NcmCache {
@@ -115,6 +131,7 @@ impl NcmCache {
         self.backbone.iter_mut().chain(&mut self.encoder).for_each(LayerCache::reset);
         self.cross.iter_mut().chain(&mut self.dec_self).for_each(KvCache::reset);
         self.tokens = 0;
+        self.epoch = next_epoch();
         // Resetting replaces the DeltaNet state buffers the graph was recorded against.
         #[cfg(feature = "cuda")]
         {
@@ -277,7 +294,7 @@ impl NcmLm {
     }
 
     fn logits(&self, x: Tensor<3>) -> Tensor<3> {
-        self.project(self.dec_norm.forward(x))
+        self.project(rms_norm_fused(&self.dec_norm, x))
     }
 
     /// Normed states `[B, T, d]` to logits through the output head: its quantised copy when the
@@ -385,6 +402,7 @@ impl NcmLm {
                 })
                 .collect(),
             tokens: 0,
+            epoch: next_epoch(),
             #[cfg(feature = "cuda")]
             backbone_graph: Default::default(),
         }
@@ -485,10 +503,12 @@ impl NcmLm {
             let (rs, rq) = (rope_self.rows(j, 1), rope_q.rows(j, 1));
             let layers =
                 self.dec_blocks.iter().zip(cache.dec_self.iter_mut()).zip(cache.cross.iter());
+            let mut pending = None;
             for ((blk, self_cache), cross_cache) in layers {
-                x = blk.step(x, &rs, &rq, self_cache, cross_cache);
+                let (next, out) = blk.step(x, &rs, &rq, self_cache, cross_cache, pending);
+                (x, pending) = (next, Some(out));
             }
-            let lg = self.logits(x);
+            let lg = self.project(norm_after(&self.dec_norm, x, pending).1);
             let next = pick(j, &lg);
             if want_logits {
                 logits.push(lg);
@@ -719,8 +739,9 @@ fn greedy(_: usize, logits: &Tensor<3>) -> Tensor<2, Int> {
 /// positions advance. Both designs.
 ///
 /// On other devices, with the fused kernels or graphs off, before the ring fills, or if the
-/// capture fails, [`GraphedStep::step`] runs `append_tokens` and then [`GraphedDecoder`]. One
-/// `GraphedStep` serves one cache; make a new one after [`NcmCache::reset`].
+/// capture fails, [`GraphedStep::step`] runs `append_tokens` and then [`GraphedDecoder`]. A graph
+/// serves the cache it was captured against: stepping another cache, or the same one after
+/// [`NcmCache::reset`], captures anew.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
 pub struct GraphedStep {
@@ -780,8 +801,8 @@ struct StepInputs {
     rope_q: Option<(Rope, (usize, usize))>,
     /// RoPE tables of a concept's own positions (0..k) for the decoder pass.
     rope_self: Rope,
-    /// `cache.tokens` after the last replay: a smaller count means the cache was reset.
-    seen: usize,
+    /// The epoch of the cache the graph was captured against ([`NcmCache`]).
+    epoch: u64,
 }
 
 #[cfg(feature = "cuda")]
@@ -804,6 +825,19 @@ impl GraphedStep {
                 self.decoder.decode(model, cond, cache)
             }
         }
+    }
+
+    /// Captures the graph now (if it can serve the next [`Self::step`] with `tokens` of this
+    /// shape and none is ready), so that the capture's warm-up runs stay out of a timed loop.
+    /// Leaves the cache as it was; returns whether a graph is ready.
+    pub fn prepare(
+        &mut self,
+        model: &NcmLm,
+        tokens: &Tensor<2, Int>,
+        cache: &mut NcmCache,
+    ) -> bool {
+        self.state.prepare(model, tokens, cache, true);
+        self.is_captured()
     }
 
     /// Why the step runs eagerly, if a capture was tried and failed.
@@ -835,6 +869,17 @@ impl GraphedAppend {
         }
     }
 
+    /// As [`GraphedStep::prepare`], for [`Self::append`].
+    pub fn prepare(
+        &mut self,
+        model: &NcmLm,
+        tokens: &Tensor<2, Int>,
+        cache: &mut NcmCache,
+    ) -> bool {
+        self.state.prepare(model, tokens, cache, false);
+        self.is_captured()
+    }
+
     /// Why the append runs eagerly, if a capture was tried and failed.
     pub fn failure(&self) -> Option<&str> {
         self.state.failure()
@@ -861,20 +906,35 @@ impl StepState {
         if !crate::fused::graphs_active(&device) || tokens.dims()[1] != model.k {
             return None;
         }
-        let ring_full = cache.cross.iter().all(|c| c.window().is_some() && c.len() >= c.capacity());
-        if matches!(self, StepState::Untried) && ring_full {
-            *self = match model.capture_step(tokens, cache, decode) {
-                Ok(graph) => StepState::Ready(Box::new(graph)),
-                Err(e) => StepState::Failed(e),
-            };
-        }
+        self.prepare(model, tokens, cache, decode);
         let StepState::Ready(g) = self else { return None };
-        assert!(cache.tokens >= g.inputs.seen, "the cache was reset: step it with a new graph");
         g.replay(model, tokens.clone(), cache);
         Some(match &g.out {
             StepOut::Cond(c) => StepOut::Cond(c.clone()),
             StepOut::Tokens(t) => StepOut::Tokens(t.clone()),
         })
+    }
+
+    /// Captures the graph if it can serve this step now and none is ready. A graph captured
+    /// against another cache, or before the cache was reset, is dropped first.
+    fn prepare(
+        &mut self,
+        model: &NcmLm,
+        tokens: &Tensor<2, Int>,
+        cache: &mut NcmCache,
+        decode: bool,
+    ) {
+        if matches!(self, StepState::Ready(g) if g.inputs.epoch != cache.epoch) {
+            *self = StepState::Untried;
+        }
+        let ring_full = cache.cross.iter().all(|c| c.window().is_some() && c.len() >= c.capacity());
+        let eligible = crate::fused::graphs_active(&tokens.device()) && tokens.dims()[1] == model.k;
+        if matches!(self, StepState::Untried) && ring_full && eligible {
+            *self = match model.capture_step(tokens, cache, decode) {
+                Ok(graph) => StepState::Ready(Box::new(graph)),
+                Err(e) => StepState::Failed(e),
+            };
+        }
     }
 
     fn failure(&self) -> Option<&str> {
@@ -906,7 +966,6 @@ impl StepGraph {
         }
         inputs.backbone.advance(&mut cache.backbone);
         cache.tokens += k;
-        inputs.seen = cache.tokens;
     }
 }
 
@@ -973,7 +1032,7 @@ impl NcmLm {
             rope_k,
             rope_q,
             rope_self: self.rope(0, k, &device),
-            seen: cache.tokens,
+            epoch: cache.epoch,
         };
         let tokens = tokens.clone().cast(burn::tensor::IntDType::I32);
         crate::kernels::assign_int_into(&inputs.tokens, tokens, 0, 0);
