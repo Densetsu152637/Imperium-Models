@@ -921,8 +921,8 @@ impl Block {
     }
 
     /// A retrieval layer's one-token step over slots whose caches are every row of one pool
-    /// ([`SparseRetrieval::make_slot_caches`]), eagerly on CUDA: all slots in one set of
-    /// launches. None when that does not apply.
+    /// ([`SparseRetrieval::make_slot_caches`]) on CUDA, eager or captured: all slots in one set
+    /// of launches. None when that does not apply.
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn pooled_retrieval(
         &self,
@@ -930,11 +930,11 @@ impl Block {
         ropes: &[&Ropes],
         caches: &mut [&mut [LayerCache]],
         layer: usize,
-        steps: Option<&[Vec<Option<KvStep>>]>,
     ) -> Option<MixOut> {
+        // Inside a captured slot step too: each slot's StackStep stages its position into its
+        // row of the pool's position buffer, which the batched kernels read.
         #[cfg(feature = "cuda")]
         if let (Mixer::Retrieval(ret), MixInput::Projected(p)) = (&self.attn, input)
-            && steps.is_none()
             && p.dims()[1] == 1
             && crate::fused::active(&p.device())
         {
@@ -1084,7 +1084,7 @@ impl Block {
         // Each slot's mixer core on its own caches (retrieval decode of pooled slots in one set
         // of launches), then the output projection once over all rows: one weight read per
         // layer instead of one per slot.
-        let core = match self.pooled_retrieval(&input, ropes, caches, layer, steps) {
+        let core = match self.pooled_retrieval(&input, ropes, caches, layer) {
             Some(core) => core,
             None => {
                 let rows: Vec<MixOut> = caches
