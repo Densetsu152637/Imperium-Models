@@ -61,13 +61,15 @@ mod kernel {
                 let mut v = 0.0f32;
                 if inside {
                     if comptime!(identity) {
-                        let code = usize::cast_from(codes[b * n + src]);
-                        v = f32::cast_from(book[code * c + i]);
+                        let code =
+                            usize::cast_from(codes[b * codes.stride(0) + src * codes.stride(1)]);
+                        v = f32::cast_from(book[code * book.stride(0) + i * book.stride(1)]);
                     } else {
                         for m in 0..n {
-                            let code = usize::cast_from(codes[b * n + m]);
-                            v += f32::cast_from(up[src * n + m])
-                                * f32::cast_from(book[code * c + i]);
+                            let code =
+                                usize::cast_from(codes[b * codes.stride(0) + m * codes.stride(1)]);
+                            v += f32::cast_from(up[src * up.stride(0) + m * up.stride(1)])
+                                * f32::cast_from(book[code * book.stride(0) + i * book.stride(1)]);
                         }
                         v = f32::cast_from(F::cast_from(v));
                     }
@@ -79,10 +81,11 @@ mod kernel {
         sync_cube();
         let mut o = tid;
         while o < c {
-            let mut s = f32::cast_from(bias[o]);
+            let mut s = f32::cast_from(bias[o * bias.stride(0)]);
             for k in 0..3usize {
                 for i in 0..c {
-                    s += f32::cast_from(weight[o * c * 3 + i * 3 + k]) * rows[k * MAX_C + i];
+                    let at = o * weight.stride(0) + i * weight.stride(1) + k * weight.stride(2);
+                    s += f32::cast_from(weight[at]) * rows[k * MAX_C + i];
                 }
             }
             let conv = f32::cast_from(F::cast_from(s));
@@ -91,7 +94,7 @@ mod kernel {
             let bb = f32::cast_from(F::cast_from(conv * ratio));
             let mut y = f32::cast_from(F::cast_from(a + bb));
             if comptime!(add) {
-                y += f32::cast_from(acc[row * c + o]);
+                y += f32::cast_from(acc[b * acc.stride(0) + j * acc.stride(1) + o * acc.stride(2)]);
             }
             out[row * c + o] = F::cast_from(y);
             o += UNITS;
