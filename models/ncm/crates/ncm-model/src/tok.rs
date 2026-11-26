@@ -125,6 +125,32 @@ impl TokenLm {
         })
     }
 
+    /// [`Self::prefill`] of one prompt piece per batch row, the rows separate streams (slots)
+    /// each at its own position: `tokens` `[B, n]`, row i into `caches[i]` (built for batch 1),
+    /// in chunks of `chunk` tokens ([`crate::layers::Stack::forward_slots`]: the projections
+    /// and MLPs of every slot's chunk as one batch, the mixers per slot). Returns the logits of
+    /// each row's last position `[B, 1, V]`.
+    pub fn prefill_slots(
+        &self,
+        tokens: Tensor<2, Int>,
+        caches: &mut [&mut [LayerCache]],
+        chunk: usize,
+    ) -> Tensor<3> {
+        let n = tokens.dims()[1];
+        let chunk = chunk.max(1);
+        let mut last = None;
+        let mut start = 0;
+        while start < n {
+            let len = chunk.min(n - start);
+            let x = self.emb.forward(tokens.clone().narrow(1, start, len));
+            last = Some(self.stack.forward_slots(x, caches));
+            start += len;
+        }
+        let h = last.expect("prompt pieces must not be empty");
+        let len = h.dims()[1];
+        self.logits(h.narrow(1, len - 1, 1))
+    }
+
     /// One decode step for tokens `[B, 1]` whose rows are separate streams, row i with its own
     /// caches `caches[i]` (built for batch 1) at its own position: logits `[B, 1, V]`
     /// ([`crate::layers::Stack::forward_slots`]).

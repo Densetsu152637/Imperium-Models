@@ -588,13 +588,14 @@ impl NcmLm {
         drop(written.into_data());
     }
 
-    /// [`Self::append_tokens`] of one concept per batch row, the rows separate streams (slots):
-    /// `tokens` `[B, k]`, row i appended to `caches[i]` (built for batch 1). Returns each
-    /// row's next condition `[B, 1, d]`.
+    /// [`Self::append_tokens`] of whole concepts per batch row, the rows separate streams
+    /// (slots): `tokens` `[B, t]` (`t` a multiple of k: one concept per decode step, a prefill
+    /// chunk for [`Self::prefill_slots`]), row i appended to `caches[i]` (built for batch 1) at
+    /// its own position. Returns each row's next condition `[B, 1, d]`.
     pub fn append_slots(&self, tokens: Tensor<2, Int>, caches: &mut [&mut NcmCache]) -> Tensor<3> {
         let k = self.k;
         let [b, t] = tokens.dims();
-        assert!(t == k && b == caches.len(), "one concept per slot");
+        assert!(t > 0 && t % k == 0 && b == caches.len(), "whole concepts for every slot");
         let device = tokens.device();
         let x = self.emb.forward(tokens);
         let states = {
@@ -604,23 +605,49 @@ impl NcmLm {
         };
         // The cross-attention key/value projections once over every slot's row, RoPE and the
         // ring write per slot.
-        let ropes: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, k, &device)).collect();
+        let ropes: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, t, &device)).collect();
         for (l, blk) in self.dec_blocks.iter().enumerate() {
             let kvs = blk.cross.make_kv_rows(states.clone(), &ropes);
             for (cache, (keys, values)) in caches.iter_mut().zip(kvs) {
                 cache.cross[l].write(keys, values);
             }
         }
-        let concepts = self.pool.forward(states.reshape([b, 1, k * self.local_dim]));
+        let n = t / k;
+        let concepts = self.pool.forward(states.reshape([b, n, k * self.local_dim]));
         let h = {
             let mut bb: Vec<&mut [LayerCache]> =
                 caches.iter_mut().map(|c| c.backbone.as_mut_slice()).collect();
             self.backbone.forward_slots(concepts, &mut bb)
         };
         for cache in caches.iter_mut() {
-            cache.tokens += k;
+            cache.tokens += t;
         }
-        self.cond_proj.forward(h)
+        self.cond_proj.forward(if n == 1 { h } else { h.narrow(1, n - 1, 1) })
+    }
+
+    /// [`Self::prefill`] of one prompt piece per batch row, the rows separate streams (slots)
+    /// each at its own position: `tokens` `[B, n]` (`n` a multiple of k), row i into
+    /// `caches[i]`, in chunks of `chunk` tokens (at most [`ENCODER_CHUNK`]) through
+    /// [`Self::append_slots`], so the projections and MLPs of every slot's chunk run as one
+    /// batch. Returns each row's next condition `[B, 1, d]`.
+    pub fn prefill_slots(
+        &self,
+        tokens: Tensor<2, Int>,
+        caches: &mut [&mut NcmCache],
+        chunk: usize,
+    ) -> Tensor<3> {
+        let k = self.k;
+        let chunk = chunk.min(ENCODER_CHUNK);
+        let chunk = (chunk - chunk % k).max(k);
+        let n = tokens.dims()[1];
+        let mut cond = None;
+        let mut start = 0;
+        while start < n {
+            let len = chunk.min(n - start);
+            cond = Some(self.append_slots(tokens.clone().narrow(1, start, len), caches));
+            start += len;
+        }
+        cond.expect("prompt pieces must not be empty")
     }
 
     /// [`Self::decode_concept_with`] for a batch of separate streams: `cond` `[B, 1, d]`, row i
