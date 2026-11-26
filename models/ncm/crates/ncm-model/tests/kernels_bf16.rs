@@ -187,3 +187,9 @@ fn pooled_slot_steps_match_separate_bf16() {
     let (device, _lock) = setup(DTYPE);
     pooled_slot_steps_match(&device, TOL);
 }
+
+#[test]
+fn graphed_ncm_slots_match_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_ncm_slots_match_eager(&device);
+}

@@ -1146,3 +1146,40 @@ pub fn pooled_slot_steps_match(device: &Device, tol: f32) {
         assert_close(&format!("pooled slot step {step}"), &got, &want, &want, tol);
     }
 }
+
+/// The NCM's batched concept-step graph ([`ncm_model::ncm::GraphedNcmSlots`], greedy) gives
+/// the same concepts as the eager batched step (`append_slots`, then `decode_slots` by
+/// argmax), for two slots at different positions with pooled slot caches.
+pub fn graphed_ncm_slots_match_eager(device: &Device) {
+    use ncm_model::sample::SampleSettings;
+    let cfg = tiny_ncm_v2(8, tiny_v2(2, 2, 4));
+    device.seed(9);
+    let model = NcmLm::new(&cfg, device);
+    let k = cfg.k;
+    let mut graphed = model.make_slot_caches(2, 64 * k, device);
+    let mut eager = model.make_slot_caches(2, 64 * k, device);
+    for (i, concepts) in [5usize, 8].into_iter().enumerate() {
+        let n = concepts * k;
+        let data: Vec<i32> = (0..n).map(|j| ((j * 11 + i * 7) % cfg.vocab_size) as i32).collect();
+        let prompt = Tensor::<2, Int>::from_data(TensorData::new(data, [1, n]), device);
+        model.prefill(prompt.clone(), &mut graphed[i], 4 * k);
+        model.prefill(prompt, &mut eager[i], 4 * k);
+    }
+    let mut graphs = ncm_model::ncm::GraphedNcmSlots::default();
+    let settings = [SampleSettings::GREEDY; 2];
+    let mut written: Vec<i32> = (0..2 * k).map(|j| (j * 3 % cfg.vocab_size) as i32).collect();
+    for step in 0..6 {
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(written.clone(), [2, k]), device);
+        let mut g: Vec<&mut ncm_model::NcmCache> = graphed.iter_mut().collect();
+        let got = graphs.step(&model, &[0, 1], tokens.clone(), &mut g, &settings);
+        let mut e: Vec<&mut ncm_model::NcmCache> = eager.iter_mut().collect();
+        let cond = model.append_slots(tokens, &mut e);
+        let mut argmax = |_: usize, logits: &Tensor<3>| argmax_last(logits.clone()).reshape([2, 1]);
+        let want = ints(model.decode_slots(cond, &mut e, &mut argmax));
+        match got {
+            Some((next, _)) => assert_eq!(ints(next), want, "step {step}: concepts differ"),
+            None => panic!("step {step}: no graph ({:?})", graphs.failure(&[0, 1])),
+        }
+        written = want.iter().map(|&t| t as i32).collect();
+    }
+}
