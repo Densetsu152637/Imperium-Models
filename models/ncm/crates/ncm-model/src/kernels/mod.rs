@@ -429,17 +429,11 @@ impl NcmKernels for CubeBackend {
         let out = empty_like(&x, vec![rows, n_len]);
         let dtype = elem(x.dtype);
         let client = x.client.clone();
-        // Vectors of words per load when every vector lies in one scale group: four (16 bytes)
-        // for q8; two for q4, whose decoding rather than its loads limits it.
-        let vec = if bits == 4 { 2 } else { 4 };
         let strides = packed.meta.strides().to_vec();
-        // Any width: the kernel stages x a tile at a time.
-        if rows <= crate::quant::GEMV_ROWS
-            && strides[1] == 1
-            && strides[0].is_multiple_of(vec)
-            && words.is_multiple_of(vec)
-            && group_words.is_multiple_of(vec)
-        {
+        // Any width (x staged a tile at a time), any word count (narrower vectors down to one
+        // word) and any group length (per-word scales when vectors cross groups).
+        let vec = quant::vector_words(bits, words, strides[0]);
+        if rows <= crate::quant::GEMV_ROWS && strides[1] == 1 {
             unsafe {
                 quant::qgemv_vec_kernel::launch_unchecked(
                     &client,
@@ -457,6 +451,7 @@ impl NcmKernels for CubeBackend {
                     bits,
                     rows,
                     group_words,
+                    quant::straddles(vec, group_words),
                     dtype,
                 );
             }

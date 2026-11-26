@@ -371,6 +371,7 @@ mod kernel {
         r: usize,
         #[comptime] bits: u32,
         #[comptime] group_words: usize,
+        #[comptime] straddle: bool,
     ) -> f32 {
         let v = packed.vector_size().comptime();
         let lane = UNIT_POS_X as usize;
@@ -399,8 +400,15 @@ mod kernel {
                         sum += (code - offset) * xs[r * stride + kk + kk / 32];
                     }
                 }
+                if comptime!(straddle) {
+                    // The vector may cross a group boundary: each word its own scale.
+                    acc += sum * scales[srow + (w + i) / group_words];
+                    sum = 0.0;
+                }
             }
-            acc += sum * scale;
+            if comptime!(!straddle) {
+                acc += sum * scale;
+            }
             w += PLANE * v;
         }
         acc
@@ -429,6 +437,7 @@ mod kernel {
         #[comptime] bits: u32,
         #[comptime] rows: usize,
         #[comptime] group_words: usize,
+        #[comptime] straddle: bool,
         #[comptime] norm: bool,
         #[comptime] add: bool,
         #[comptime] glu: bool,
@@ -504,6 +513,7 @@ mod kernel {
                         r,
                         bits,
                         group_words,
+                        straddle,
                     );
                     if comptime!(glu) {
                         u[r] += qdot_part::<Q>(
@@ -519,6 +529,7 @@ mod kernel {
                             r,
                             bits,
                             group_words,
+                            straddle,
                         );
                     }
                 }
@@ -696,7 +707,9 @@ impl NcmFusedMlp for CubeBackend {
         use kernel::{PLANE, PLANES};
         let [rows, k] = x.meta.shape().dims::<2>();
         let words = packed.meta.shape().dims::<2>()[1];
-        let vec = if f.bits == 4 { 2 } else { 4 };
+        let row_stride = packed.meta.strides()[0];
+        let vec = crate::kernels::quant::vector_words(f.bits, words, row_stride);
+        let straddle = crate::kernels::quant::straddles(vec, f.group_words);
         let out = flat_out(&x, rows * f.n + if f.add { rows * k } else { 0 });
         let client = x.client.clone();
         let dtype = elem(x.dtype);
@@ -722,6 +735,7 @@ impl NcmFusedMlp for CubeBackend {
                 f.bits,
                 rows,
                 f.group_words,
+                straddle,
                 f.norm,
                 f.add,
                 f.glu,
@@ -772,12 +786,10 @@ fn weight(layer: &QLinear, rows: usize, d_in: usize, out_cols: usize) -> Option<
             (kk == d_in && nw >= out_cols).then_some(Weight::Dense(w))
         }
         crate::quant::KernelWeight::Quant { packed, scales, format, d_in: k } => {
-            let words = packed.dims()[1];
+            // Any shape: the rows staged a tile at a time, vectors narrowed to the word count's
+            // alignment and per-word scales where vectors cross groups.
             let group_words = format.group_len(k) / format.per_word();
-            let vec = if format.bits == 4 { 2 } else { 4 };
-            // Any width: the kernel stages the rows a tile at a time.
-            let fits = words.is_multiple_of(vec) && group_words.is_multiple_of(vec);
-            fits.then_some(Weight::Quant { packed, scales, bits: format.bits, group_words })
+            Some(Weight::Quant { packed, scales, bits: format.bits, group_words })
         }
     }
 }

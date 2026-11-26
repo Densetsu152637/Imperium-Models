@@ -103,9 +103,10 @@ pub(crate) fn qgemv_kernel<F: Float>(
 /// [`qgemv_kernel`] with `x` staged in shared memory (f32, skewed) a tile of `tile_k` inputs
 /// at a time (`rows * (tile_k + tile_k / 32 + 1) <= QX`, a multiple of 512 unless it is all of
 /// `k_len`), so inputs of any width keep it, and each lane's words read as one vector of `v`
-/// when the word count and the group length are multiples of `v`: lane `l` takes words
-/// `(l + 32 i) * v .. + v` of the tile, which share one scale. `QPLANES` features per cube
-/// share the staged `x`.
+/// (`v` from [`vector_words`]: as wide as the rows' alignment allows, down to one word): lane
+/// `l` takes words `(l + 32 i) * v .. + v` of the tile, which share one scale unless
+/// `straddle` (the group length not a multiple of `v`: then each word its own). `QPLANES`
+/// features per cube share the staged `x`.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
@@ -120,6 +121,7 @@ pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
     #[comptime] bits: u32,
     #[comptime] rows: usize,
     #[comptime] group_words: usize,
+    #[comptime] straddle: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let v = packed.vector_size().comptime();
@@ -183,10 +185,21 @@ pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
                             }
                         }
                     }
+                    if comptime!(straddle) {
+                        // The vector may cross a group boundary: each word its own scale.
+                        let ws = scales[srow + (w + i) / group_words];
+                        #[unroll]
+                        for r in 0..rows {
+                            acc[r] += part[r] * ws;
+                            part[r] = 0.0;
+                        }
+                    }
                 }
-                #[unroll]
-                for r in 0..rows {
-                    acc[r] += part[r] * scale;
+                if comptime!(!straddle) {
+                    #[unroll]
+                    for r in 0..rows {
+                        acc[r] += part[r] * scale;
+                    }
                 }
                 w += PLANE * v;
             }
@@ -201,6 +214,25 @@ pub(crate) fn qgemv_vec_kernel<F: Float, N: Size>(
             out[r * n_len + n] = F::cast_from(total);
         }
     }
+}
+
+/// Words per vector load of the staged quantised kernels for a contiguous `[n, words]` code
+/// matrix with row stride `row_stride`: the preferred width (four for q8, two for q4, whose
+/// decoding rather than its loads limits it) or the largest smaller power of two that keeps
+/// every row's vectors aligned, down to one. Whether vectors stay inside one scale group of
+/// `group_words` is the kernels' `straddle` flag ([`straddles`]), not a reason to narrow.
+pub(crate) fn vector_words(bits: u32, words: usize, row_stride: usize) -> usize {
+    let mut v = if bits == 4 { 2 } else { 4 };
+    while v > 1 && !(words.is_multiple_of(v) && row_stride.is_multiple_of(v)) {
+        v /= 2;
+    }
+    v
+}
+
+/// Whether vectors of `v` words may cross a scale group of `group_words` (then every word
+/// looks up its own scale).
+pub(crate) fn straddles(v: usize, group_words: usize) -> bool {
+    !group_words.is_multiple_of(v)
 }
 
 /// The input tile of the staged quantised kernels for `rows` rows of `k_len` inputs within
