@@ -20,6 +20,7 @@ fn help_lists_the_documented_flags() {
         "--no-cuda-graphs",
         "--speculate",
         "--assume-accept",
+        "--hybrid-p",
     ] {
         assert!(help.contains(flag), "missing {flag}");
     }
@@ -150,4 +151,49 @@ fn assume_accept_needs_speculate_and_a_rate() {
     assert!(run(&off).unwrap_err().contains("--speculate on"));
     let bad = Cli::parse_from(base.iter().chain(&["--speculate", "on", "--assume-accept", "1.5"]));
     assert!(run(&bad).unwrap_err().contains("between 0 and 1"));
+}
+
+#[test]
+fn hybrid_runs_against_the_k4_ncm() {
+    let cli = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--design",
+        "v2",
+        "--model",
+        "all",
+        "--context",
+        "37",
+        "--new-tokens",
+        "16",
+        "--repeats",
+        "1",
+        "--hybrid-p",
+        "1.0",
+        "0.9",
+    ]);
+    let payload = run(&cli).expect("tiny run");
+    let results = payload["results"].as_array().unwrap();
+    let hybrid = results.iter().find(|r| r["name"] == "hybrid").expect("a hybrid result");
+    let runs = hybrid["contexts"]["37"]["runs"].as_array().unwrap();
+    // The autoregressive path, the two rates and full rejection.
+    assert_eq!(runs.len(), 4);
+    // p = 1 accepts every draft token: the prompt's open block (3 of 8 left), then whole blocks.
+    let first = runs[1]["mean_first_accepted"].as_f64().unwrap();
+    assert!((3.0..=8.0).contains(&first), "{first}");
+    assert_eq!(runs[3]["redecodes_per_block"].as_f64().map(|r| r > 0.0), Some(true));
+    assert_eq!(payload["hybrid_over_ncm_v2"].as_array().unwrap().len(), 4);
+    let bad = Cli::parse_from([
+        "ncm-bench",
+        "--tiny",
+        "--device",
+        "cpu",
+        "--model",
+        "hybrid",
+        "--hybrid-p",
+        "1.5",
+    ]);
+    assert!(run(&bad).is_err());
 }

@@ -13,6 +13,12 @@
 //! pass. Random weights almost never accept a draft, so `--assume-accept` adds synthetic runs
 //! that force a given acceptance rate: they estimate the speed of a trained model, not its
 //! output.
+//!
+//! `--model hybrid` (or `all`) runs the NCM hybrid's block decode loop ([`hybrid`]): the
+//! autoregressive path alone and synthetic per-token agreement rates `--hybrid-p` (step 6 of the
+//! local test plan), against the k = 4 NCM of the v2 design when that runs too.
+
+pub mod hybrid;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -44,6 +50,10 @@ pub enum ModelChoice {
     Tok,
     Ncm,
     Both,
+    /// The NCM hybrid (block decoder) only.
+    Hybrid,
+    /// The token baseline, the k = 4 NCM and the hybrid.
+    All,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -174,6 +184,11 @@ pub struct Cli {
     /// Cache the v2 indexer keys at the run dtype instead of 8-bit codes.
     #[arg(long)]
     pub float_index_keys: bool,
+    /// The hybrid's SYNTHETIC per-token agreement rates (geometric first rejections): the
+    /// design's mean accepted prefixes of 32, 25.6, 19.2 and 15.4 tokens. A run with the
+    /// autoregressive path alone and one with full rejection (p = 0) are always added.
+    #[arg(long, num_args = 1.., value_name = "P", default_values_t = [1.0, 0.986, 0.967, 0.950])]
+    pub hybrid_p: Vec<f64>,
 }
 
 impl Cli {
@@ -681,10 +696,14 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         DtypeChoice::Bf16 => 2,
         DtypeChoice::F32 => 4,
     };
+    if let Some(p) = cli.hybrid_p.iter().find(|p| !(0.0..=1.0).contains(*p)) {
+        return Err(format!("--hybrid-p {p} is not between 0 and 1"));
+    }
     let kinds: Vec<&str> = match cli.model {
         ModelChoice::Tok => vec!["tok"],
         ModelChoice::Ncm => vec!["ncm"],
-        ModelChoice::Both => vec!["tok", "ncm"],
+        ModelChoice::Both | ModelChoice::All => vec!["tok", "ncm"],
+        ModelChoice::Hybrid => vec![],
     };
     let mut results = Vec::new();
     let mut rates: Vec<(&str, Design, Rates)> = Vec::new();
@@ -705,6 +724,36 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
             let (result, decode) = bench_model(&cfg, cli, &device, itemsize, spec);
             results.push(result);
             rates.push((kind, design, decode));
+        }
+    }
+    let mut hybrid_ratios = Vec::new();
+    if matches!(cli.model, ModelChoice::Hybrid | ModelChoice::All) {
+        PREFILL_CHUNK.store(cli.prefill_chunk.unwrap_or(8192).max(1), Ordering::Relaxed);
+        let (result, hybrid_rates) = hybrid::bench_hybrid(cli, &device, spec);
+        results.push(result);
+        let k4 = rates.iter().find(|r| r.0 == "ncm" && r.1 == Design::V2).map(|r| r.2.clone());
+        for (context, label, tok_s) in &hybrid_rates {
+            let Some(base) = k4.as_ref().and_then(|r| r.iter().find(|(c, _)| c == context)) else {
+                continue;
+            };
+            let ratio = tok_s / base.1;
+            let gate = if *label == hybrid::gate_label() {
+                Some(if ratio >= hybrid::HYBRID_GATE { "PASS" } else { "FAIL" })
+            } else if *label == hybrid::ar_label() {
+                Some(if ratio >= 1.0 { "PASS" } else { "FAIL" })
+            } else {
+                None
+            };
+            println!(
+                "ratio hybrid/ncm k=4 (v2) @ ctx {context}, {label}: {ratio:.2}x{}",
+                gate.map_or(String::new(), |g| format!(" {g}"))
+            );
+            hybrid_ratios.push(json!({
+                "context": context,
+                "mode": label,
+                "ratio": ratio,
+                "verdict": gate,
+            }));
         }
     }
     let find = |kind: &str, design: Design| {
@@ -752,5 +801,6 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         "results": results,
         "ratios": ratios,
         "ncm_v2_over_fallback": design_ratios,
+        "hybrid_over_ncm_v2": hybrid_ratios,
     }))
 }
