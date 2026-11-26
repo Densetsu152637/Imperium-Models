@@ -173,6 +173,12 @@ pub struct HybridConfig {
     pub redecode_min: usize,
     /// Parallel mode rejects a position whose top probability is below this.
     pub tau: f64,
+    /// Training: blocks whose memory attention runs at once (0: all); bounds the scores to
+    /// `memory_chunk · q · (recent + memory_chunk · L)` per head.
+    pub memory_chunk: usize,
+    /// Training: gradient checkpointing (recompute memory-bound activations in the backward
+    /// pass; see [`crate::hybrid::train::training_device`]).
+    pub checkpointing: bool,
 }
 
 impl Default for HybridConfig {
@@ -206,6 +212,8 @@ impl Default for HybridConfig {
             level_alpha: 1.0,
             redecode_min: 20,
             tau: 0.5,
+            memory_chunk: 4,
+            checkpointing: false,
         }
     }
 }

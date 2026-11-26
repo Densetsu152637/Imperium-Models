@@ -2,18 +2,33 @@
 //! Next-Concept Modeling (arXiv 2610.14162). Design of record: the research repository's
 //! `docs/next-concept-modelling/architecture.md`; settings in [`crate::HybridConfig`].
 //!
-//! Plain Burn tensor code (the reference); fused kernels and CUDA graphs come later.
+//! The reference is plain Burn tensor code ([`decode`]); [`fast`] is the decode path for speed
+//! (memory rings, fixed-buffer passes, device acceptance, CUDA graphs).
+//!
+//! Open TODOs of the fast path:
+//!
+//! - **One fused kernel per generator layer** (block-diagonal level attention, the joint softmax
+//!   over the memory ring and the per-block entries, then the MLP), to bring a level to at most
+//!   three launches. Today a layer runs the existing fused norm, RoPE and MLP kernels and Burn's
+//!   matmuls; the level tail is one kernel (`kernels/hybrid.rs`). Deferred: a kernel that size
+//!   needs runs against the reference to be trusted.
+//! - **GPU grammar scan.** The tool-call guard is a byte-level JSON automaton with a bracket stack
+//!   and digit counters, so a token × state table does not stay small even at depth 16; a
+//!   one-thread walk of the draft's bytes on the GPU would work but gains nothing while the host
+//!   reads the draft back anyway (2 + 2L ints) and scans at most L tokens. Revisit when
+//!   acceptance, scan and fill all stay on the device.
 
 pub mod decode;
 pub mod fast;
 pub mod memory;
 pub mod model;
+pub mod train;
 pub mod vq;
 
 pub use decode::{BlockOut, BlockStats, DecodeOptions, Hooks, HybridSession, HybridSnapshot};
 pub use fast::{FastSession, PassMode, PassResult};
 pub use memory::Memory;
-pub use model::{HybridLm, HybridLoss, HybridParts, TrainOut, TrainPlan};
+pub use model::{HybridLm, HybridLoss, HybridParts, TrainOut, TrainPlan, TrainTargets};
 pub use vq::{BlockTokenizer, Ema, Quantised, TokenizerOut, sample_keep, tokenizer_loss};
 
 use crate::config::NcmConfig;

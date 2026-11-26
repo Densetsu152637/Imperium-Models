@@ -11,6 +11,8 @@ publish.workspace = true
 # Fused CubeCL kernels for v2 decode on CUDA devices (src/kernels). Local GPU builds only: CI has
 # no CUDA toolkit and never enables it; without it every device runs the reference path.
 cuda = ["burn/cuda", "burn/extension", "dep:burn-cubecl", "dep:cubecl-cuda"]
+# Training helpers that need autodiff devices (`hybrid::train`).
+train = ["burn/autodiff"]
 
 [dependencies]
 burn = { workspace = true, features = ["store", "safetensors"] }

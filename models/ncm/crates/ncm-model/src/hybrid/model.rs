@@ -263,6 +263,20 @@ impl TrainPlan {
 }
 
 /// Outputs of [`HybridLm::forward_train`].
+/// What [`HybridLm::forward_train_targets`] returns.
+pub struct TrainTargets {
+    /// Per level, the generator's code logits `[B * nb, ℓ_k, n]`.
+    pub code_logits: Vec<Tensor<3>>,
+    /// The token decoder's log-probability of each true token `[B, N]`.
+    pub token_target_logp: Tensor<2>,
+}
+
+/// The token decoder's output in training.
+enum DecoderOut {
+    Full(Tensor<3>),
+    Targets(Tensor<2>),
+}
+
 pub struct TrainOut {
     /// Per level, the generator's code logits `[B * nb, ℓ_k, n]`.
     pub code_logits: Vec<Tensor<3>>,
@@ -605,6 +619,26 @@ impl HybridLm {
         self.copy.mix(h, logits, memory)
     }
 
+    /// The token decoder's log-probabilities of `targets` `[B, nb * L]` only
+    /// ([`CopyHead::target_logp`]: deterministic, nothing vocabulary-sized beyond the logits).
+    pub fn run_decoder_targets(
+        &self,
+        x: Tensor<4>,
+        shape: &PassShape,
+        kvs: &[LayerKv],
+        memory: &Memory,
+        targets: Tensor<2, Int>,
+    ) -> Tensor<2> {
+        let [b, nb, l, d] = x.dims();
+        let mut x = x;
+        for (blk, kv) in self.dec_blocks.iter().zip(kvs) {
+            x = blk.forward(x, shape, kv, memory);
+        }
+        let h = crate::fused::rms_norm(&self.dec_norm, x).reshape([b, nb * l, d]);
+        let logits = crate::fused::linear_transposed(self.emb.weight.val(), h.clone());
+        self.copy.target_logp(h, logits, memory, targets)
+    }
+
     /// Each token-decoder layer's keys and values of `memory`.
     pub fn decoder_kv(&self, memory: &Memory) -> Vec<LayerKv> {
         self.dec_blocks.iter().map(|b| b.cross.project(memory, self.rope_base)).collect()
@@ -732,6 +766,34 @@ impl HybridLm {
         codes: Tensor<2, Int>,
         plan: &TrainPlan,
     ) -> TrainOut {
+        let (code_logits, token, memory) = self.forward_inner(tokens, codes, plan, true);
+        let DecoderOut::Full(token_logp) = token else { unreachable!("asked for the full output") };
+        TrainOut { code_logits, token_logp, memory }
+    }
+
+    /// [`Self::forward_train`] as training runs it: the token decoder's log-probabilities of
+    /// the true tokens only ([`CopyHead::target_logp`]: reproducible on GPU, no `[B, N, V]`
+    /// mixture), and the memory attention chunked by `memory_chunk` blocks.
+    pub fn forward_train_targets(
+        &self,
+        tokens: Tensor<2, Int>,
+        codes: Tensor<2, Int>,
+        plan: &TrainPlan,
+    ) -> TrainTargets {
+        let (code_logits, token, _) = self.forward_inner(tokens, codes, plan, false);
+        let DecoderOut::Targets(token_target_logp) = token else {
+            unreachable!("asked for the targets")
+        };
+        TrainTargets { code_logits, token_target_logp }
+    }
+
+    fn forward_inner(
+        &self,
+        tokens: Tensor<2, Int>,
+        codes: Tensor<2, Int>,
+        plan: &TrainPlan,
+        full: bool,
+    ) -> (Vec<Tensor<3>>, DecoderOut, Memory) {
         let [b, n] = tokens.dims();
         let l = self.h.block;
         assert!(n.is_multiple_of(l) && n >= l, "sequences are whole blocks of {l} tokens");
@@ -789,7 +851,7 @@ impl HybridLm {
             Some(seq_next.clone()),
             &device,
         );
-        let dec_memory = Entries::memory(
+        let mut dec_memory = Entries::memory(
             &per_block,
             false,
             Some(states),
@@ -799,6 +861,9 @@ impl HybridLm {
             Some(seq_next),
             &device,
         );
+        let mut gen_memory = gen_memory;
+        gen_memory.chunk_blocks = self.h.memory_chunk;
+        dec_memory.chunk_blocks = self.h.memory_chunk;
 
         // Generator: all levels in one pass, block-diagonal between levels.
         let depth = self.h.depth();
@@ -844,6 +909,7 @@ impl HybridLm {
         let zmask: Vec<f32> = plan.zero.iter().map(|&z| if z { 0.0 } else { 1.0 }).collect();
         let zmask = Tensor::<1>::from_data(TensorData::new(zmask, [rows]), &device);
         let zhat = zsum.expect("at least one level");
+        let tokens_all = tokens.clone();
         let x = self.decoder_input(tokens.reshape([rows, l]), Some((zhat, zmask)), b);
         let (dec_rope, causal) = self.decoder_self(&device);
         let q_pos: Vec<usize> = (0..n).collect();
@@ -854,8 +920,12 @@ impl HybridLm {
             rope_base: self.rope_base,
         };
         let kvs = self.decoder_kv(&dec_memory);
-        let token_logp = self.run_decoder(x, &shape, &kvs, &dec_memory);
-        TrainOut { code_logits, token_logp, memory: gen_memory }
+        let token = if full {
+            DecoderOut::Full(self.run_decoder(x, &shape, &kvs, &dec_memory))
+        } else {
+            DecoderOut::Targets(self.run_decoder_targets(x, &shape, &kvs, &dec_memory, tokens_all))
+        };
+        (code_logits, token, gen_memory)
     }
 
     /// The training losses of [`Self::forward_train`]'s outputs: the code loss (true codes
@@ -869,13 +939,38 @@ impl HybridLm {
         plan: &TrainPlan,
     ) -> HybridLoss {
         let [b, n] = tokens.dims();
+        let logp = out.token_logp.clone().gather(2, tokens.clone().unsqueeze_dim::<3>(2));
+        self.losses(&out.code_logits, logp.reshape([b, n]), tokens, codes, plan)
+    }
+
+    /// [`Self::loss`] of [`Self::forward_train_targets`]'s outputs (the same values).
+    pub fn loss_targets(
+        &self,
+        out: &TrainTargets,
+        tokens: Tensor<2, Int>,
+        codes: Tensor<2, Int>,
+        plan: &TrainPlan,
+    ) -> HybridLoss {
+        self.losses(&out.code_logits, out.token_target_logp.clone(), tokens, codes, plan)
+    }
+
+    /// Both losses from the code logits and the true tokens' log-probabilities `[B, N]`.
+    fn losses(
+        &self,
+        code_logits: &[Tensor<3>],
+        token_logp: Tensor<2>,
+        tokens: Tensor<2, Int>,
+        codes: Tensor<2, Int>,
+        plan: &TrainPlan,
+    ) -> HybridLoss {
+        let [b, n] = tokens.dims();
         let l = self.h.block;
         let device = tokens.device();
         let alpha = self.h.level_alpha;
         let mut per_level = Vec::new();
         let mut weighted: Option<Tensor<1>> = None;
         let mut total = 0.0;
-        for (k, logits) in out.code_logits.iter().enumerate() {
+        for (k, logits) in code_logits.iter().enumerate() {
             let n_k = self.h.levels[k];
             let target = codes.clone().narrow(1, self.h.level_offset(k), n_k).unsqueeze_dim::<3>(2);
             let ce = log_softmax(logits.clone(), 2).gather(2, target).neg().mean();
@@ -888,8 +983,7 @@ impl HybridLm {
             per_level.push(ce);
         }
         let code = weighted.expect("at least one level") / total;
-        let nll =
-            out.token_logp.clone().gather(2, tokens.unsqueeze_dim::<3>(2)).neg().reshape([b, n]);
+        let nll = token_logp.neg();
         let nb = n / l;
         let mask: Vec<f32> = (0..b * n)
             .map(|i| {
@@ -982,6 +1076,7 @@ impl Entries {
             (off, len, Tensor::cat(copies.into_iter().map(|c| c.2).collect(), 1))
         });
         Memory {
+            chunk_blocks: 0,
             nb,
             seq,
             seq_start,

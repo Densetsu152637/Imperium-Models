@@ -779,3 +779,57 @@ fn verified_sampling_has_the_paths_distribution() {
 fn fast_verified_sampling_has_the_paths_distribution_on_cuda() {
     verified_sampling_matches_the_path(Device::cuda(0), true);
 }
+
+// ----------------------------------------------------------------------------- training paths
+
+/// The memory attention chunked by blocks gives the dense reference's outputs (same math), at
+/// chunk sizes that do and do not divide the blocks; and the training path that reads only the
+/// true tokens' log-probabilities (no scatter-add) gives the full distribution's values there,
+/// the same losses, and bit-identical results run to run.
+#[test]
+fn chunked_memory_and_target_logprobs_match_the_reference() {
+    let device = device();
+    let (base, h) = tiny_cfg();
+    let l = h.block;
+    let nb = 7;
+    let mut outs = Vec::new();
+    for chunk in [0usize, 1, 2, 3, 7] {
+        device.seed(50);
+        let cfg = ncm_model::NcmConfig {
+            hybrid: Some(HybridConfig { memory_chunk: chunk, ..h.clone() }),
+            ..base.clone()
+        };
+        let model = HybridLm::new(&cfg, &device);
+        let toks = tokens(&device, cfg.vocab_size, 2, nb * l, 51);
+        let codes = block_codes(&model, toks.clone());
+        let mut plan = TrainPlan::exact(codes.clone());
+        plan.known[3] = 4;
+        plan.zero[5] = true;
+        let full = model.forward_train(toks.clone(), codes.clone(), &plan);
+        let targets = model.forward_train_targets(toks.clone(), codes.clone(), &plan);
+        let gathered = full.token_logp.clone().gather(2, toks.clone().unsqueeze_dim::<3>(2));
+        assert_close(
+            &values(targets.token_target_logp.clone()),
+            &values(gathered.reshape([2, nb * l])),
+            1e-5,
+            1e-4,
+        );
+        let a = model.loss(&full, toks.clone(), codes.clone(), &plan);
+        let b = model.loss_targets(&targets, toks.clone(), codes.clone(), &plan);
+        assert_close(&values(a.token), &values(b.token), 1e-5, 1e-4);
+        assert_close(&values(a.code), &values(b.code), 1e-6, 1e-5);
+        let again = model.forward_train_targets(toks, codes, &plan);
+        assert_eq!(values(again.token_target_logp), values(targets.token_target_logp.clone()));
+        outs.push((
+            values(full.token_logp),
+            full.code_logits.into_iter().map(values).collect::<Vec<_>>(),
+        ));
+    }
+    let (want_tokens, want_codes) = &outs[0];
+    for (tokens, codes) in &outs[1..] {
+        assert_close(tokens, want_tokens, 1e-5, 1e-4);
+        for (c, w) in codes.iter().zip(want_codes) {
+            assert_close(c, w, 1e-5, 1e-4);
+        }
+    }
+}
