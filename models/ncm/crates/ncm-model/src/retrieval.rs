@@ -524,26 +524,29 @@ impl SparseRetrieval {
             .collect()
     }
 
-    /// Whether `caches` are every row of one slot pool, in row order, each still a view of the
-    /// pool's buffers (so [`Self::decode_rows`] takes them).
+    /// Whether `caches` are distinct rows of one slot pool, each still a view of the pool's
+    /// buffers with room for a position (so [`Self::decode_rows`] takes them): any subset of
+    /// the pool's slots, in any order.
     #[cfg(feature = "cuda")]
     pub(crate) fn rows_pooled(caches: &[&LatentCache]) -> bool {
         let Some(Some(first)) = caches.first().map(|c| c.pooled.as_ref()) else {
             return false;
         };
-        first.rows == caches.len()
-            && caches.iter().enumerate().all(|(i, c)| {
-                c.pooled.as_ref().is_some_and(|p| p.id == first.id && p.row == i)
-                    && c.length < c.capacity
-                    && c.aliases_pool()
-            })
+        let mut seen = vec![false; first.rows];
+        caches.iter().all(|c| {
+            let Some(p) = c.pooled.as_ref() else { return false };
+            let fresh = p.id == first.id && !std::mem::replace(&mut seen[p.row], true);
+            fresh && c.length < c.capacity && c.aliases_pool()
+        })
     }
 
-    /// One-token fused decode of every slot of a pool at once: `p` `[rows, 1, W]` (row i the
-    /// input projection of slot i), `ropes[i]` the tables of slot i's position. The same
-    /// kernels as [`Self::decode_fused`] over the pool's buffers, each row at its own position
-    /// (one upload of all positions), so a batched step costs one set of launches instead of
-    /// one per slot.
+    /// One-token fused decode of pooled slots at once: `p` `[n, 1, W]` (row i the input
+    /// projection of `caches[i]`), `ropes[i]` the tables of its position. The same kernels as
+    /// [`Self::decode_fused`] over the whole pool's buffers, one launch set: each active row at
+    /// its own position, the pool's idle rows marked with position -1 (the kernels skip them:
+    /// they neither read nor write). Eagerly every position is uploaded at once; inside a
+    /// captured slot step each active slot's [`crate::layers::StackStep`] stages its own and
+    /// the idle rows are filled with -1 by the graph.
     #[cfg(feature = "cuda")]
     pub(crate) fn decode_rows(
         &self,
@@ -553,18 +556,56 @@ impl SparseRetrieval {
     ) -> MixOut {
         let pool = caches[0].pooled.clone().expect("pooled caches");
         let device = p.device();
+        let rows: Vec<usize> =
+            caches.iter().map(|c| c.pooled.as_ref().expect("pooled").row).collect();
+        let n = rows.len();
+        let whole = n == pool.rows && rows.iter().enumerate().all(|(i, &r)| i == r);
+        // Each pool row's slot index in `caches`, or None for an idle row.
+        let mut slot_of = vec![None; pool.rows];
+        for (i, &r) in rows.iter().enumerate() {
+            slot_of[r] = Some(i);
+        }
         if !crate::fused::capturing() {
-            let pos: Vec<i32> = caches.iter().map(|c| c.length as i32).collect();
-            let pos = burn::tensor::TensorData::new(pos, [caches.len()]);
+            let mut pos = vec![-1i32; pool.rows];
+            for (cache, &r) in caches.iter().zip(&rows) {
+                pos[r] = cache.length as i32;
+            }
+            let pos = burn::tensor::TensorData::new(pos, [pool.rows]);
             let pos = Tensor::<1, Int>::from_data(pos, &device).cast(IntDType::I32);
             crate::kernels::assign_int_into(&pool.position, pos, 0, 0);
+        } else {
+            for (r, slot) in slot_of.iter().enumerate() {
+                if slot.is_none() {
+                    let idle = Tensor::<1, Int>::full([1], -1, &device).cast(IntDType::I32);
+                    crate::kernels::assign_int_into(&pool.position, idle, 0, r);
+                }
+            }
         }
-        let (cos, sin): (Vec<Tensor<4>>, Vec<Tensor<4>>) = ropes.iter().map(|r| r.tables()).unzip();
-        let tables = (Tensor::cat(cos, 0), Tensor::cat(sin, 0));
+        // The inputs and RoPE tables laid out by pool row (idle rows: zeros, any table).
+        let (p_all, tables) = if whole {
+            let (cos, sin): (Vec<Tensor<4>>, Vec<Tensor<4>>) =
+                ropes.iter().map(|r| r.tables()).unzip();
+            (p, (Tensor::cat(cos, 0), Tensor::cat(sin, 0)))
+        } else {
+            let [_, t, w] = p.dims();
+            let mut xs = Vec::with_capacity(pool.rows);
+            let (mut cos, mut sin) = (Vec::new(), Vec::new());
+            for slot in &slot_of {
+                let i = slot.unwrap_or(0);
+                xs.push(match slot {
+                    Some(i) => p.clone().narrow(0, *i, 1),
+                    None => Tensor::<3>::zeros([1, t, w], &device),
+                });
+                let (c, s) = ropes[i].tables();
+                cos.push(c);
+                sin.push(s);
+            }
+            (Tensor::cat(xs, 0), (Tensor::cat(cos, 0), Tensor::cat(sin, 0)))
+        };
         let norms =
             [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
         let out = crate::kernels::retrieval_decode(
-            p,
+            p_all,
             norms,
             tables,
             self.uk.weight.val(),
@@ -574,6 +615,12 @@ impl SparseRetrieval {
             &pool.position,
             self.kernel_dims(),
         );
+        // The active rows' outputs, in `caches` order (idle rows hold nothing).
+        let out = if whole {
+            out
+        } else {
+            Tensor::cat(rows.iter().map(|&r| out.clone().narrow(0, r, 1)).collect(), 0)
+        };
         for cache in caches.iter_mut() {
             cache.check_pooled();
             cache.length += 1;

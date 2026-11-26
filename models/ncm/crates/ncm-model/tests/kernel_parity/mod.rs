@@ -1145,6 +1145,29 @@ pub fn pooled_slot_steps_match(device: &Device, tol: f32) {
         let want = values(model.step_slots(token, &mut rows));
         assert_close(&format!("pooled slot step {step}"), &got, &want, &want, tol);
     }
+    // A subset of the pool, out of row order (slot 1 idle): idle rows neither read nor write,
+    // so slot 1 continues as if never touched.
+    for step in 0..6 {
+        let ids: Vec<i32> = (0..2).map(|i| ((step * 3 + i * 5) % cfg.vocab_size) as i32).collect();
+        let token = Tensor::<2, Int>::from_data(TensorData::new(ids, [2, 1]), device);
+        let (a, rest) = pooled.split_at_mut(1);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            vec![rest[1].as_mut_slice(), a[0].as_mut_slice()];
+        let got = values(model.step_slots(token.clone(), &mut rows));
+        let (a, rest) = separate.split_at_mut(1);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            vec![rest[1].as_mut_slice(), a[0].as_mut_slice()];
+        let want = values(model.step_slots(token, &mut rows));
+        assert_close(&format!("pooled subset step {step}"), &got, &want, &want, tol);
+    }
+    let token = Tensor::<2, Int>::from_data(TensorData::new(vec![1i32, 2, 3], [3, 1]), device);
+    let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+        pooled.iter_mut().map(|c| c.as_mut_slice()).collect();
+    let got = values(model.step_slots(token.clone(), &mut rows));
+    let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+        separate.iter_mut().map(|c| c.as_mut_slice()).collect();
+    let want = values(model.step_slots(token, &mut rows));
+    assert_close("pooled step after the subset", &got, &want, &want, tol);
 }
 
 /// The NCM's batched concept-step graph ([`ncm_model::ncm::GraphedNcmSlots`], greedy) gives

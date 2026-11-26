@@ -920,9 +920,10 @@ impl Block {
         self.project_out(self.mix_core(input, start, ropes, cache, step))
     }
 
-    /// A retrieval layer's one-token step over slots whose caches are every row of one pool
-    /// ([`SparseRetrieval::make_slot_caches`]) on CUDA, eager or captured: all slots in one set
-    /// of launches. None when that does not apply.
+    /// A retrieval layer's one-token step over slots whose caches are rows of one pool
+    /// ([`SparseRetrieval::make_slot_caches`]; any subset, idle rows skipped by the kernels) on
+    /// CUDA, eager or captured: all slots in one set of launches. None when that does not
+    /// apply.
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn pooled_retrieval(
         &self,

@@ -138,6 +138,14 @@ fn row_position(position: &Tensor<i32>, b: usize) -> usize {
     usize::cast_from(position[i * position.stride(0)])
 }
 
+/// Whether batch row `b` takes part in this step: a negative position marks an idle row of a
+/// slot pool (it neither reads nor writes; its output rows are left unset).
+#[cube]
+fn row_active(position: &Tensor<i32>, b: usize) -> bool {
+    let i = select(position.shape(0) > 1, b, 0usize);
+    position[i * position.stride(0)] >= 0
+}
+
 /// Rotate-half RoPE of element `x` of batch row `b` with partner `other` (element
 /// `(i + dr / 2) % dr`); the tables hold one position per row or one for every row.
 #[cube]
@@ -204,6 +212,9 @@ pub(crate) fn ret_prep_kernel<F: Float>(
     let ps = p.stride(2);
     if cube_id < heads * batch * PREP_SLICES {
         let b = cube_id / (heads * PREP_SLICES);
+        if !row_active(position, b) {
+            terminate!();
+        }
         let hh = (cube_id / PREP_SLICES) % heads;
         let slice = cube_id % PREP_SLICES;
         let base = b * p.stride(0) + hh * qd * ps;
@@ -259,6 +270,9 @@ pub(crate) fn ret_prep_kernel<F: Float>(
         let entry = cube_id - heads * batch * PREP_SLICES;
         let b = entry / 3;
         let part = entry % 3;
+        if !row_active(position, b) {
+            terminate!();
+        }
         let pos = row_position(position, b);
         let row = b * p.stride(0);
         let (k0, k1, k2) = (kv.stride(0), kv.stride(1), kv.stride(2));
@@ -385,6 +399,9 @@ pub(crate) fn ret_index_kernel<F: Float>(
 ) {
     let b = CUBE_POS / blocks;
     let blk = CUBE_POS % blocks;
+    if !row_active(position, b) {
+        terminate!();
+    }
     // Uniform over the cube: blocks past the candidates are left alone.
     if blk >= candidate_blocks(row_position(position, b), block, local) {
         terminate!();
@@ -482,6 +499,9 @@ pub(crate) fn ret_topk_kernel(
 ) {
     let b = CUBE_POS;
     let row = b * blocks;
+    if !row_active(position, b) {
+        terminate!();
+    }
     let n = candidate_blocks(row_position(position, b), block, local);
     if n <= k {
         terminate!();
@@ -622,6 +642,9 @@ pub(crate) fn ret_attend_kernel<F: Float>(
     let steps = comptime!(width.div_ceil(LANES));
     let cols = comptime!(latent.div_ceil(CUBE));
     let b = CUBE_POS / (chunks * groups);
+    if !row_active(position, b) {
+        terminate!();
+    }
     let rest = CUBE_POS % (chunks * groups);
     let chunk = rest / groups;
     let h0 = (rest % groups) * hg;
@@ -806,6 +829,7 @@ pub(crate) fn ret_combine_kernel<F: Float>(
     part_sum: &Tensor<f32>,
     part_acc: &Tensor<f32>,
     out: &mut Tensor<F>,
+    position: &Tensor<i32>,
     chunks: usize,
     #[comptime] heads: usize,
     #[comptime] dv: usize,
@@ -820,6 +844,9 @@ pub(crate) fn ret_combine_kernel<F: Float>(
     let tile = CUBE_POS % tiles;
     let b = bh / heads;
     let hh = bh % heads;
+    if !row_active(position, b) {
+        terminate!();
+    }
     let tid = UNIT_POS as usize;
     let lane = UNIT_POS_PLANE as usize;
     let mut o = Shared::<[f32]>::new_slice(latent);
