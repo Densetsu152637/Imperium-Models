@@ -483,6 +483,20 @@ impl NcmLm {
         Tensor::cat(pieces, 1)
     }
 
+    /// Runs the prefill path once on a throwaway cache: `tokens` prompt tokens (rounded down to
+    /// whole concepts) in chunks of `chunk`, then one decoded concept, so that the kernels and
+    /// buffer sizes of those shapes are compiled and allocated before the first request (a
+    /// server calls it at startup, after [`crate::kernels::enable_kernel_cache`] on CUDA). The
+    /// model's caches are untouched; the device is synchronised before it returns.
+    pub fn warm_up(&self, tokens: usize, chunk: usize, device: &Device) {
+        let n = (tokens - tokens % self.k).max(self.k);
+        let mut cache = self.make_cache(n + self.k, 1, device);
+        let prompt = Tensor::<2, Int>::zeros([1, n], device);
+        let cond = self.prefill(prompt, &mut cache, chunk);
+        let (written, _) = self.decode_concept(cond, &mut cache, None, false);
+        drop(written.into_data());
+    }
+
     /// Feed a prompt (length a multiple of k) in chunks; returns the next-concept condition.
     pub fn prefill(&self, tokens: Tensor<2, Int>, cache: &mut NcmCache, chunk: usize) -> Tensor<3> {
         let chunk = (chunk - chunk % self.k).max(self.k);

@@ -273,3 +273,12 @@ fn config_rejects_unknown_keys_and_kinds() {
     let cfg = Config::parse("model = \"ncm\"\nk = 8\n");
     assert_eq!(cfg.map(|c| c.unit()).ok(), Some(NcmConfig { k: 8, ..NcmConfig::default() }.k));
 }
+
+#[test]
+fn ncm_warm_up_leaves_the_model_usable() {
+    let device = Device::flex();
+    let cfg = ncm_model::tiny_ncm_v2(8, ncm_model::tiny_v2(2, 2, 4));
+    let model = ncm_model::NcmLm::new(&cfg, &device);
+    model.warm_up(37, 16, &device);
+    model.warm_up(1, 16, &device);
+}
