@@ -15,6 +15,7 @@ cuda = ["burn/cuda", "burn/extension", "dep:burn-cubecl", "dep:cubecl-cuda"]
 train = ["burn/autodiff"]
 
 [dependencies]
+ncm-exec = { path = "../ncm-exec" }
 burn = { workspace = true, features = ["store", "safetensors"] }
 serde = { workspace = true }
 toml = { workspace = true }

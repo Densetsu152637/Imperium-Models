@@ -4369,12 +4369,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ncm-exec"
+version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ncm-model"
 version = "0.0.0"
 dependencies = [
  "burn",
  "burn-cubecl",
  "cubecl-cuda",
+ "ncm-exec",
  "serde",
  "serde_json",
  "tempfile",

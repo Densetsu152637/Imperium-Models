@@ -40,6 +40,7 @@ pub use config::{
     tiny_tok, tiny_tok_v2, tiny_v2, tok_1b, tok_250m, tok_250m_of, tok_250m_v2,
 };
 pub use ncm::{NcmCache, NcmLm, NcmParts, ncm_cache_bytes};
+pub use ncm_exec::{Dtype, Footprint, FootprintRequest, Part, Placement, Quant, Tier};
 pub use speculative::{Acceptance, DraftLoss, SpecStats, Speculator, draft_loss, speculate_slots};
 pub use tok::{TokParts, TokenLm, tok_cache_bytes};
 
