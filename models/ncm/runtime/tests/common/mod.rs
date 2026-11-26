@@ -45,8 +45,14 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
     engine_with_slots(config, ctx, 1)
 }
 
+/// Engines seed the CPU device and draw their weights from its one random stream: two built at
+/// once (tests run in parallel) would interleave their draws and get other weights than the
+/// seed gives. Every test engine is built under this lock.
+static BUILD: Mutex<()> = Mutex::new(());
+
 /// An engine serving `slots` requests at once (continuous batching), `ctx` tokens each.
 pub fn engine_with_slots(config: Config, ctx: usize, slots: usize) -> Engine {
+    let _build = BUILD.lock().unwrap_or_else(|e| e.into_inner());
     let options = EngineOptions {
         config,
         ctx,
