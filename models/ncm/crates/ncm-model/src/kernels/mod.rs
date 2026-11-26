@@ -57,7 +57,7 @@ fn launch_rms_norm(
 }
 
 /// Cubes per SM the GEMV grids aim for.
-const GEMV_WAVES: usize = 2;
+const GEMV_WAVES: usize = 4;
 
 /// Adds the `splits` f32 partials `part` `[splits, count]` into `y` (`count` elements).
 fn gemv_sum(
@@ -1074,7 +1074,7 @@ fn launch_attend_decode(
 /// Whether [`attend_decode`] takes `rows` query rows per key/value head of width `d` against
 /// `keys` cached positions.
 pub fn attend_decode_fits(rows: usize, d: usize, keys: usize) -> bool {
-    rows <= 16 && d <= attend::CUBE && keys >= 1 && keys <= attend::MAX_KEYS
+    rows <= 16 && d <= attend::CUBE && (1..=attend::MAX_KEYS).contains(&keys)
 }
 
 /// Attention of a decode step in one kernel: `q` `[B, KVH, R, d]` (a group's query heads
