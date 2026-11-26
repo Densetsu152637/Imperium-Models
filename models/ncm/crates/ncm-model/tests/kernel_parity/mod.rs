@@ -1117,3 +1117,32 @@ pub fn sampler_rows_are_independent(device: &Device) {
         assert_eq!(alone[0], drawn[r], "row {r} alone");
     }
 }
+
+/// Slot caches allocated together ([`ncm_model::TokenLm::make_slot_caches`], the retrieval
+/// layers' rows of shared buffers, decoded in one set of launches) give the same batched steps
+/// as separately allocated slot caches, for slots at different positions and past the point
+/// where retrieval turns sparse (blocks of 4, top 2, window 8).
+pub fn pooled_slot_steps_match(device: &Device, tol: f32) {
+    let cfg = ncm_model::tiny_tok_v2(tiny_v2(4, 2, 8));
+    device.seed(3);
+    let model = ncm_model::TokenLm::new(&cfg, device);
+    let mut pooled = model.make_slot_caches(3, 96, device);
+    let mut separate: Vec<_> = (0..3).map(|_| model.make_cache(96, 1, device)).collect();
+    for (i, len) in [21usize, 40, 33].into_iter().enumerate() {
+        let data: Vec<i32> = (0..len).map(|j| ((j * 7 + i * 13) % cfg.vocab_size) as i32).collect();
+        let prompt = Tensor::<2, Int>::from_data(TensorData::new(data, [1, len]), device);
+        model.prefill(prompt.clone(), &mut pooled[i], 16);
+        model.prefill(prompt, &mut separate[i], 16);
+    }
+    for step in 0..12 {
+        let ids: Vec<i32> = (0..3).map(|i| ((step * 5 + i * 3) % cfg.vocab_size) as i32).collect();
+        let token = Tensor::<2, Int>::from_data(TensorData::new(ids, [3, 1]), device);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            pooled.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.step_slots(token.clone(), &mut rows));
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            separate.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let want = values(model.step_slots(token, &mut rows));
+        assert_close(&format!("pooled slot step {step}"), &got, &want, &want, tol);
+    }
+}

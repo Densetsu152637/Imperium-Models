@@ -463,6 +463,47 @@ impl NcmLm {
 
     // ------------------------------------------------------------------ incremental
 
+    /// `slots` caches (each for batch 1) for [`Self::append_slots`] and [`Self::decode_slots`]:
+    /// as many [`Self::make_cache`], except that the backbone's retrieval caches are rows of
+    /// shared buffers on CUDA ([`crate::layers::Stack::make_slot_caches`]), so a batched step
+    /// decodes each retrieval layer once for all slots.
+    pub fn make_slot_caches(
+        &self,
+        slots: usize,
+        max_tokens: usize,
+        device: &Device,
+    ) -> Vec<NcmCache> {
+        let concepts = max_tokens.div_ceil(self.k);
+        let backbones = self.backbone.make_slot_caches(slots, concepts, device);
+        backbones
+            .into_iter()
+            .map(|backbone| NcmCache {
+                backbone,
+                ..self.make_cache_without_backbone(max_tokens, device)
+            })
+            .collect()
+    }
+
+    /// [`Self::make_cache`] for batch 1 with an empty backbone (filled by the caller).
+    fn make_cache_without_backbone(&self, max_tokens: usize, device: &Device) -> NcmCache {
+        let mut cache = self.make_cache(0, 1, device);
+        cache.encoder = self.encoder.make_caches(max_tokens, 1, device);
+        cache.cross = (0..self.dec_blocks.len())
+            .map(|_| {
+                KvCache::make(
+                    1,
+                    self.dec_kv_heads,
+                    self.head_dim,
+                    max_tokens,
+                    Some(self.enc_window),
+                    device,
+                )
+            })
+            .collect();
+        cache.backbone = Vec::new();
+        cache
+    }
+
     pub fn make_cache(&self, max_tokens: usize, batch: usize, device: &Device) -> NcmCache {
         let concepts = max_tokens.div_ceil(self.k);
         NcmCache {

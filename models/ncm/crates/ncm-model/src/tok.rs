@@ -88,6 +88,17 @@ impl TokenLm {
         self.logits(self.hidden(tokens, caches))
     }
 
+    /// `slots` cache sets (each for batch 1) for [`Self::step_slots`], the retrieval layers'
+    /// in shared buffers on CUDA ([`crate::layers::Stack::make_slot_caches`]).
+    pub fn make_slot_caches(
+        &self,
+        slots: usize,
+        max_tokens: usize,
+        device: &Device,
+    ) -> Vec<Vec<LayerCache>> {
+        self.stack.make_slot_caches(slots, max_tokens, device)
+    }
+
     pub fn make_cache(&self, max_tokens: usize, batch: usize, device: &Device) -> Vec<LayerCache> {
         self.stack.make_caches(max_tokens, batch, device)
     }

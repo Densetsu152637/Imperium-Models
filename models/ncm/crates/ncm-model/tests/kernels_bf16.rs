@@ -181,3 +181,9 @@ fn sampler_rows_are_independent_bf16() {
     let (device, _lock) = setup(DTYPE);
     sampler_rows_are_independent(&device);
 }
+
+#[test]
+fn pooled_slot_steps_match_separate_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    pooled_slot_steps_match(&device, TOL);
+}

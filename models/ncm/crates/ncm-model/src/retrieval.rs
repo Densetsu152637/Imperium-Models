@@ -117,6 +117,7 @@ impl ScoreKeys {
 /// A retrieval cache's indexer keys.
 // One per retrieval layer: the size gap between the variants is not worth boxing for.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum IndexKeys {
     /// At the run dtype, `[B, S, di]`.
     Float(Tensor<3>),
@@ -174,6 +175,18 @@ impl IndexKeys {
         }
     }
 
+    /// Batch row `i` of the keys (a view of the same buffers).
+    #[cfg(feature = "cuda")]
+    fn row(&self, i: usize) -> Self {
+        match self {
+            Self::Float(k) => Self::Float(k.clone().narrow(0, i, 1)),
+            Self::Int8 { codes, scales } => Self::Int8 {
+                codes: codes.clone().narrow(0, i, 1),
+                scales: scales.clone().narrow(0, i, 1),
+            },
+        }
+    }
+
     /// The first `n` positions' keys for scoring.
     fn view(&self, n: usize) -> ScoreKeys {
         match self {
@@ -184,6 +197,32 @@ impl IndexKeys {
             },
         }
     }
+}
+
+/// A fresh identifier for position buffers and slot pools.
+#[cfg(feature = "cuda")]
+pub(crate) fn fresh_id() -> u64 {
+    next_id()
+}
+
+#[cfg(feature = "cuda")]
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Slot caches of one retrieval layer allocated together: the shared buffers `[rows, S, *]`,
+/// the position buffer `[rows]` (one per slot, shared by a stack's retrieval layers) and this
+/// cache's row.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct PoolRow {
+    id: u64,
+    row: usize,
+    rows: usize,
+    kv: Tensor<3>,
+    keys: IndexKeys,
+    position: Tensor<1, Int>,
 }
 
 /// One retrieval layer's cache: `[latent | RoPE key]` and the indexer key per position. It
@@ -197,6 +236,11 @@ pub struct LatentCache {
     /// Identifies `position` (see [`LatentCache::share_position`]).
     #[cfg(feature = "cuda")]
     position_id: u64,
+    /// When this cache is one row of slot caches allocated together
+    /// ([`SparseRetrieval::make_slot_caches`]): the shared buffers and its row, so that a
+    /// batched step decodes every slot in one set of launches.
+    #[cfg(feature = "cuda")]
+    pooled: Option<PoolRow>,
     capacity: usize,
     length: usize,
     itemsize: usize,
@@ -220,10 +264,9 @@ impl LatentCache {
             #[cfg(feature = "cuda")]
             position: Tensor::<1, Int>::zeros([1], device).cast(burn::tensor::IntDType::I32),
             #[cfg(feature = "cuda")]
-            position_id: {
-                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            position_id: next_id(),
+            #[cfg(feature = "cuda")]
+            pooled: None,
             capacity,
             length: 0,
             itemsize,
@@ -271,6 +314,9 @@ impl LatentCache {
     pub(crate) fn share_position(&mut self, other: &LatentCache) {
         self.position = other.position.clone();
         self.position_id = other.position_id;
+        if let (Some(mine), Some(theirs)) = (self.pooled.as_mut(), other.pooled.as_ref()) {
+            mine.position = theirs.position.clone();
+        }
     }
 
     /// Identifies the position buffer (shared by [`Self::share_position`]).
@@ -409,6 +455,99 @@ impl SparseRetrieval {
         let width = self.latent + self.rope_dim;
         let int8 = self.index_8bit;
         LatentCache::new(batch, width, self.index_dim, int8, max_positions, device)
+    }
+
+    /// `rows` slot caches (each for batch 1) whose buffers are rows of shared ones, with the
+    /// next positions in `position` (`[rows]`, i32, row i for slot i; a stack's retrieval
+    /// layers share it). Each behaves as [`Self::make_cache`]'s; a batched step over all of
+    /// them in row order decodes in one set of launches ([`Self::decode_rows`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn make_slot_caches(
+        &self,
+        rows: usize,
+        max_positions: usize,
+        position: &Tensor<1, Int>,
+        position_id: u64,
+        device: &Device,
+    ) -> Vec<LatentCache> {
+        let pool = self.make_cache(max_positions, rows, device);
+        let (kv, keys) = (pool.kv.expect("cache"), pool.keys.expect("cache"));
+        let id = next_id();
+        (0..rows)
+            .map(|row| LatentCache {
+                kv: Some(kv.clone().narrow(0, row, 1)),
+                keys: Some(keys.row(row)),
+                position: position.clone().narrow(0, row, 1),
+                position_id,
+                pooled: Some(PoolRow {
+                    id,
+                    row,
+                    rows,
+                    kv: kv.clone(),
+                    keys: keys.clone(),
+                    position: position.clone(),
+                }),
+                capacity: max_positions,
+                length: 0,
+                itemsize: pool.itemsize,
+            })
+            .collect()
+    }
+
+    /// Whether `caches` are every row of one slot pool, in row order (so [`Self::decode_rows`]
+    /// takes them).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rows_pooled(caches: &[&LatentCache]) -> bool {
+        let Some(Some(first)) = caches.first().map(|c| c.pooled.as_ref()) else {
+            return false;
+        };
+        first.rows == caches.len()
+            && caches.iter().enumerate().all(|(i, c)| {
+                c.pooled.as_ref().is_some_and(|p| p.id == first.id && p.row == i)
+                    && c.length < c.capacity
+            })
+    }
+
+    /// One-token fused decode of every slot of a pool at once: `p` `[rows, 1, W]` (row i the
+    /// input projection of slot i), `ropes[i]` the tables of slot i's position. The same
+    /// kernels as [`Self::decode_fused`] over the pool's buffers, each row at its own position
+    /// (one upload of all positions), so a batched step costs one set of launches instead of
+    /// one per slot.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn decode_rows(
+        &self,
+        p: Tensor<3>,
+        ropes: &[&Rope],
+        caches: &mut [&mut LatentCache],
+    ) -> MixOut {
+        let pool = caches[0].pooled.clone().expect("pooled caches");
+        let device = p.device();
+        if !crate::fused::capturing() {
+            let pos: Vec<i32> = caches.iter().map(|c| c.length as i32).collect();
+            let pos = burn::tensor::TensorData::new(pos, [caches.len()]);
+            let pos = Tensor::<1, Int>::from_data(pos, &device).cast(IntDType::I32);
+            crate::kernels::assign_int_into(&pool.position, pos, 0, 0);
+        }
+        let (cos, sin): (Vec<Tensor<4>>, Vec<Tensor<4>>) = ropes.iter().map(|r| r.tables()).unzip();
+        let tables = (Tensor::cat(cos, 0), Tensor::cat(sin, 0));
+        let norms =
+            [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
+        let out = crate::kernels::retrieval_decode(
+            p,
+            norms,
+            tables,
+            self.uk.weight.val(),
+            self.uv.weight.val(),
+            &pool.kv,
+            &pool.keys,
+            &pool.position,
+            self.kernel_dims(),
+        );
+        for cache in caches.iter_mut() {
+            cache.length += 1;
+        }
+        // The combine kernel has applied the gate.
+        MixOut { x: out, gate: None }
     }
 
     fn scale(&self) -> f64 {

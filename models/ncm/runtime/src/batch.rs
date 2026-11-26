@@ -194,14 +194,27 @@ impl Batcher {
             State::Ncm { model, cache, .. } => (Model::Ncm(model), Caches::Ncm(cache)),
             State::Empty => unreachable!("a built core has a model"),
         };
-        let mut slots = vec![Slot { caches: first, kept: Vec::new(), last_used: 0, active: None }];
-        for _ in 1..count {
-            let caches = match &model {
-                Model::Tok(m) => Caches::Tok(m.make_cache(capacity, 1, &device)),
-                Model::Ncm(m) => Caches::Ncm(m.make_cache(capacity, 1, &device)),
-            };
-            slots.push(Slot { caches, kept: Vec::new(), last_used: 0, active: None });
-        }
+        // With several slots, all of them get caches allocated together (on CUDA the retrieval
+        // layers' rows of shared buffers, so a batched step decodes them in one set of
+        // launches); one slot keeps the core's.
+        let slot = |caches| Slot { caches, kept: Vec::new(), last_used: 0, active: None };
+        let slots: Vec<Slot> = if count <= 1 {
+            vec![slot(first)]
+        } else {
+            drop(first);
+            match &model {
+                Model::Tok(m) => m
+                    .make_slot_caches(count, capacity, &device)
+                    .into_iter()
+                    .map(|c| slot(Caches::Tok(c)))
+                    .collect(),
+                Model::Ncm(m) => m
+                    .make_slot_caches(count, capacity, &device)
+                    .into_iter()
+                    .map(|c| slot(Caches::Ncm(c)))
+                    .collect(),
+            }
+        };
         Self {
             core,
             model,

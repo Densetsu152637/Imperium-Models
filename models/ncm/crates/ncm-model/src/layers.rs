@@ -920,6 +920,45 @@ impl Block {
         self.project_out(self.mix_core(input, start, ropes, cache, step))
     }
 
+    /// A retrieval layer's one-token step over slots whose caches are every row of one pool
+    /// ([`SparseRetrieval::make_slot_caches`]), eagerly on CUDA: all slots in one set of
+    /// launches. None when that does not apply.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn pooled_retrieval(
+        &self,
+        input: &MixInput,
+        ropes: &[&Ropes],
+        caches: &mut [&mut [LayerCache]],
+        layer: usize,
+        steps: Option<&[Vec<Option<KvStep>>]>,
+    ) -> Option<MixOut> {
+        #[cfg(feature = "cuda")]
+        if let (Mixer::Retrieval(ret), MixInput::Projected(p)) = (&self.attn, input)
+            && steps.is_none()
+            && p.dims()[1] == 1
+            && crate::fused::active(&p.device())
+        {
+            let lats: Option<Vec<&crate::retrieval::LatentCache>> = caches
+                .iter()
+                .map(|c| match &c[layer] {
+                    LayerCache::Latent(l) => Some(l),
+                    _ => None,
+                })
+                .collect();
+            if !lats.is_some_and(|l| SparseRetrieval::rows_pooled(&l)) {
+                return None;
+            }
+            let mut lats: Vec<&mut crate::retrieval::LatentCache> =
+                caches.iter_mut().map(|c| c[layer].latent()).collect();
+            let tables: Vec<&Rope> = ropes
+                .iter()
+                .map(|r| r.retrieval.as_ref().expect("the stack built this table"))
+                .collect();
+            return Some(ret.decode_rows(p.clone(), &tables, &mut lats));
+        }
+        None
+    }
+
     /// The mixer's input projections of the normed input `h` (all batch rows at once).
     fn project_in(&self, h: Tensor<3>) -> MixInput {
         match &self.attn {
@@ -1042,17 +1081,24 @@ impl Block {
                 (x, self.project_in(h))
             }
         };
-        // Each slot's mixer core on its own caches, then the output projection once over all
-        // rows: one weight read per layer instead of one per slot.
-        let rows: Vec<MixOut> = caches
-            .iter_mut()
-            .enumerate()
-            .map(|(i, c)| {
-                let step = steps.and_then(|s| s[i][layer].as_ref());
-                self.mix_core(input.row(i), starts[i], ropes[i], Some(&mut c[layer]), step)
-            })
-            .collect();
-        let mixed = self.project_out(MixOut::cat(rows));
+        // Each slot's mixer core on its own caches (retrieval decode of pooled slots in one set
+        // of launches), then the output projection once over all rows: one weight read per
+        // layer instead of one per slot.
+        let core = match self.pooled_retrieval(&input, ropes, caches, layer, steps) {
+            Some(core) => core,
+            None => {
+                let rows: Vec<MixOut> = caches
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let step = steps.and_then(|s| s[i][layer].as_ref());
+                        self.mix_core(input.row(i), starts[i], ropes[i], Some(&mut c[layer]), step)
+                    })
+                    .collect();
+                MixOut::cat(rows)
+            }
+        };
+        let mixed = self.project_out(core);
         if let Some(x) = self.mlp.residual_step(&self.n2, &x, Some(&mixed)) {
             return (x, None);
         }
@@ -1332,6 +1378,48 @@ impl Stack {
             (x, pending) = block.forward_slots(x, pending, starts, ropes, caches, i, steps);
         }
         norm_after(&self.norm, x, pending).1
+    }
+
+    /// `slots` cache sets (each for batch 1) for [`Self::forward_slots`]: as many
+    /// [`Self::make_caches`], except that on CUDA each retrieval layer's caches are rows of
+    /// shared buffers with one position buffer per stack, so a batched one-token step over all
+    /// slots in order decodes each retrieval layer in one set of launches.
+    pub fn make_slot_caches(
+        &self,
+        slots: usize,
+        max_positions: usize,
+        device: &Device,
+    ) -> Vec<Vec<LayerCache>> {
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(device) && slots > 1 {
+            let position = Tensor::<1, burn::tensor::Int>::zeros([slots], device)
+                .cast(burn::tensor::IntDType::I32);
+            let position_id = crate::retrieval::fresh_id();
+            let mut sets: Vec<Vec<LayerCache>> = (0..slots).map(|_| Vec::new()).collect();
+            for block in &self.blocks {
+                match &block.attn {
+                    Mixer::Retrieval(ret) => {
+                        let rows = ret.make_slot_caches(
+                            slots,
+                            max_positions,
+                            &position,
+                            position_id,
+                            device,
+                        );
+                        for (set, cache) in sets.iter_mut().zip(rows) {
+                            set.push(LayerCache::Latent(cache));
+                        }
+                    }
+                    _ => {
+                        for set in sets.iter_mut() {
+                            set.push(block.make_cache(max_positions, 1, device));
+                        }
+                    }
+                }
+            }
+            return sets;
+        }
+        (0..slots).map(|_| self.make_caches(max_positions, 1, device)).collect()
     }
 
     /// One cache per layer for runs of up to `max_positions`.
