@@ -89,6 +89,11 @@ pub type Rewrite<'a> = &'a mut dyn FnMut(usize, &mut Vec<i32>);
 /// log-probabilities)`.
 pub type RowObserver<'a> = &'a mut dyn FnMut(&[i32], usize, &[f32]);
 
+/// The grammar scan over proposed tokens (see [`Hooks::scan`]).
+pub type Scan<'a> = &'a mut dyn FnMut(&[i32]) -> usize;
+/// An autoregressive-path token choice (see [`Hooks::pick`]).
+pub type Pick<'a> = &'a mut dyn FnMut(&[f32]) -> i32;
+
 /// Observers and overrides for tests and benchmarks.
 #[derive(Default)]
 pub struct Hooks<'a> {
@@ -102,6 +107,23 @@ pub struct Hooks<'a> {
     /// Decides acceptance instead of the rule, for synthetic acceptance in benchmarks:
     /// `(pass, position) -> accept`. The output is then not the model's.
     pub accept: Option<&'a mut dyn FnMut(usize, usize) -> bool>,
+    /// The grammar constraint scan: given the tokens a check pass would emit, in order, returns
+    /// how many of them the grammar allows (advancing its state over those). The block is cut
+    /// there and continues on the autoregressive path, where `pick` chooses every token.
+    pub scan: Option<Scan<'a>>,
+    /// Chooses an autoregressive-path token from its log-probabilities (a grammar mask, the
+    /// request's sampler), in place of the argmax or the plain draw.
+    pub pick: Option<Pick<'a>>,
+}
+
+/// Applies the constraint scan to `emitted`: true when it cut them (the block continues on the
+/// autoregressive path).
+pub(crate) fn scan_cut(hooks: &mut Hooks, emitted: &mut Vec<i32>) -> bool {
+    let Some(scan) = hooks.scan.as_mut() else { return false };
+    let allowed = scan(emitted).min(emitted.len());
+    let cut = allowed < emitted.len();
+    emitted.truncate(allowed);
+    cut
 }
 
 /// What one block's decode did.
@@ -530,6 +552,10 @@ impl HybridSession {
                 stopped = false;
             }
             emitted.truncate(cut);
+            let constrained = scan_cut(hooks, &mut emitted);
+            if constrained {
+                stopped = false;
+            }
             if emitted.iter().any(|t| opts.switch_off.contains(t)) {
                 close_span = true;
             }
@@ -537,7 +563,7 @@ impl HybridSession {
             if fixed.len() >= known + limit {
                 stopped = true;
             }
-            if stopped || fixed.len() >= l {
+            if stopped || fixed.len() >= l || constrained {
                 break;
             }
             if let Some(s) = switch {
@@ -566,7 +592,10 @@ impl HybridSession {
             if let Some(f) = hooks.ar_rows.as_mut() {
                 f(&fixed, i, row);
             }
-            let token = sample(row, opts.temperature, opts.top_p, &mut || self.uniform()) as i32;
+            let token = match hooks.pick.as_mut() {
+                Some(pick) => pick(row),
+                None => sample(row, opts.temperature, opts.top_p, &mut || self.uniform()) as i32,
+            };
             stats.ar_tokens += 1;
             fixed.push(token);
             if opts.switch_on.contains(&token) {

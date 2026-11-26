@@ -684,6 +684,10 @@ impl FastSession {
                 stopped = false;
             }
             emitted.truncate(keep);
+            let constrained = super::decode::scan_cut(hooks, &mut emitted);
+            if constrained {
+                stopped = false;
+            }
             if emitted.iter().any(|t| opts.switch_off.contains(t)) {
                 close_span = true;
             }
@@ -691,7 +695,7 @@ impl FastSession {
             if fixed.len() >= known + limit {
                 stopped = true;
             }
-            if stopped || fixed.len() >= l {
+            if stopped || fixed.len() >= l || constrained {
                 break;
             }
             if let Some(s) = switch {
@@ -720,7 +724,8 @@ impl FastSession {
             let device = self.device.clone();
             put_int(&mut self.inputs.ar_tokens, ints(inputs, [1, l], &device), 1, 0);
             let (ids, logp) = self.ar_output(model);
-            let token = if opts.temperature > 0.0 || hooks.ar_rows.is_some() {
+            let token = if opts.temperature > 0.0 || hooks.ar_rows.is_some() || hooks.pick.is_some()
+            {
                 let row: Vec<f32> = logp
                     .narrow(1, i, 1)
                     .into_data()
@@ -730,7 +735,9 @@ impl FastSession {
                 if let Some(f) = hooks.ar_rows.as_mut() {
                     f(&fixed, i, &row);
                 }
-                if opts.temperature > 0.0 {
+                if let Some(pick) = hooks.pick.as_mut() {
+                    pick(&row)
+                } else if opts.temperature > 0.0 {
                     let mut uniform = || self.session.uniform();
                     super::decode::sample_row(&row, opts.temperature, opts.top_p, &mut uniform)
                         as i32

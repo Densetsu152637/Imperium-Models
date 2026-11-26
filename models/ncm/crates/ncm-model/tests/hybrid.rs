@@ -683,3 +683,44 @@ fn fast_verified_mode_equals_autoregressive_greedy() {
         assert_eq!(got.len(), want.len());
     }
 }
+
+/// The constraint scan: a grammar that allows only even token ids cuts every block at the
+/// first odd token a check pass proposes; the autoregressive fill then picks the best allowed
+/// token. Every emitted token is allowed, and the fast path agrees with the reference loop.
+#[test]
+fn constraint_scan_rejects_what_it_should() {
+    let (model, cfg, h, device) = tiny_model(44);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 6 * l, 45));
+    let prompt = &stream[..l + 2];
+    let allowed = |t: i32| t % 2 == 0;
+    let decode = |fast: bool| {
+        let mut scans = 0;
+        let mut scan = |proposed: &[i32]| {
+            scans += 1;
+            proposed.iter().take_while(|&&t| allowed(t)).count()
+        };
+        let mut pick = |row: &[f32]| {
+            let best = (0..row.len())
+                .filter(|&i| allowed(i as i32))
+                .max_by(|&a, &b| row[a].total_cmp(&row[b]));
+            best.expect("an allowed token") as i32
+        };
+        let mut hooks = Hooks { scan: Some(&mut scan), pick: Some(&mut pick), ..Hooks::default() };
+        let opts = greedy(true);
+        let out = if fast {
+            let mut s = FastSession::new(&model, 6 * l, &device);
+            s.prefill(&model, prompt);
+            s.generate_reply(&model, 2 * l, &opts, &mut hooks).0
+        } else {
+            let mut s = HybridSession::new(&model, 6 * l, &device);
+            s.prefill(&model, prompt);
+            s.generate_reply(&model, 2 * l, &opts, &mut hooks).0
+        };
+        (out, scans)
+    };
+    let (reference, scans) = decode(false);
+    assert!(scans > 0, "the scan ran");
+    assert!(reference.iter().all(|&t| allowed(t)), "{reference:?}");
+    assert_eq!(decode(true).0, reference);
+}
