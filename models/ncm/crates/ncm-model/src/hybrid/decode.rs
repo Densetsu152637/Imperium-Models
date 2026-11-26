@@ -334,6 +334,46 @@ impl HybridSession {
         }
     }
 
+    /// [`Self::prefill_slots`] for pieces of different lengths (varlen): `pieces[i]` (each
+    /// non-empty, at most [`crate::ncm::ENCODER_CHUNK`] tokens) continues `sessions[i]`, all
+    /// encoded in one packed encoder pass ([`crate::layers::Stack::forward_packed`]: projections
+    /// and MLPs once over every token, the mixers per piece, nothing padded).
+    pub fn prefill_packed(
+        model: &HybridLm,
+        sessions: &mut [&mut HybridSession],
+        pieces: &[&[i32]],
+    ) {
+        assert_eq!(pieces.len(), sessions.len(), "one piece per session");
+        assert!(pieces.iter().all(|p| !p.is_empty()), "no empty piece");
+        let lens: Vec<usize> = pieces.iter().map(|p| p.len()).collect();
+        let ids: Vec<i32> = pieces.concat();
+        let total = ids.len();
+        let device = sessions[0].device.clone();
+        for (s, piece) in sessions.iter_mut().zip(pieces) {
+            assert_eq!(s.encoded, s.tokens.len(), "sessions encoded up to their ends");
+            s.tokens.extend_from_slice(piece);
+        }
+        let tokens =
+            Tensor::<2, Int>::from_data(burn::tensor::TensorData::new(ids, [1, total]), &device);
+        let x = model.embed(tokens);
+        let states = {
+            let mut caches: Vec<&mut [LayerCache]> =
+                sessions.iter_mut().map(|s| s.encoder.as_mut_slice()).collect();
+            model.encoder().forward_packed(x, &lens, &mut caches)
+        };
+        let mut at = 0;
+        for (s, &len) in sessions.iter_mut().zip(&lens) {
+            let piece = states.clone().narrow(1, at, len);
+            at += len;
+            s.states = Some(match s.states.take() {
+                Some(old) => Tensor::cat(vec![old, piece], 1),
+                None => piece,
+            });
+            s.encoded += len;
+            s.step_complete_blocks(model);
+        }
+    }
+
     /// Back to an empty stream, in the caches' own buffers on CUDA (a server reuses one
     /// session, and the graphs captured against it, across requests).
     pub fn reset(&mut self, model: &HybridLm) {
