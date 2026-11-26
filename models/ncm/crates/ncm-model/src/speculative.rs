@@ -33,7 +33,7 @@ use burn::tensor::activation::log_softmax;
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 #[cfg(feature = "cuda")]
 use burn::{
-    backend::{Backend, BackendGraph, Dispatch},
+    backend::{Backend, Dispatch},
     tensor::ExecutionError,
 };
 
@@ -400,10 +400,9 @@ impl Speculator {
         #[cfg(feature = "cuda")]
         if let (true, GraphState::Ready(g)) = (self.serving, &self.graphs) {
             // Safety: every buffer the graph touched is held by `g`, by the model (weights) or
-            // by `cache` (the cross-attention rings), all alive across the replay, and all work
-            // runs on this thread's stream.
-            unsafe { Dispatch::graph_replay(cond.device().as_dispatch(), &g.draft) }
-                .expect("draft graph replay");
+            // by `cache` (the cross-attention rings), all alive across the replay (which checks
+            // it runs on the capturing thread).
+            unsafe { crate::graph::replay(&cond.device(), &g.draft, "draft") };
             return g.drafted.clone();
         }
         let [b, _, _] = cond.dims();
@@ -424,8 +423,7 @@ impl Speculator {
         if let (true, GraphState::Ready(g)) = (self.serving, &self.graphs) {
             crate::kernels::assign_int_into(&g.guess, guess, 0, 0);
             // Safety: as for the draft graph.
-            unsafe { Dispatch::graph_replay(cond.device().as_dispatch(), &g.verify) }
-                .expect("verify graph replay");
+            unsafe { crate::graph::replay(&cond.device(), &g.verify, "verify") };
             return g.verified.clone();
         }
         let [b, k] = guess.dims();
@@ -492,8 +490,8 @@ enum GraphState {
 /// replay), and the two passes' greedy picks.
 #[cfg(feature = "cuda")]
 struct SpecGraphs {
-    draft: BackendGraph<Dispatch>,
-    verify: BackendGraph<Dispatch>,
+    draft: crate::graph::Captured,
+    verify: crate::graph::Captured,
     cond: Tensor<3>,
     rope_q: Rope,
     guess: Tensor<2, Int>,
@@ -581,7 +579,7 @@ fn capture(model: &NcmLm, cond: &Tensor<3>, cache: &NcmCache) -> Result<SpecGrap
         let out = pass();
         let graph =
             Dispatch::graph_stop_capture(dispatch).map_err(|e| err("graph_stop_capture", e))?;
-        Ok::<_, String>((graph, out))
+        Ok::<_, String>((crate::graph::Captured::new(graph), out))
     };
     let (draft_graph, drafted) = record(&draft).map_err(|e| format!("draft pass: {e}"))?;
     let (verify_graph, verified) = record(&verify).map_err(|e| format!("verify pass: {e}"))?;

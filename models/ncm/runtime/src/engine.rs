@@ -8,9 +8,11 @@
 //! caches. The NCM reads its prompt in k-token concepts from the start of the token stream; a
 //! trailing partial concept is forced as the start of the first decoded one. Resets and restores
 //! write into the caches' own buffers on CUDA, so the decode graphs are captured once and kept.
+//! All GPU work runs on one worker thread ([`Engine`]), as the kept graphs require.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use burn::module::{Module, ModuleMapper, Param};
@@ -269,7 +271,8 @@ impl Default for NcmGraphs {
     }
 }
 
-pub struct Engine {
+/// The model and its caches, on the engine's worker thread ([`Engine`]).
+struct Core {
     info: ModelInfo,
     vocab: Arc<Vocab>,
     device: Device,
@@ -326,10 +329,10 @@ fn itemsize(dtype: FloatDType) -> usize {
     }
 }
 
-impl Engine {
+impl Core {
     /// Builds the model (loading `options.weights` or initialising random weights) and
     /// allocates the caches for `options.ctx` tokens.
-    pub fn new(options: EngineOptions, vocab: Arc<Vocab>) -> Result<Self, EngineError> {
+    fn build(options: EngineOptions, vocab: Arc<Vocab>) -> Result<Self, EngineError> {
         let EngineOptions {
             config,
             ctx,
@@ -487,6 +490,82 @@ enum Emit {
     Limit,
 }
 
+/// Rejects a prompt of `tokens` that a model of `info` cannot serve.
+fn check_prompt(info: &ModelInfo, tokens: usize) -> Result<(), EngineError> {
+    if tokens == 0 {
+        return Err(EngineError::EmptyPrompt);
+    }
+    if tokens.next_multiple_of(info.unit) > info.ctx {
+        return Err(EngineError::ContextExceeded { prompt: tokens, ctx: info.ctx });
+    }
+    Ok(())
+}
+
+/// The model, its caches and the generation loop, served from one long-lived worker thread.
+///
+/// cubecl gives every OS thread its own stream, and a captured CUDA graph replays in order only
+/// with work on its capture stream. The engine keeps its decode graphs across requests, so every
+/// request's GPU work (building the model, staging inputs, replays, reading tokens back) must run
+/// on the same thread: [`Engine::new`] starts that thread and builds the model there, and
+/// [`Backend::generate`] hands it each request and relays its tokens, from whichever thread the
+/// caller runs on.
+pub struct Engine {
+    info: ModelInfo,
+    vocab: Arc<Vocab>,
+    jobs: Mutex<mpsc::Sender<Job>>,
+}
+
+/// A request for the worker thread, the channel its events go back on, and the flag the caller
+/// sets when its listener left.
+struct Job {
+    request: GenRequest,
+    events: mpsc::Sender<Event>,
+    cancel: Arc<AtomicBool>,
+}
+
+enum Event {
+    Token(u32),
+    Done(Result<GenStats, EngineError>),
+}
+
+impl Engine {
+    /// Builds the model (loading `options.weights` or initialising random weights) and
+    /// allocates the caches for `options.ctx` tokens, on a new worker thread that then serves
+    /// every request.
+    pub fn new(options: EngineOptions, vocab: Arc<Vocab>) -> Result<Self, EngineError> {
+        let (ready, built) = mpsc::channel();
+        let (jobs, queue) = mpsc::channel::<Job>();
+        let worker_vocab = vocab.clone();
+        std::thread::Builder::new()
+            .name("ncm-engine".into())
+            .spawn(move || {
+                let core = match Core::build(options, worker_vocab) {
+                    Ok(core) => {
+                        ready.send(Ok(core.info.clone())).ok();
+                        core
+                    }
+                    Err(e) => {
+                        ready.send(Err(e)).ok();
+                        return;
+                    }
+                };
+                // Ends when the engine (its sender) is dropped.
+                for Job { request, events, cancel } in queue {
+                    let mut on_token = |token| {
+                        !cancel.load(Ordering::Relaxed) && events.send(Event::Token(token)).is_ok()
+                    };
+                    let result = core.generate(request, &mut on_token);
+                    events.send(Event::Done(result)).ok();
+                }
+            })
+            .map_err(|e| EngineError::Device(format!("cannot start the engine thread: {e}")))?;
+        let info = built
+            .recv()
+            .map_err(|_| EngineError::Device("the engine thread stopped while loading".into()))??;
+        Ok(Self { info, vocab, jobs: Mutex::new(jobs) })
+    }
+}
+
 impl Backend for Engine {
     fn info(&self) -> &ModelInfo {
         &self.info
@@ -497,14 +576,7 @@ impl Backend for Engine {
     }
 
     fn check_prompt(&self, tokens: usize) -> Result<(), EngineError> {
-        if tokens == 0 {
-            return Err(EngineError::EmptyPrompt);
-        }
-        let padded = tokens.next_multiple_of(self.info.unit);
-        if padded > self.capacity {
-            return Err(EngineError::ContextExceeded { prompt: tokens, ctx: self.capacity });
-        }
-        Ok(())
+        check_prompt(&self.info, tokens)
     }
 
     fn generate(
@@ -512,7 +584,36 @@ impl Backend for Engine {
         request: GenRequest,
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<GenStats, EngineError> {
-        self.check_prompt(request.prompt.len())?;
+        check_prompt(&self.info, request.prompt.len())?;
+        let (events, received) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = Job { request, events, cancel: cancel.clone() };
+        let gone = || EngineError::Device("the engine thread stopped".into());
+        self.jobs.lock().unwrap_or_else(|p| p.into_inner()).send(job).map_err(|_| gone())?;
+        let mut listening = true;
+        loop {
+            match received.recv().map_err(|_| gone())? {
+                // Tokens the worker sent before it saw the cancel are dropped.
+                Event::Token(token) if listening => {
+                    if !on_token(token) {
+                        listening = false;
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+                Event::Token(_) => {}
+                Event::Done(result) => return result,
+            }
+        }
+    }
+}
+
+impl Core {
+    fn generate(
+        &self,
+        request: GenRequest,
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<GenStats, EngineError> {
+        check_prompt(&self.info, request.prompt.len())?;
         let mut run = Run {
             sampler: Sampler::new(request.sampling),
             params: request.sampling,
@@ -534,7 +635,7 @@ impl Backend for Engine {
     }
 }
 
-impl Engine {
+impl Core {
     /// The kept state a prompt `ids` can start from: the longest one whose tokens `ids`
     /// extends (with its stored output when `ids` is exactly its tokens), as (index, whole).
     fn pick_kept<S, O>(&self, ids: &[i32], kept: &[Kept<S, O>]) -> Option<(usize, bool)> {
@@ -821,7 +922,7 @@ impl Engine {
 /// The graphed decode loops (CUDA): one graph replay per step, the token or concept read back
 /// to the host once per step to stream it.
 #[cfg(feature = "cuda")]
-impl Engine {
+impl Core {
     /// The token baseline after its prompt pass (`logits` of the last prompt position); each
     /// token fed back is appended to `history`. The caller fills in the prompt's fields.
     fn graphed_tok(
@@ -913,6 +1014,8 @@ impl Engine {
         } else {
             greedy
         };
+        // Decoding starts with the first concept, whose tokens count (the eager path likewise).
+        let decode_started = Instant::now();
         let mut tokens = if speculate && pending.is_empty() {
             speculator.decode(model, cond, cache)
         } else {
@@ -921,7 +1024,6 @@ impl Engine {
         let mut skip = pending.len();
         let (mut capture_s, mut captured) = (0.0, false);
         let fresh = !(if speculate { append.is_captured() } else { step.is_captured() });
-        let decode_started = Instant::now();
         let mut empty_concepts = 0;
         let finish = loop {
             let picked = read_ids(&tokens);

@@ -151,3 +151,9 @@ fn attend_decode_matches_cpu_bf16() {
     let (device, _lock) = setup(DTYPE);
     attend_decode_matches(&device, TOL);
 }
+
+#[test]
+fn graphed_decoder_waits_for_a_full_ring_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_decoder_waits_for_a_full_ring(&device);
+}

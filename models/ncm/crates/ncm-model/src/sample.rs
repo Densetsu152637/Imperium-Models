@@ -276,7 +276,7 @@ mod kernel {
                     let v = vals[c];
                     let id = ids[c];
                     if v >= kept_floor {
-                        let h = mix(s0 ^ draw, s1, id);
+                        let h = mix(mix(s0, s1, draw), id, 0x6A09_E667u32);
                         let u = (f32::cast_from(h >> 8) + 0.5f32) / 16_777_216.0f32;
                         let score = v / temperature - f32::ln(-f32::ln(u));
                         if score > best || (score == best && id < at) {
@@ -351,7 +351,7 @@ mod kernel {
         while i < n {
             let v = logit(x, row, i);
             if v >= floor {
-                let h = mix(s0 ^ draw, s1, i as u32);
+                let h = mix(mix(s0, s1, draw), i as u32, 0x6A09_E667u32);
                 let u = (f32::cast_from(h >> 8) + 0.5f32) / 16_777_216.0f32;
                 let score = v / temperature - f32::ln(-f32::ln(u));
                 if score > best {

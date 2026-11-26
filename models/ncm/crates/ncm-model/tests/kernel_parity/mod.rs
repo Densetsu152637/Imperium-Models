@@ -382,6 +382,33 @@ pub fn graphed_tok_matches(device: &Device, spec: Option<QuantSpec>) {
     }
 }
 
+/// A captured [`GraphedDecoder`] kept across a reset to a prompt shorter than the
+/// cross-attention ring must not replay (the graph attends over the whole ring, stale slots
+/// included): it decodes eagerly until the ring is full again, giving the eager tokens.
+pub fn graphed_decoder_waits_for_a_full_ring(device: &Device) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        let model = build_ncm(&cfg, None, device);
+        let mut cache = model.make_cache(64 + 4 * 4, 1, device);
+        let mut decoder = GraphedDecoder::default();
+        let cond = model.prefill(ncm_prompt(device), &mut cache, 16);
+        decoder.decode(&model, cond, &mut cache);
+        assert!(decoder.is_captured(), "decoder graph: {:?}", decoder.failure());
+        cache.reset();
+        // One concept: the 8-token ring holds 4.
+        let short =
+            Tensor::<2, Int>::from_data(TensorData::new(vec![5i32, 9, 2, 7], [1, 4]), device);
+        let cond = model.prefill(short, &mut cache, 16);
+        let want = ints(model.decode_concept(cond.clone(), &mut cache, None, false).0);
+        let got = ints(decoder.decode(&model, cond, &mut cache));
+        assert_eq!(
+            got,
+            want,
+            "{}: a kept decoder graph replayed over a part-filled ring",
+            cfg.attention.name()
+        );
+    }
+}
+
 /// The quantisations the graphed-decode checks run with: q8, and q4 in groups of 64 with the
 /// output head quantised too.
 pub fn quant_specs() -> [QuantSpec; 2] {

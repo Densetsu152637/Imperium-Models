@@ -227,6 +227,11 @@ impl LatentCache {
         self.length
     }
 
+    /// Positions the cache holds at most.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Copies the next position into the device buffer the fused kernels read.
     #[cfg(feature = "cuda")]
     pub(crate) fn refresh_position(&self) {

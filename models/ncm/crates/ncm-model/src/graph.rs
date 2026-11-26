@@ -293,7 +293,7 @@ mod cuda {
         warmups: usize,
         run: impl Fn(&mut C) -> T,
         undo: impl Fn(&mut C),
-    ) -> Result<(BackendGraph<Dispatch>, T), String> {
+    ) -> Result<(Captured, T), String> {
         let dispatch = device.as_dispatch();
         let err = |what: &str, e: ExecutionError| format!("{what}: {e:?}");
         Dispatch::graph_prepare(dispatch).map_err(|e| err("graph_prepare", e))?;
@@ -311,18 +311,38 @@ mod cuda {
         let graph = Dispatch::graph_stop_capture(dispatch);
         undo(ctx);
         let graph = graph.map_err(|e| err("graph_stop_capture", e))?;
-        Ok((graph, out))
+        Ok((Captured::new(graph), out))
     }
 
-    /// Replays `graph` on `device`'s stream.
+    /// A captured graph and the thread that captured it. cubecl gives every OS thread its own
+    /// stream, and a replay is ordered only against the capture's stream: the inputs a caller
+    /// stages and the outputs it reads are ordered with the replay only on that thread. So a
+    /// graph replays only on its capturing thread ([`replay`] checks); a server runs all of a
+    /// model's GPU work on one thread.
+    pub(crate) struct Captured {
+        graph: BackendGraph<Dispatch>,
+        thread: std::thread::ThreadId,
+    }
+
+    impl Captured {
+        pub(crate) fn new(graph: BackendGraph<Dispatch>) -> Self {
+            Self { graph, thread: std::thread::current().id() }
+        }
+    }
+
+    /// Replays `graph` on `device`'s stream. Panics on a thread other than the capturing one.
     ///
     /// # Safety
     ///
     /// Every buffer the graph touched must still be alive (held by the caller's graph inputs
-    /// and outputs, the model's weights or the caches), and all work runs on this thread's
-    /// stream.
-    pub(crate) unsafe fn replay(device: &Device, graph: &BackendGraph<Dispatch>, what: &str) {
-        unsafe { Dispatch::graph_replay(device.as_dispatch(), graph) }
+    /// and outputs, the model's weights or the caches).
+    pub(crate) unsafe fn replay(device: &Device, graph: &Captured, what: &str) {
+        assert_eq!(
+            graph.thread,
+            std::thread::current().id(),
+            "the {what} graph replays only on the thread that captured it (its stream)"
+        );
+        unsafe { Dispatch::graph_replay(device.as_dispatch(), &graph.graph) }
             .unwrap_or_else(|e| panic!("{what} graph replay: {e:?}"));
     }
 }

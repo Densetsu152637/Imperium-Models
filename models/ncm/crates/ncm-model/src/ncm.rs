@@ -12,8 +12,6 @@
 //! Concept 0 is context only: it has no earlier concept to condition on, so logits cover tokens
 //! k .. N - 1 (`logits[:, t - k]` predicts token t).
 
-#[cfg(feature = "cuda")]
-use burn::backend::{BackendGraph, Dispatch};
 use burn::module::{Module, Param};
 use burn::nn::{Embedding, EmbeddingConfig, RmsNorm};
 use burn::tensor::{Bool, Device, Int, Tensor};
@@ -688,7 +686,7 @@ enum GraphState {
 
 #[cfg(feature = "cuda")]
 struct DecoderGraph {
-    graph: BackendGraph<Dispatch>,
+    graph: crate::graph::Captured,
     cond: Tensor<3>,
     rope_q: Rope,
     /// Kept for the buffers the graph reads.
@@ -719,7 +717,10 @@ impl GraphedDecoder {
                 Err(e) => GraphState::Failed(e),
             };
         }
-        let GraphState::Ready(g) = &self.state else {
+        // A graph kept across requests serves only once the cross-attention ring is full
+        // again: before, the eager pass attends over the filled slots alone.
+        let serving = ring_full && crate::fused::graphs_active(&device);
+        let (true, GraphState::Ready(g)) = (serving, &self.state) else {
             return model.decode_concept(cond, cache, None, false).0;
         };
         let (cos, sin) = model.rope(cache.tokens, model.k, &device).tables();
@@ -729,7 +730,7 @@ impl GraphedDecoder {
         crate::kernels::assign_into(&q_sin, sin, 0, 0);
         // Safety: every buffer the graph touched is held by `g` (its inputs and output), by the
         // model (weights) or by `cache` (the decoder caches), all of which outlive the replay,
-        // and all work runs on this thread's stream.
+        // (the replay checks it runs on the capturing thread).
         unsafe { crate::graph::replay(&device, &g.graph, "decoder") };
         g.tokens.clone()
     }
@@ -876,7 +877,7 @@ enum StepOut {
 
 #[cfg(feature = "cuda")]
 struct StepGraph {
-    graph: BackendGraph<Dispatch>,
+    graph: crate::graph::Captured,
     out: StepOut,
     inputs: StepInputs,
 }
@@ -1132,7 +1133,7 @@ impl StepGraph {
         inputs.refresh(model, cache);
         // Safety: every buffer the graph touched is held by `self` (inputs, outputs, RoPE
         // tables, cursors), by the model (weights) or by `cache`, all alive across the replay,
-        // and all work runs on this thread's stream.
+        // (the replay checks it runs on the capturing thread).
         unsafe { crate::graph::replay(&device, &self.graph, "concept step") };
         inputs.encoder.advance(&mut cache.encoder);
         for c in &mut cache.cross {

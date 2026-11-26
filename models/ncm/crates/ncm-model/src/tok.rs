@@ -148,7 +148,7 @@ enum TokState {
 
 #[cfg(feature = "cuda")]
 struct TokGraph {
-    graph: burn::backend::BackendGraph<burn::backend::Dispatch>,
+    graph: crate::graph::Captured,
     /// The input token `[B, 1]` (i32), copied in before each replay.
     input: Tensor<2, Int>,
     step: crate::layers::StackStep,
@@ -182,8 +182,7 @@ impl GraphedTok {
                 g.cursors.refresh(&mut g.staging);
                 g.staging.upload(&device);
                 // Safety: the graph's buffers are held by `g`, the model's weights and the
-                // caches, all alive across the replay, and everything runs on this thread's
-                // stream.
+                // caches, all alive across the replay (which checks its thread).
                 unsafe { crate::graph::replay(&device, &g.graph, "token step") };
                 g.step.advance(caches);
                 let out = g.output.clone();

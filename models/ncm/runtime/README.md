@@ -31,7 +31,7 @@ Not implemented: `stop` strings, penalties, `response_format`, images (`--mmproj
 
 ## Decode paths
 
-Every request resets the caches, prefills its prompt and decodes one of four ways (`timings.decode_path`):
+Every request resets or restores the caches (prefix reuse, below), prefills the rest of its prompt and decodes one of four ways (`timings.decode_path`). All of a model's GPU work runs on one engine thread, whatever thread the HTTP layer serves a request on: cubecl gives each thread its own stream, and the kept graphs replay in order only on the thread that captured them (a replay on another thread panics).
 
 | Path | Requests | How |
 |---|---|---|
@@ -54,7 +54,7 @@ The architecture and config come from `--config`, else the weight file's header,
 
 ## Context and cache
 
-The key/value caches are allocated at launch for the per-request context, rounded down to whole concepts for the NCM. `-c 1000000` allocates the 1M-token caches the architecture doc sizes (`ncm_model::cache_bytes`; about 1 GiB for the NCM and 5 GiB for the baseline in bf16); the launch line reports the bytes, `/props` and every response's `timings.cache_bytes` repeat them. Requests reset the caches; generation ends with `finish_reason: "length"` at the end of the context.
+The key/value caches are allocated at launch for the per-request context, rounded down to whole concepts for the NCM. `-c 1000000` allocates the 1M-token caches the architecture doc sizes (`ncm_model::cache_bytes`; about 1 GiB for the NCM and 5 GiB for the baseline in bf16); the launch line reports the bytes, `/props` and every response's `timings.cache_bytes` repeat them. Requests reset or restore the caches (prefix reuse); generation ends with `finish_reason: "length"` at the end of the context.
 
 ## Weight format
 

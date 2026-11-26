@@ -1012,7 +1012,11 @@ impl StackStep {
         for ((cache, cursor), position) in layers {
             match (cache, cursor, position) {
                 (LayerCache::Kv(kv), Some(i), _) => set.sync(*i, kv),
-                (LayerCache::Latent(c), _, Some(at)) => staging.ints(*at, 1)[0] = c.len() as i32,
+                (LayerCache::Latent(c), _, Some(at)) => {
+                    // A replay skips the eager step's bound check: refuse to write past the end.
+                    assert!(c.len() < c.capacity(), "cache capacity {} exceeded", c.capacity());
+                    staging.ints(*at, 1)[0] = c.len() as i32
+                }
                 _ => {}
             }
         }
@@ -1092,7 +1096,7 @@ enum StackGraphState {
 
 #[cfg(feature = "cuda")]
 struct StackGraph {
-    graph: burn::backend::BackendGraph<burn::backend::Dispatch>,
+    graph: crate::graph::Captured,
     input: Tensor<3>,
     step: StackStep,
     cursors: crate::graph::CursorSet,
@@ -1124,7 +1128,7 @@ impl GraphedStack {
         g.cursors.refresh(&mut g.staging);
         g.staging.upload(&device);
         // Safety: the graph's buffers are held by `g`, the stack's weights and the caches, all
-        // alive across the replay, and everything runs on this thread's stream.
+        // alive across the replay (the replay checks it runs on the capturing thread).
         unsafe { crate::graph::replay(&device, &g.graph, "stack") };
         g.step.advance(caches);
         g.output.clone()

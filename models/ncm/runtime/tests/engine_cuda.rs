@@ -86,6 +86,31 @@ fn graphed_paths_match_eager_and_sample_by_seed() {
         assert_eq!(run(&engine, prompt, sampled(7)).0, a, "a seed reproduces its reply");
         assert_ne!(run(&engine, prompt, sampled(8)).0, a, "another seed draws another reply");
     }
+    // Requests from different threads: the engine runs them all on its own thread, so its kept
+    // graphs replay on their capture stream; replies equal the eager ones.
+    for config in [tiny_tok_v2_config(), tiny_ncm_v2_config()] {
+        let engine = std::sync::Arc::new(engine(config.clone(), false));
+        set_cuda_graphs(false);
+        let eager: Vec<_> =
+            prompts.iter().map(|p| run(&engine, p, SamplingParams::GREEDY).0).collect();
+        set_cuda_graphs(true);
+        for round in 0..2 {
+            let handles: Vec<_> = (0..2)
+                .map(|t| {
+                    let engine = engine.clone();
+                    std::thread::spawn(move || {
+                        let p = prompts[(t + round) % 2];
+                        (p, run(&engine, p, SamplingParams::GREEDY).0)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (p, got) = handle.join().expect("a request thread");
+                let want = &eager[prompts.iter().position(|q| *q == p).unwrap()];
+                assert_eq!(&got, want, "{config:?}: a request from another thread differs");
+            }
+        }
+    }
     // Self-speculation (a model with a draft head) gives plain greedy's reply in f32.
     let Config::Ncm(base) = tiny_ncm_v2_config() else { unreachable!() };
     let with_draft = Config::Ncm(NcmConfig { draft_layers: 1, ..base });
