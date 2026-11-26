@@ -1033,25 +1033,51 @@ fn launch_attend_decode(
     let out = empty_like(&q, vec![b, kvh, rows, d]);
     let dtype = elem(q.dtype);
     let client = q.client.clone();
+    let cubes = b * kvh * rows;
+    // Split-KV: every split holds at most MAX_KEYS scores, and long caches split further
+    // (splits of at least 256 keys) until about two cubes per SM are reading.
+    let needed = keys.div_ceil(attend::MAX_KEYS);
+    let wanted = 168usize.div_ceil(cubes).min(keys.div_ceil(256));
+    let splits = needed.max(wanted).max(1);
+    let split_len = keys.div_ceil(splits);
+    let splits = keys.div_ceil(split_len);
+    let part = scratch(&q, vec![if splits > 1 { splits * cubes * (d + 2) } else { 1 }], DType::F32);
     unsafe {
         attend::attend_decode_kernel::launch_unchecked(
             &client,
-            CubeCount::Static((b * kvh * rows) as u32, 1, 1),
+            CubeCount::Static(cubes as u32, splits as u32, 1),
             CubeDim::new_1d(attend::CUBE as u32),
             q.into_tensor_arg(),
             k.into_tensor_arg(),
             v.into_tensor_arg(),
             mask.into_tensor_arg(),
             out.clone().into_tensor_arg(),
+            part.clone().into_tensor_arg(),
             kvh,
             rows,
             keys,
             t,
+            split_len,
             1.0 / (d as f32).sqrt(),
             d,
             masked,
+            splits > 1,
             dtype,
         );
+        if splits > 1 {
+            let count = cubes * d;
+            attend::attend_combine_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(count.div_ceil(attend::CUBE) as u32, 1, 1),
+                CubeDim::new_1d(attend::CUBE as u32),
+                part.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                count,
+                splits,
+                d,
+                dtype,
+            );
+        }
     }
     out
 }
@@ -1059,7 +1085,8 @@ fn launch_attend_decode(
 /// Whether [`attend_decode`] takes `rows` query rows per key/value head of width `d` against
 /// `keys` cached positions.
 pub fn attend_decode_fits(rows: usize, d: usize, keys: usize) -> bool {
-    rows <= 16 && d <= attend::CUBE && (1..=attend::MAX_KEYS).contains(&keys)
+    // Any number of keys: past MAX_KEYS the kernel splits them (split-KV).
+    rows <= 16 && d <= attend::CUBE && keys >= 1
 }
 
 /// Attention of a decode step in one kernel: `q` `[B, KVH, R, d]` (a group's query heads
