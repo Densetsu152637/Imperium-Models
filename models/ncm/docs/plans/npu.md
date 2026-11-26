@@ -1,6 +1,6 @@
 # Plan: NCM engine backend interface, with NPU backends as its first new implementation
 
-Revision: 2026-11-26, written against `9613f29` (feat/ncm-varlen-batch tip). Last updated 2026-11-26, rev 2: the plan-gate review of `1fe0b52` and the user's answers.
+Revision: 2026-11-26, written against `9613f29` (feat/ncm-varlen-batch tip). Last updated 2026-11-26, rev 3: re-review of `d238768` (rev 2 was the plan-gate review of `1fe0b52` and the user's answers).
 
 Nothing here is implemented, built or measured. Every number marked *est.* is an estimate. External facts carry their source; those marked *unverified* were not confirmed in this session.
 
@@ -12,7 +12,7 @@ Nothing here is implemented, built or measured. Every number marked *est.* is an
 - A batch-1 NPU backend in v1: accepted.
 
 > **Hardware: no NPU is available.** The development machine is an Intel i7-13700KF (no NPU) on Windows build 26300.
-> - Every on-NPU step is **blocked on hardware access**: Stage 0b, Stage 4, Stage 5, Stage 6, goal 5, and the NPU-specific parts of Stages 2–3.
+> - Every on-NPU step is **blocked on hardware access**: Stage 0b, Stage 4, Stage 5, Stages 6a–6b, goal 5, and the NPU-specific parts of Stages 2–3.
 > - The generic work runs on the CPU and in CI: the interface, the exporter, the ORT CPU backend.
 > - Ways to get hardware are open question 1.
 
@@ -22,7 +22,7 @@ Nothing here is implemented, built or measured. Every number marked *est.* is an
    - Check: the runtime tests pass unchanged on the Burn backend, `cargo test -p ncm-server` (CPU, CI) and `cargo test -p ncm-server --features cuda` (local GPU gate).
    - Check: speed stays within ±2% under the Stage 1b procedure.
 2. `ncm-exec` does not depend on Burn. The dependency direction is `ncm-model → ncm-exec`, `ncm-ort → ncm-exec`, and the runtime depends on all three.
-   - Check: `cargo tree -p ncm-exec -e normal | grep -c burn` prints 0.
+   - Check: `! cargo tree -p ncm-exec -e normal | grep -q burn` succeeds.
 3. The exported ONNX graphs match the Burn reference on ORT's CPU EP for every phase of the token baseline v2 and the hybrid:
    - f32 max |Δlogit| ≤ 1e-4;
    - identical greedy tokens over 64 steps;
@@ -230,6 +230,29 @@ What this means:
 
 Weight duplication across graphs is checked per EP (Stage 0b and Stage 5).
 
+### 4a. How NPU placement and NPU parity are checked
+
+**Placement**, the source of the partition acceptance:
+- Every graph meant for the NPU runs in its own ORT session with the session config `session.disable_cpu_ep_fallback = 1`. With that set, a node the EP rejects makes session creation fail instead of silently running on the CPU, so creating the session at all proves the graph is fully on the NPU.
+- The CPU parts get their own sessions on the CPU EP, so their placement holds by construction:
+  - the f32 DeltaNet inverse, on targets where Stage 0b puts it on the CPU;
+  - top-k and gather;
+  - host sampling.
+- The node counts in the harness JSON (`partition.<graph>.npu_nodes` / `cpu_nodes`) come from parsing ORT's verbose-log "Node placements" lines, with log severity set to verbose for the harness run only.
+
+**Parity on the NPU**, against the Burn reference with the *same* quantisation (`--quant q8` / `q4`, same group), over 64 greedy steps from fixed prompts:
+
+| Weights | max \|Δlogit\| (tiny model / 250M) | Greedy match |
+|---|---|---|
+| int8 | ≤ 0.05 / ≤ 0.1 | identical tokens for all 64 steps on the tiny model; ≥ 62/64 on the 250M sample |
+| int4 | ≤ 0.1 / ≤ 0.25 | identical tokens for all 64 steps on the tiny model; ≥ 60/64 on the 250M sample |
+
+These thresholds are *est.*; Stage 0b and Stage 4 re-derive them from the measured spread and record them with the result. A mismatch must also be explainable: the reference's top-2 logit margin at the first diverging step must be below the |Δlogit| bound.
+
+**Recurrent-state drift:**
+- The DeltaNet state buffers stay **f32** and **host-owned**: graph inputs and outputs in f32, even when activations are fp16 or int16. So rounding cannot compound in the stored state between invocations.
+- A long-context check on each target compares the NPU state against Burn f32 after 8,192 recurrent positions: max |Δ| ≤ 1e-2 *est.*, looser than the CPU EP's 1e-3 because the step's internal math runs at the NPU precision.
+
 ### 5. Expected speed and memory (*est.*, unmeasured; 250M configs)
 
 | Path | Weight bytes per step | Bandwidth ceiling (60 GB/s) | Planning guess |
@@ -285,7 +308,7 @@ Memory is all system RAM:
 - Stage 3 adds `--device ort-cpu`.
 - Stage 4 adds `--device npu:<target>` and the JSON schema.
 
-**Imperium:** `runtime.ncm.device` maps to `--device` (Stage 6), then the Imperium and research sessions are notified.
+**Imperium:** `runtime.ncm.device` maps to `--device` (Stage 6c), then the Imperium and research sessions are notified.
 
 **wgpu:** arrives as another Burn device in `BurnBackend`, with its own `Capabilities`.
 
@@ -358,7 +381,7 @@ Memory is all system RAM:
 - **Depends on:** `feat/ncm-varlen-batch` merged. It goes before CPU offload Stage 1 (decision 2).
 - **Owned paths:** `crates/ncm-exec/{Cargo.toml, src/lib.rs, src/footprint.rs}`, the workspace `Cargo.toml`, `crates/ncm-model/Cargo.toml`.
 - **Acceptance checks:**
-  - Goal 2's `cargo tree` check prints 0.
+  - Goal 2's check succeeds: `! cargo tree -p ncm-exec -e normal | grep -q burn`.
   - Unit tests of the byte sums: `cargo test -p ncm-exec`.
   - `scripts/check.sh` passes.
 - **Status:** pending
@@ -372,7 +395,10 @@ Memory is all system RAM:
   - Implement `BurnBackend` for CPU and CUDA.
   - Route `Core`'s sequential paths through the traits, one path at a time: eager, graphed greedy, graphed sampled, speculative, hybrid.
   - Keep the batcher as the Burn-only side door.
-- **Depends on:** stage 1a; CPU offload Stage 1 if it is in flight (it owns only the `engine.rs` start-up line).
+- **Depends on:** stage 1a.
+  - CPU offload Stage 1 is a soft ordering only: it touches just the `engine.rs` start-up line.
+  - If offload Stage 1 has landed, 1b keeps its footprint start-up line and routes it through `ExecBackend::footprint`.
+  - If it has not landed, 1b goes ahead, and offload Stage 1 later adds its line on top of the refactored `engine.rs` (a one-line edit there).
 - **Owned paths:**
   - `crates/ncm-exec/src/{exec.rs, hybrid.rs}`
   - `crates/ncm-model/src/{exec.rs, hybrid/fast.rs}`
@@ -411,6 +437,7 @@ Memory is all system RAM:
     - `BlockLogic` for the hybrid;
     - snapshots in system RAM;
     - the version check of decision 8.
+  - Before adding `ort` 2.0.0-rc.15, check its MSRV (`rust-version` in its `Cargo.toml`) against the workspace toolchain (`rust-toolchain.toml`, 1.99.1). If it needs a newer toolchain, stop and report instead of bumping the toolchain.
   - Add the `ort` feature to `runtime/Cargo.toml` (optional `ncm-ort` with `ort/load-dynamic`) and `--device ort-cpu`.
   - Make `runtime/tests/e2e.rs` take its device from the `NCM_E2E_DEVICE` environment variable (default: Burn CPU).
   - Add `--device ort-cpu` to `ncm-bench`.
@@ -445,41 +472,73 @@ Memory is all system RAM:
   - `runtime/src/{cli.rs, server.rs (readiness)}`
   - `scripts/npu-harness.ps1`
 - **Acceptance checks:**
-  - Goal 5 for Intel: the harness JSON validates against the schema, parity holds within the quantised tolerance, and the e2e tests pass.
-  - The partition shows every hot graph on the NPU, except the declared CPU parts (top-k and gather, and the f32 inverse if Stage 0b said so).
+  - Goal 5 for Intel: the harness JSON validates against the schema, and the e2e tests pass.
+  - Parity meets the int8 and int4 thresholds of decision 4a.
+  - The 8,192-position state-drift check passes.
+  - Every NPU session is created with `session.disable_cpu_ep_fallback = 1`.
+  - The parsed node placements show 0 CPU nodes in the NPU sessions.
 - **Status:** pending (**blocked: no NPU hardware**)
 - **Outcome:**
 - **Handoff notes:** correct the decision 5 estimates with the measured numbers.
 
-## Stage 5: NPU quantisation and graph-set tuning, per target (hardware-gated)
+## Stage 5: NPU quantisation and graph-set tuning, Intel (hardware-gated)
 - **Objective:**
-  - Per target, choose:
+  - On Intel, choose:
     - the weight form: symmetric int4 or int8 QDQ;
-    - the activation precision: fp16, bf16 (XDNA) or int16 (HTP);
+    - the activation precision;
     - the level bucketing: one padded graph or two buckets;
     - the prefill buckets.
   - Enable weight sharing between graphs where the EP supports it.
-- **Depends on:** stage 4 (for Intel), then each later target's stage 6 bring-up.
-- **Owned paths:** `crates/ncm-export/src/{quant.rs, targets.rs}`, `crates/ncm-ort/src/ep/*`, `docs/quantisation.md` (NPU section).
+  - Record the choices as the `intel` target profile.
+- **Depends on:** stage 4.
+- **Owned paths:** `crates/ncm-export/src/{quant.rs, targets.rs}`, `crates/ncm-ort/src/ep/openvino.rs`, `docs/quantisation.md` (NPU section).
 - **Acceptance checks:**
-  - Greedy tokens match the Burn quantised reference: tiny model, and a 64-step 250M sample.
+  - Decision 4a parity for both weight forms.
   - Weights in memory are at most 1.5× one copy.
-  - The harness JSON improves on the previous run.
+  - The harness JSON improves on Stage 4's decode or prefill tok/s.
 - **Status:** pending (**blocked: no NPU hardware**)
 - **Outcome:**
-- **Handoff notes:** acceptance data from a trained hybrid decides how much fill-pass count matters.
+- **Handoff notes:** acceptance data from a trained hybrid decides how much fill-pass count matters. The profile format becomes the template for 6a and 6b.
 
-## Stage 6: Qualcomm, then AMD; Imperium release (hardware-gated)
+## Stage 6a: Qualcomm bring-up and tuning (hardware-gated)
 - **Objective:**
-  - Bring up `npu:qualcomm` through the QNN EP: context-binary caching per QAIRT version, int8/int16 QDQ, the f32 inverse on the CPU.
-  - Then `npu:amd` through the VitisAI EP. If custom graphs do not compile there, stop and report: OGA-prepared models are the only documented LLM route, and adopting OGA would be a separate decision.
-  - Map Imperium's `runtime.ncm.device`, document it in `runtime/README.md`, and notify the Imperium and research sessions.
-- **Depends on:** stage 5; stage 0b and hardware for each target.
-- **Owned paths:**
-  - `crates/ncm-ort/src/ep/{qnn.rs, vitisai.rs}`
-  - `runtime/README.md`
-  - an Imperium PR for the setting, if needed (owned by the Imperium implementation session)
-- **Acceptance checks:** goal 5 per target, from the harness JSON.
+  - Bring up `--device npu:qualcomm` through the QNN EP.
+  - Cache the context binaries per QAIRT version.
+  - Export with int8/int16 QDQ and fp16 options.
+  - Run the f32 inverse in its CPU session.
+  - Tune as in Stage 5 and record the `qualcomm` profile.
+- **Depends on:** stage 5 (profile format, harness); stage 0b for Qualcomm; Snapdragon X hardware.
+- **Owned paths:** `crates/ncm-ort/src/ep/qnn.rs`, the `qualcomm` profile in `crates/ncm-export/src/targets.rs`.
+- **Acceptance checks:**
+  - Goal 5 for Qualcomm.
+  - Decision 4a parity and state drift.
+  - `disable_cpu_ep_fallback` sessions are created, with 0 CPU nodes in NPU sessions.
 - **Status:** pending (**blocked: no NPU hardware**)
+- **Outcome:**
+- **Handoff notes:** record the QAIRT and ORT versions with the result. Context binaries must be rebuilt when QAIRT changes.
+
+## Stage 6b: AMD bring-up and tuning (hardware-gated)
+- **Objective:**
+  - Bring up `--device npu:amd` through the VitisAI EP with the exported graphs, then tune as in Stage 5 and record the `amd` profile.
+  - If custom graphs do not compile with CPU fallback disabled, stop and report. OGA-prepared models are the only documented LLM route, and adopting OGA is a separate decision.
+- **Depends on:** stage 5; stage 0b for AMD; Ryzen AI 300 hardware. It is independent of 6a.
+- **Owned paths:** `crates/ncm-ort/src/ep/vitisai.rs`, the `amd` profile in `crates/ncm-export/src/targets.rs`.
+- **Acceptance checks:** goal 5 for AMD, plus decision 4a parity and state drift, and the fallback-disabled sessions. Otherwise, a recorded stop report naming the rejected ops.
+- **Status:** pending (**blocked: no NPU hardware**)
+- **Outcome:**
+- **Handoff notes:** Ryzen AI releases break compatibility between versions, so record the exact release.
+
+## Stage 6c: Imperium mapping and release
+- **Objective:**
+  - Map Imperium's `runtime.ncm.device` to `ncm-server --device`, via an Imperium PR owned by the Imperium implementation session.
+  - Document the devices in `runtime/README.md`.
+  - Write release notes listing the supported targets and their status.
+  - Notify the Imperium and research sessions.
+- **Depends on:** stage 3, for `ort-cpu`, and stage 4, for the first NPU target. Later targets are added to the notes as 6a and 6b land.
+- **Owned paths:** `runtime/README.md`, the release notes; the Imperium PR is owned by the Imperium implementation session.
+- **Acceptance checks:**
+  - With Imperium set to `runtime.ncm.device = "npu:intel"` (or `ort-cpu` without hardware), Imperium launches `ncm-server` with the matching `--device` and completes a chat.
+  - The e2e test of the Imperium launch line passes.
+- **Status:** pending
 - **Outcome:**
 - **Handoff notes:** NPU batching stays out of scope until a target shows batch-1 is dispatch-bound and the EP supports it.
