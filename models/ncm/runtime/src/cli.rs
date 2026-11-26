@@ -103,9 +103,15 @@ pub struct Cli {
     pub top_k: usize,
     #[arg(long, default_value_t = 0.95)]
     pub top_p: f32,
-    /// Prompt tokens fed to the model per step.
-    #[arg(long, default_value_t = 512)]
-    pub prefill_chunk: usize,
+    /// Prompt tokens fed to the model per step (default 8192 for the v2 design, 512 for the
+    /// fallback).
+    #[arg(long)]
+    pub prefill_chunk: Option<usize>,
+    /// Decode greedy, unconstrained NCM requests by self-speculation (draft and verify passes)
+    /// when the model has a draft head; CUDA only. Off by default: in bf16 the parallel verify
+    /// pass may resolve a near tie differently from step-by-step greedy decoding.
+    #[arg(long)]
+    pub speculate: bool,
     /// Quantise the linear layers' weights at load. A quantised weight file loads as it is.
     #[arg(long, value_enum, default_value = "none")]
     pub quant: QuantArg,

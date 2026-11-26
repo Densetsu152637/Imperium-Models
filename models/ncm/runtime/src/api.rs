@@ -245,8 +245,10 @@ fn per_token_ms(count: usize, seconds: f64) -> f64 {
 }
 
 /// llama-server's `timings` object, with prompt processing and decoding timed separately.
-/// `predicted_per_second` is the decode speed in tokens per second; `cache_bytes` is the
-/// key/value cache allocated at launch (an extension).
+/// `predicted_per_second` is the decode speed in tokens per second. Extensions: `cache_bytes`,
+/// the key/value cache allocated at launch; `graph_capture_ms`, the decode graph's capture
+/// (counted in neither `prompt_ms` nor `predicted_ms`); `decode_path`, the loop the request
+/// took (`eager`, `graphed-greedy`, `graphed-sampled`, `speculative`).
 pub fn timings_json(stats: &GenStats, cache_bytes: usize) -> Value {
     json!({
         "cache_n": 0,
@@ -259,6 +261,8 @@ pub fn timings_json(stats: &GenStats, cache_bytes: usize) -> Value {
         "predicted_per_token_ms": per_token_ms(stats.decode_tokens, stats.decode_s),
         "predicted_per_second": per_second(stats.decode_tokens, stats.decode_s),
         "cache_bytes": cache_bytes,
+        "graph_capture_ms": stats.capture_s * 1000.0,
+        "decode_path": stats.path.name(),
     })
 }
 

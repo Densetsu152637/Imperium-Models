@@ -19,8 +19,10 @@ use crate::constrain::Constraint;
 use crate::sampling::{Sampler, SamplingParams};
 use crate::vocab::{Specials, Vocab, VocabError};
 
-/// Prompt tokens fed to the model at once.
+/// Prompt tokens fed to the model at once: the fallback design's default.
 pub const DEFAULT_PREFILL_CHUNK: usize = 512;
+/// The v2 design's default: its fused prefill kernels are fastest on long chunks.
+pub const DEFAULT_PREFILL_CHUNK_V2: usize = 8192;
 /// Concepts in a row with no output before an NCM reply is cut off.
 const MAX_EMPTY_CONCEPTS: usize = 16;
 
@@ -70,6 +72,38 @@ pub struct GenStats {
     /// Tokens produced in `decode_s` (the token baseline's first token comes from the prompt
     /// pass, so it is not counted here).
     pub decode_tokens: usize,
+    /// Seconds spent capturing the decode graph (outside `prompt_s` and `decode_s`; 0 when
+    /// none was captured).
+    pub capture_s: f64,
+    /// How the reply was decoded ([`DecodePath`]).
+    pub path: DecodePath,
+}
+
+/// The decode loop a request took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodePath {
+    /// Per-token steps with the host choosing every token: grammar-constrained requests, the
+    /// CPU, and CUDA with the fused kernels off.
+    Eager,
+    /// One captured CUDA graph replay per step (per concept for the NCM), greedy picks on the
+    /// device.
+    GraphedGreedy,
+    /// The same with temperature, top-k and top-p sampling on the device.
+    GraphedSampled,
+    /// Self-speculative greedy decoding (NCM with a draft head, `--speculate`): draft and
+    /// verify passes, each concept appended through a graph.
+    Speculative,
+}
+
+impl DecodePath {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Eager => "eager",
+            Self::GraphedGreedy => "graphed-greedy",
+            Self::GraphedSampled => "graphed-sampled",
+            Self::Speculative => "speculative",
+        }
+    }
 }
 
 pub struct GenRequest {
@@ -159,6 +193,10 @@ pub struct EngineOptions {
     /// Quantise the linear layers' weights at load (see `ncm_model::quant`). A quantised weight
     /// file loads as it is; this must then be None or the file's own spec.
     pub quant: Option<QuantSpec>,
+    /// Decode greedy, unconstrained NCM requests by self-speculation when the model has a draft
+    /// head (CUDA only). The parallel verify pass rounds differently from step-by-step decoding,
+    /// so in bf16 a near tie may go the other way: off by default.
+    pub speculate: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -174,6 +212,9 @@ pub struct Engine {
     chunk: usize,
     /// Tokens the caches hold.
     capacity: usize,
+    /// Read by the graphed paths (CUDA builds).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    speculate: bool,
     state: Mutex<State>,
 }
 
@@ -234,6 +275,7 @@ impl Engine {
             seed,
             prefill_chunk,
             quant,
+            speculate,
         } = options;
         if vocab.len() != config.vocab_size() {
             return Err(EngineError::VocabMismatch {
@@ -282,6 +324,7 @@ impl Engine {
             device,
             chunk: prefill_chunk.max(unit),
             capacity,
+            speculate,
             state: Mutex::new(state),
         })
     }
@@ -292,6 +335,25 @@ impl Engine {
 
     fn sync(&self) {
         self.device.sync().ok();
+    }
+
+    /// Whether requests may take the graphed device paths: CUDA with the fused kernels and
+    /// graphs on.
+    #[cfg(feature = "cuda")]
+    fn graphs(&self) -> bool {
+        ncm_model::fused::graphs_active(&self.device)
+    }
+}
+
+/// The device sampler's settings for a sampled request.
+#[cfg(feature = "cuda")]
+fn device_sampling(params: SamplingParams) -> ncm_model::sample::SampleSettings {
+    ncm_model::sample::SampleSettings {
+        temperature: params.temperature,
+        top_k: params.top_k,
+        top_p: params.top_p,
+        seed: params.seed.unwrap_or_else(crate::sampling::entropy),
+        counter: 0,
     }
 }
 
@@ -312,6 +374,8 @@ fn read_ids(tokens: &Tensor<2, Int>) -> Vec<u32> {
 /// Mutable state of one generation, shared by both architectures.
 struct Run<'a> {
     sampler: Sampler,
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    params: SamplingParams,
     constraint: Option<Box<dyn Constraint>>,
     ids: Specials,
     on_token: &'a mut dyn FnMut(u32) -> bool,
@@ -380,6 +444,7 @@ impl Backend for Engine {
         self.check_prompt(request.prompt.len())?;
         let mut run = Run {
             sampler: Sampler::new(request.sampling),
+            params: request.sampling,
             constraint: request.constraint,
             ids: self.vocab.ids,
             on_token,
@@ -415,6 +480,11 @@ impl Engine {
         let logits = model
             .prefill(self.int_tensor(&ids), caches, self.chunk)
             .ok_or(EngineError::EmptyPrompt)?;
+        #[cfg(feature = "cuda")]
+        if self.graphs() && run.constraint.is_none() {
+            let prompt_s = started.elapsed().as_secs_f64();
+            return Ok(self.graphed_tok(model, caches, logits, prompt.len(), prompt_s, run));
+        }
         let mut row = read_logits(&logits);
         let prompt_s = started.elapsed().as_secs_f64();
         let decode_started = Instant::now();
@@ -441,6 +511,8 @@ impl Engine {
             prompt_s,
             decode_s: decode_started.elapsed().as_secs_f64(),
             decode_tokens: run.emitted.saturating_sub(1),
+            capture_s: 0.0,
+            path: DecodePath::Eager,
         })
     }
 
@@ -464,6 +536,11 @@ impl Engine {
         let mut cond = model.prefill(self.int_tensor(&padded), cache, self.chunk);
         self.sync();
         let prompt_s = started.elapsed().as_secs_f64();
+        #[cfg(feature = "cuda")]
+        if self.graphs() && run.constraint.is_none() {
+            let stats = self.graphed_ncm(model, cache, cond, padded.len(), run);
+            return Ok(GenStats { prompt_tokens: prompt.len(), prompt_s, ..stats });
+        }
         let decode_started = Instant::now();
         let mut written = padded.len();
         let device = self.device.clone();
@@ -525,6 +602,166 @@ impl Engine {
             prompt_s,
             decode_s: decode_started.elapsed().as_secs_f64(),
             decode_tokens: run.emitted,
+            capture_s: 0.0,
+            path: DecodePath::Eager,
         })
+    }
+}
+
+/// The graphed decode loops (CUDA): one graph replay per step, the token or concept read back
+/// to the host once per step to stream it.
+#[cfg(feature = "cuda")]
+impl Engine {
+    /// The token baseline after its prompt pass (`logits` of the last prompt position).
+    fn graphed_tok(
+        &self,
+        model: &TokenLm,
+        caches: &mut [LayerCache],
+        logits: Tensor<3>,
+        prompt_tokens: usize,
+        prompt_s: f64,
+        run: &mut Run<'_>,
+    ) -> GenStats {
+        use ncm_model::tok::GraphedTok;
+        let sampled = !run.params.is_greedy();
+        let mut graphed = if sampled {
+            GraphedTok::sampled(&self.device, device_sampling(run.params))
+        } else {
+            GraphedTok::default()
+        };
+        let mut token = graphed.first(logits);
+        let capture_started = Instant::now();
+        graphed.prepare(model, &token, caches);
+        self.sync();
+        let capture_s = capture_started.elapsed().as_secs_f64();
+        let decode_started = Instant::now();
+        let mut written = prompt_tokens;
+        let finish = loop {
+            let id = read_ids(&token)[0];
+            match run.emit(id) {
+                Emit::Stop => break Finish::Stop,
+                Emit::Limit => break Finish::Length,
+                Emit::Go => {}
+            }
+            if written >= self.capacity {
+                break Finish::Length;
+            }
+            token = graphed.step(model, token, caches);
+            written += 1;
+        };
+        GenStats {
+            prompt_tokens,
+            completion_tokens: run.emitted,
+            finish,
+            prompt_s,
+            decode_s: decode_started.elapsed().as_secs_f64(),
+            decode_tokens: run.emitted.saturating_sub(1),
+            capture_s,
+            path: if sampled { DecodePath::GraphedSampled } else { DecodePath::GraphedGreedy },
+        }
+    }
+
+    /// The NCM after its prompt (`cond`, `written` tokens in the cache). Greedy requests replay
+    /// [`ncm_model::ncm::GraphedStep`] (append the concept just written and decode the next one
+    /// in one graph), or decode by self-speculation with `--speculate`; sampled ones replay its
+    /// device-sampling variant. Concepts are cut at the end-of-concept token and padded before
+    /// they are appended, as on the eager path.
+    fn graphed_ncm(
+        &self,
+        model: &NcmLm,
+        cache: &mut NcmCache,
+        cond: Tensor<3>,
+        written: usize,
+        run: &mut Run<'_>,
+    ) -> GenStats {
+        use ncm_model::ncm::{GraphedAppend, GraphedStep};
+        use ncm_model::{Acceptance, Speculator};
+        let k = model.concept_size();
+        let ids = run.ids;
+        let sampled = !run.params.is_greedy();
+        let speculate = !sampled && self.speculate && model.has_draft_head();
+        let mut step = if sampled {
+            GraphedStep::sampled(&self.device, device_sampling(run.params))
+        } else {
+            GraphedStep::default()
+        };
+        let mut speculator = Speculator::new(Acceptance::Verify);
+        let mut append = GraphedAppend::default();
+        let mut tokens = if speculate {
+            speculator.decode(model, cond, cache)
+        } else {
+            step.first(model, cond, cache)
+        };
+        let (mut capture_s, mut captured) = (0.0, false);
+        let decode_started = Instant::now();
+        let mut written = written;
+        let mut empty_concepts = 0;
+        let finish = 'generate: loop {
+            let picked = read_ids(&tokens);
+            let before = run.emitted;
+            let mut concept: Vec<i32> = Vec::with_capacity(k);
+            for &token in &picked {
+                concept.push(token as i32);
+                if token == ids.eoc {
+                    break;
+                }
+                match run.emit(token) {
+                    Emit::Stop => break 'generate Finish::Stop,
+                    Emit::Limit => break 'generate Finish::Length,
+                    Emit::Go => {}
+                }
+            }
+            empty_concepts = if run.emitted == before { empty_concepts + 1 } else { 0 };
+            if empty_concepts >= MAX_EMPTY_CONCEPTS {
+                break Finish::Stop;
+            }
+            if written + k > self.capacity {
+                break Finish::Length;
+            }
+            // Fed back as decoded unless the concept ended early (then padded).
+            let input = if concept.len() == k {
+                tokens
+            } else {
+                concept.resize(k, ids.pad as i32);
+                self.int_tensor(&concept)
+            };
+            // The first step that can be graphed captures its graph (once the cross-attention
+            // ring is full): timed apart from decoding.
+            let failed = step.failure().is_some() || append.failure().is_some();
+            if !captured && !failed {
+                let capture_started = Instant::now();
+                captured = if speculate {
+                    append.prepare(model, &input, cache)
+                } else {
+                    step.prepare(model, &input, cache)
+                };
+                if captured {
+                    self.sync();
+                    capture_s = capture_started.elapsed().as_secs_f64();
+                }
+            }
+            tokens = if speculate {
+                let cond = append.append(model, input, cache);
+                speculator.decode(model, cond, cache)
+            } else {
+                step.step(model, input, cache)
+            };
+            written += k;
+        };
+        let path = match (speculate, sampled) {
+            (true, _) => DecodePath::Speculative,
+            (false, true) => DecodePath::GraphedSampled,
+            (false, false) => DecodePath::GraphedGreedy,
+        };
+        GenStats {
+            prompt_tokens: 0,
+            completion_tokens: run.emitted,
+            finish,
+            prompt_s: 0.0,
+            decode_s: (decode_started.elapsed().as_secs_f64() - capture_s).max(0.0),
+            decode_tokens: run.emitted,
+            capture_s,
+            path,
+        }
     }
 }

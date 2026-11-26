@@ -132,6 +132,9 @@ impl TokenLm {
 #[derive(Default)]
 pub struct GraphedTok {
     state: TokState,
+    /// Sampled decoding ([`Self::sampled`]): the device sampler and the request's settings;
+    /// None: greedy.
+    sampler: Option<(crate::sample::SampleParams, crate::sample::SampleSettings)>,
 }
 
 #[cfg(feature = "cuda")]
@@ -169,6 +172,7 @@ impl GraphedTok {
     ) -> Tensor<2, Int> {
         let device = token.device();
         let [b, t] = token.dims();
+        self.refresh_sampler();
         if t == 1 && crate::fused::graphs_active(&device) {
             self.prepare(model, &token, caches);
             if let TokState::Ready(g) = &mut self.state {
@@ -182,10 +186,53 @@ impl GraphedTok {
                 // stream.
                 unsafe { crate::graph::replay(&device, &g.graph, "token step") };
                 g.step.advance(caches);
-                return g.output.clone();
+                let out = g.output.clone();
+                self.advance();
+                return out;
             }
         }
-        crate::fused::argmax_last(model.step(token, caches)).reshape([b, 1])
+        let logits = model.step(token, caches);
+        let out = self.pick_eager(logits);
+        debug_assert_eq!(out.dims(), [b, 1]);
+        out
+    }
+
+    /// A step that samples the token on the device instead of taking the argmax
+    /// ([`crate::sample`]), inside the same graph. `settings.counter` is the request's first
+    /// draw.
+    pub fn sampled(device: &Device, settings: crate::sample::SampleSettings) -> Self {
+        let params = crate::sample::SampleParams::new(device);
+        Self { sampler: Some((params, settings)), ..Default::default() }
+    }
+
+    /// The token `[B, 1]` picked from `logits` `[B, 1, V]` (the prompt's last position) like
+    /// every step picks: argmax, or the device sampler, advancing its counter.
+    pub fn first(&mut self, logits: Tensor<3>) -> Tensor<2, Int> {
+        self.refresh_sampler();
+        self.pick_eager(logits)
+    }
+
+    fn pick_eager(&mut self, logits: Tensor<3>) -> Tensor<2, Int> {
+        let [b, _, v] = logits.dims();
+        let out = match &self.sampler {
+            Some((params, _)) => crate::sample::sample(logits.reshape([b, v]), params, 0),
+            None => crate::fused::argmax_last(logits).reshape([b, 1]),
+        };
+        self.advance();
+        out
+    }
+
+    /// Copies the sampler's settings to the device before a draw.
+    fn refresh_sampler(&self) {
+        if let Some((params, settings)) = &self.sampler {
+            params.set(*settings);
+        }
+    }
+
+    fn advance(&mut self) {
+        if let Some((_, settings)) = &mut self.sampler {
+            settings.counter = settings.counter.wrapping_add(1);
+        }
     }
 
     /// Captures the graph now (if none is ready and it can serve a step from `token` `[B, 1]`),
@@ -199,7 +246,8 @@ impl GraphedTok {
     ) -> bool {
         let eligible = token.dims()[1] == 1 && crate::fused::graphs_active(&token.device());
         if matches!(self.state, TokState::Untried) && eligible {
-            self.state = match model.capture_step(token, caches) {
+            let sample = self.sampler.as_ref().map(|s| s.0.clone());
+            self.state = match model.capture_step(token, caches, sample) {
                 Ok(graph) => TokState::Ready(Box::new(graph)),
                 Err(e) => TokState::Failed(e),
             };
@@ -223,12 +271,13 @@ impl GraphedTok {
 
 #[cfg(feature = "cuda")]
 impl TokenLm {
-    /// Warms up and records one greedy step over fixed input buffers, leaving the caches as
+    /// Warms up and records one step (greedy, or sampled per `sample`) over fixed input buffers, leaving the caches as
     /// they were.
     fn capture_step(
         &self,
         token: &Tensor<2, Int>,
         caches: &mut [LayerCache],
+        sample: Option<crate::sample::SampleParams>,
     ) -> Result<TokGraph, String> {
         use crate::layers::StackStep;
         let device = token.device();
@@ -246,7 +295,14 @@ impl TokenLm {
             staging.scatter();
             let x = self.emb.forward(input.clone());
             let h = step.run(&self.stack, x, caches, &cursors.steps());
-            crate::fused::argmax_last(self.logits(h)).reshape([b, 1])
+            let logits = self.logits(h);
+            match &sample {
+                Some(params) => {
+                    let v = logits.dims()[2];
+                    crate::sample::sample(logits.reshape([b, v]), params, 0)
+                }
+                None => crate::fused::argmax_last(logits).reshape([b, 1]),
+            }
         };
         let undo = |caches: &mut [LayerCache]| StackStep::restore(caches, &saved);
         let (graph, output) = crate::graph::record(&device, caches, 2, run, undo)?;

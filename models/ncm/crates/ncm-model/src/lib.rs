@@ -20,6 +20,8 @@ pub mod layers;
 pub mod ncm;
 pub mod quant;
 pub mod retrieval;
+#[cfg(feature = "cuda")]
+pub mod sample;
 pub mod speculative;
 pub mod tok;
 pub mod weights;

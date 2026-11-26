@@ -745,6 +745,29 @@ impl NcmLm {
     }
 }
 
+/// Token `j` of a concept drawn by the device sampler from its logits `[B, 1, V]`.
+#[cfg(feature = "cuda")]
+fn sample_pick(
+    logits: &Tensor<3>,
+    params: &crate::sample::SampleParams,
+    j: usize,
+) -> Tensor<2, Int> {
+    let [b, _, v] = logits.dims();
+    crate::sample::sample(logits.clone().reshape([b, v]), params, j as u32)
+}
+
+/// The next concept from `cond`, each token drawn by the device sampler (eagerly).
+#[cfg(feature = "cuda")]
+fn sampled_concept(
+    model: &NcmLm,
+    cond: Tensor<3>,
+    cache: &mut NcmCache,
+    params: &crate::sample::SampleParams,
+) -> Tensor<2, Int> {
+    let mut pick = |j: usize, logits: &Tensor<3>| sample_pick(logits, params, j);
+    model.decode_concept_with(cond, cache, false, &mut pick).0
+}
+
 /// The greedy pick of [`NcmLm::decode_with_ropes`] on the device.
 #[cfg(feature = "cuda")]
 fn greedy(_: usize, logits: &Tensor<3>) -> Tensor<2, Int> {
@@ -769,6 +792,27 @@ fn greedy(_: usize, logits: &Tensor<3>) -> Tensor<2, Int> {
 pub struct GraphedStep {
     state: StepState,
     decoder: GraphedDecoder,
+    /// Sampled decoding ([`Self::sampled`]); None: greedy.
+    sampler: Option<StepSampler>,
+}
+
+/// The device sampler of a sampled [`GraphedStep`] and the request's settings, whose counter
+/// advances by `k` draws per concept.
+#[cfg(feature = "cuda")]
+struct StepSampler {
+    params: crate::sample::SampleParams,
+    settings: crate::sample::SampleSettings,
+}
+
+/// How a step graph picks the next concept's tokens.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+enum Pick {
+    /// No decoder pass ([`GraphedAppend`]).
+    None,
+    Greedy,
+    /// [`crate::sample::sample`] with these device settings, draw `counter + j` for token j.
+    Sample(Box<crate::sample::SampleParams>),
 }
 
 /// [`NcmLm::append_tokens`] of one concept as a captured CUDA graph, like [`GraphedStep`]
@@ -839,13 +883,62 @@ impl GraphedStep {
         tokens: Tensor<2, Int>,
         cache: &mut NcmCache,
     ) -> Tensor<2, Int> {
-        match self.state.run(model, &tokens, cache, true) {
+        let pick = self.pick();
+        let out = match self.state.run(model, &tokens, cache, &pick) {
             Some(StepOut::Tokens(t)) => t,
             Some(StepOut::Cond(_)) => unreachable!("a decoding step graph writes tokens"),
             None => {
                 let cond = model.append_tokens(tokens, cache);
-                self.decoder.decode(model, cond, cache)
+                match &pick {
+                    Pick::Sample(params) => sampled_concept(model, cond, cache, params),
+                    _ => self.decoder.decode(model, cond, cache),
+                }
             }
+        };
+        self.advance(model.k);
+        out
+    }
+
+    /// A step that samples each token on the device instead of taking the argmax
+    /// ([`crate::sample`]: temperature, top-k and top-p, a seeded counter-based random stream),
+    /// inside the same graph. `settings.counter` is the request's first draw.
+    pub fn sampled(device: &Device, settings: crate::sample::SampleSettings) -> Self {
+        let params = crate::sample::SampleParams::new(device);
+        Self { sampler: Some(StepSampler { params, settings }), ..Default::default() }
+    }
+
+    /// The first concept of a reply from the prompt's condition `cond`, picked like every later
+    /// one (argmax, or the device sampler, advancing its counter), run eagerly: the step graph
+    /// serves only concepts that follow a written one.
+    pub fn first(
+        &mut self,
+        model: &NcmLm,
+        cond: Tensor<3>,
+        cache: &mut NcmCache,
+    ) -> Tensor<2, Int> {
+        let out = match self.pick() {
+            Pick::Sample(params) => sampled_concept(model, cond, cache, &params),
+            _ => model.decode_concept(cond, cache, None, false).0,
+        };
+        self.advance(model.k);
+        out
+    }
+
+    /// The pick of the next step, its device settings refreshed.
+    fn pick(&self) -> Pick {
+        match &self.sampler {
+            None => Pick::Greedy,
+            Some(s) => {
+                s.params.set(s.settings);
+                Pick::Sample(Box::new(s.params.clone()))
+            }
+        }
+    }
+
+    /// Counts the draws of a written concept.
+    fn advance(&mut self, k: usize) {
+        if let Some(s) = &mut self.sampler {
+            s.settings.counter = s.settings.counter.wrapping_add(k as u32);
         }
     }
 
@@ -858,7 +951,8 @@ impl GraphedStep {
         tokens: &Tensor<2, Int>,
         cache: &mut NcmCache,
     ) -> bool {
-        self.state.prepare(model, tokens, cache, true);
+        let pick = self.pick();
+        self.state.prepare(model, tokens, cache, &pick);
         self.is_captured()
     }
 
@@ -884,7 +978,7 @@ impl GraphedAppend {
         tokens: Tensor<2, Int>,
         cache: &mut NcmCache,
     ) -> Tensor<3> {
-        match self.state.run(model, &tokens, cache, false) {
+        match self.state.run(model, &tokens, cache, &Pick::None) {
             Some(StepOut::Cond(c)) => c,
             Some(StepOut::Tokens(_)) => unreachable!("an append graph writes the condition"),
             None => model.append_tokens(tokens, cache),
@@ -898,7 +992,7 @@ impl GraphedAppend {
         tokens: &Tensor<2, Int>,
         cache: &mut NcmCache,
     ) -> bool {
-        self.state.prepare(model, tokens, cache, false);
+        self.state.prepare(model, tokens, cache, &Pick::None);
         self.is_captured()
     }
 
@@ -922,13 +1016,13 @@ impl StepState {
         model: &NcmLm,
         tokens: &Tensor<2, Int>,
         cache: &mut NcmCache,
-        decode: bool,
+        pick: &Pick,
     ) -> Option<StepOut> {
         let device = tokens.device();
         if !crate::fused::graphs_active(&device) || tokens.dims()[1] != model.k {
             return None;
         }
-        self.prepare(model, tokens, cache, decode);
+        self.prepare(model, tokens, cache, pick);
         let StepState::Ready(g) = self else { return None };
         g.replay(model, tokens.clone(), cache);
         Some(match &g.out {
@@ -944,7 +1038,7 @@ impl StepState {
         model: &NcmLm,
         tokens: &Tensor<2, Int>,
         cache: &mut NcmCache,
-        decode: bool,
+        pick: &Pick,
     ) {
         if matches!(self, StepState::Ready(g) if g.inputs.epoch != cache.epoch) {
             *self = StepState::Untried;
@@ -952,7 +1046,7 @@ impl StepState {
         let ring_full = cache.cross.iter().all(|c| c.window().is_some() && c.len() >= c.capacity());
         let eligible = crate::fused::graphs_active(&tokens.device()) && tokens.dims()[1] == model.k;
         if matches!(self, StepState::Untried) && ring_full && eligible {
-            *self = match model.capture_step(tokens, cache, decode) {
+            *self = match model.capture_step(tokens, cache, pick) {
                 Ok(graph) => StepState::Ready(Box::new(graph)),
                 Err(e) => StepState::Failed(e),
             };
@@ -1021,7 +1115,7 @@ impl NcmLm {
         &self,
         tokens: &Tensor<2, Int>,
         cache: &mut NcmCache,
-        decode: bool,
+        pick: &Pick,
     ) -> Result<StepGraph, String> {
         use crate::graph::{CursorSet, restore_kv, save_kv, write_kv};
         use crate::layers::StackStep;
@@ -1044,7 +1138,7 @@ impl NcmLm {
             (rope, at)
         };
         let rope_k = rope(cache.tokens);
-        let rope_q = decode.then(|| rope(cache.tokens + k));
+        let rope_q = (!matches!(pick, Pick::None)).then(|| rope(cache.tokens + k));
         let mut inputs = StepInputs {
             tokens: input,
             cursors,
@@ -1082,8 +1176,12 @@ impl NcmLm {
             match &g.rope_q {
                 None => StepOut::Cond(cond),
                 Some((q, _)) => {
+                    let mut sampled = |j: usize, logits: &Tensor<3>| match pick {
+                        Pick::Sample(params) => sample_pick(logits, params, j),
+                        _ => greedy(j, logits),
+                    };
                     let pass =
-                        self.decode_with_ropes(cond, cache, &g.rope_self, q, false, &mut greedy);
+                        self.decode_with_ropes(cond, cache, &g.rope_self, q, false, &mut sampled);
                     StepOut::Tokens(pass.0)
                 }
             }

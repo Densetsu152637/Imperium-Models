@@ -64,7 +64,7 @@ pub struct Sampler {
 }
 
 /// A fresh seed when the request names none.
-fn entropy() -> u64 {
+pub fn entropy() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0x5EED, |d| d.as_nanos() as u64)

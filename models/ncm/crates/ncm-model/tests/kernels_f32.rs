@@ -132,3 +132,15 @@ fn graphed_step_survives_reset_f32() {
     let (device, _lock) = setup(DTYPE);
     graphed_step_survives_reset(&device);
 }
+
+#[test]
+fn graphed_sampled_step_matches_eager_f32() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_sampled_step_matches(&device);
+}
+
+#[test]
+fn sampler_matches_distribution_f32() {
+    let (device, _lock) = setup(DTYPE);
+    sampler_matches_distribution(&device);
+}

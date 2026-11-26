@@ -133,3 +133,15 @@ fn graphed_step_survives_reset_bf16() {
     let (device, _lock) = setup(DTYPE);
     graphed_step_survives_reset(&device);
 }
+
+#[test]
+fn graphed_sampled_step_matches_eager_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    graphed_sampled_step_matches(&device);
+}
+
+#[test]
+fn sampler_matches_distribution_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    sampler_matches_distribution(&device);
+}

@@ -23,6 +23,7 @@ use ncm_model::layers::Rope;
 use ncm_model::ncm::{GraphedAppend, GraphedDecoder, GraphedStep};
 use ncm_model::quant::{self, QuantSpec, format::Format};
 use ncm_model::retrieval::{LatentCache, RetrievalSpec, SparseRetrieval};
+use ncm_model::sample::SampleSettings;
 use ncm_model::tok::GraphedTok;
 use ncm_model::{
     Acceptance, NcmLm, SpecStats, Speculator, TokenLm, tiny_ncm, tiny_ncm_v2, tiny_tok,
@@ -171,6 +172,99 @@ fn ncm_step_decode(model: &NcmLm, graphs: bool, concepts: usize, device: &Device
     set_cuda_graphs(true);
     assert_eq!(graphed.is_captured(), graphs, "concept step graph: {:?}", graphed.failure());
     tokens
+}
+
+/// Sampled NCM decode through [`GraphedStep::sampled`] (graphs on or off): the tokens of every
+/// concept.
+fn ncm_sampled_decode(model: &NcmLm, graphs: bool, device: &Device) -> Vec<Vec<i64>> {
+    set_cuda_graphs(graphs);
+    let mut cache = model.make_cache(64 + 4 * 12 + 4, 1, device);
+    let cond = model.prefill(ncm_prompt(device), &mut cache, 16);
+    let settings =
+        SampleSettings { temperature: 0.9, top_k: 40, top_p: 0.95, seed: 1234, counter: 0 };
+    let mut graphed = GraphedStep::sampled(device, settings);
+    let mut next = graphed.first(model, cond, &mut cache);
+    let mut tokens = vec![ints(next.clone())];
+    for _ in 1..12 {
+        next = graphed.step(model, next, &mut cache);
+        tokens.push(ints(next.clone()));
+    }
+    set_cuda_graphs(true);
+    assert_eq!(graphed.is_captured(), graphs, "sampled step graph: {:?}", graphed.failure());
+    tokens
+}
+
+/// The sampled concept step replayed from a graph draws the same tokens as the same device
+/// sampler run eagerly (same seed, same draw counters), both designs; the draws vary.
+pub fn graphed_sampled_step_matches(device: &Device) {
+    for cfg in [tiny_ncm(8, 4), tiny_ncm_v2(8, tiny_v2(2, 2, 4))] {
+        let model = build_ncm(&cfg, None, device);
+        let eager = ncm_sampled_decode(&model, false, device);
+        let graphed = ncm_sampled_decode(&model, true, device);
+        assert_eq!(graphed, eager, "{}: sampled tokens differ", cfg.attention.name());
+        let distinct: std::collections::BTreeSet<_> = eager.iter().flatten().collect();
+        assert!(distinct.len() > 8, "sampling should vary the tokens: {eager:?}");
+    }
+}
+
+/// The device sampler's draws follow the host sampler's distribution: the `top_k` largest
+/// logits, then the smallest prefix reaching `top_p` at the temperature. 20,000 draws of one
+/// 12-token row (one row per draw, each its own counter) against the exact probabilities; a
+/// near-zero temperature takes the argmax.
+pub fn sampler_matches_distribution(device: &Device) {
+    use ncm_model::sample::{SampleParams, sample};
+    let logits: Vec<f32> = vec![1.2, -0.4, 2.0, 0.3, 1.9, -2.0, 0.0, 1.1, 0.8, -1.0, 0.5, 1.95];
+    let v = logits.len();
+    let rows = 20_000;
+    let data: Vec<f32> = (0..rows).flat_map(|_| logits.clone()).collect();
+    let x = Tensor::<2>::from_data(TensorData::new(data, [rows, v]), device);
+    let params = SampleParams::new(device);
+    for (temperature, top_k, top_p) in
+        [(1.0, 0, 1.0), (0.7, 3, 1.0), (1.3, 0, 0.6), (0.5, 5, 0.8), (2.0, 7, 0.9)]
+    {
+        params.set(SampleSettings { temperature, top_k, top_p, seed: 77, counter: 5 });
+        let drawn = ints(sample(x.clone(), &params, 0));
+        // The host sampler's kept set and probabilities.
+        let mut order: Vec<usize> = (0..v).collect();
+        order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        let k = if top_k == 0 { v } else { top_k };
+        let kept = &order[..k];
+        let max = logits[kept[0]];
+        let w: Vec<f32> = kept.iter().map(|&i| ((logits[i] - max) / temperature).exp()).collect();
+        let total: f32 = w.iter().sum();
+        let mut keep = k;
+        if top_p < 1.0 {
+            let mut mass = 0.0;
+            for (i, wi) in w.iter().enumerate() {
+                mass += wi / total;
+                if mass >= top_p {
+                    keep = i + 1;
+                    break;
+                }
+            }
+        }
+        let z: f32 = w[..keep].iter().sum();
+        let mut want = vec![0f32; v];
+        for (i, &id) in kept[..keep].iter().enumerate() {
+            want[id] = w[i] / z;
+        }
+        let mut got = vec![0f32; v];
+        for &t in &drawn {
+            got[t as usize] += 1.0 / rows as f32;
+        }
+        for id in 0..v {
+            let sd = (want[id] * (1.0 - want[id]) / rows as f32).sqrt();
+            assert!(
+                (got[id] - want[id]).abs() <= 5.0 * sd + 1e-4,
+                "T {temperature} k {top_k} p {top_p}: token {id} drawn {:.4}, want {:.4}",
+                got[id],
+                want[id]
+            );
+        }
+    }
+    params.set(SampleSettings { temperature: 1e-4, top_k: 0, top_p: 1.0, seed: 1, counter: 0 });
+    let drawn = ints(sample(x.narrow(0, 0, 100), &params, 0));
+    assert!(drawn.iter().all(|&t| t == 2), "near-zero temperature takes the argmax");
 }
 
 /// The whole-concept-step graph (encoder, cross-attention keys, pooling, backbone step,

@@ -5,9 +5,11 @@ An OpenAI-compatible HTTP server over the NCM and the token baseline (`ncm-model
 ```bash
 # CPU (what CI builds)
 cargo run --release -p ncm-server -- --arch ncm --random-weights -c 4096 --port 8080
-# GPU (also builds ncm-model's fused CUDA kernels, run eagerly: the server replays no CUDA graphs
-# and does not decode speculatively yet)
+# GPU: fused CUDA kernels and one captured CUDA graph replay per decode step (see "Decode paths")
 cargo run --release -p ncm-server --features cuda -- --arch ncm --random-weights -c 4096 --port 8080
+# ... with the v2 design, 4-bit weights and self-speculative greedy decoding (needs a draft head)
+cargo run --release -p ncm-server --features cuda -- --arch ncm --random-weights \
+    --config configs/ncm-250m-v2.toml --quant q4 --speculate -c 4096 --port 8080
 # Trained weights (config in the file's header; tokenizer.json beside it or --tokenizer)
 ncm-server --model weights/ncm-250m.safetensors --tokenizer tokenizer.json -c 1000000 --port 8080
 curl localhost:8080/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
@@ -27,9 +29,24 @@ Imperium (`imperium-local`) starts `llama-server --model <path> --host 127.0.0.1
 
 Not implemented: `stop` strings, penalties, `response_format`, images (`--mmproj` is ignored with a note), `/slots`, `/metrics`, an API key, prompt-cache reuse across requests (`cached_tokens` is always 0), several requests at once (`--parallel N` only divides the context; requests queue and run one at a time), `tool_choice` other than `none`/auto.
 
+## Decode paths
+
+Every request resets the caches, prefills its prompt and decodes one of four ways (`timings.decode_path`):
+
+| Path | Requests | How |
+|---|---|---|
+| `graphed-greedy` | CUDA (fused kernels and graphs on), greedy (`temperature` 0), no tool-call constraint | NCM: `ncm_model::ncm::GraphedStep`, one CUDA graph replay per concept that appends the concept just written (encoder, cross-attention keys, pooling, backbone) and decodes the next (decoder, argmax); the first concept, from the prompt, runs eagerly. Token baseline: `ncm_model::tok::GraphedTok`, one replay per token. |
+| `graphed-sampled` | The same, sampled | The same graphs with the pick replaced by the device sampler (`ncm_model::sample`): temperature, top-k and top-p as the host sampler keeps them, drawn by the Gumbel-max trick from a counter-based hash of the request's `seed` (a fresh one when none is given). A seed reproduces its reply on the device; it is not the host sampler's random stream. |
+| `speculative` | `--speculate`, CUDA, an NCM with a draft head, greedy, unconstrained | Draft and verify passes per concept (`ncm_model::Speculator`, graphed), each written concept appended through `GraphedAppend`. Equal to plain greedy in f32; in bf16 a near tie of the two best logits may go the other way, hence off by default. |
+| `eager` | Tool-call constrained requests (the grammar runs on the host), the CPU, CUDA with graphs off | The host picks every token from the logits (`sampling.rs`). |
+
+The graph is captured once the step can serve it (the NCM's cross-attention ring full) and replayed for the rest of the request; each request captures anew, because resetting the caches replaces buffers a graph records (`NcmCache` epochs make a stale graph recapture rather than replay). Capture takes about 40 to 80 ms at the 250M size (the first request also compiles the kernels). Each step reads its token or concept back to stream it, and a concept cut by the end-of-concept token is padded on the host before it is appended, as on the eager path. Prompts are not reused across requests.
+
+Short runs on an RTX 5080 (random weights, bf16, a 2,048-byte chat prompt, 256 tokens streamed, `predicted_per_second` of the second and third requests): NCM v2 about 1,170 greedy and 930 sampled, with `--quant q4` about 1,600 and 1,150; token baseline v2 about 540 greedy and 470 sampled. `ncm-bench` at the same settings: 1,244, 1,588 and 564 greedy.
+
 ## Command line
 
-`--model/-m`, `--host`, `--port` (0 picks a free one), `--ctx-size/-c` (total, allocated at launch; each request gets `ctx / parallel`), `--parallel/-np`, `--n-gpu-layers/-ngl` (0 means CPU), `--alias/-a`, `--temp`, `--top-k`, `--top-p` (llama-server's defaults: 0.8, 40, 0.95) are llama-server's. `--cache-type-k/-v`, `--jinja`, `--threads`, `--batch-size`, `--flash-attn`, `--mlock`, `--no-mmap` and a few more are accepted and ignored so the launch line works unchanged (`-ngl`, `-np`, `-fa`, `-ctk`, `-ctv`, `-ub`, `-tb`, `-cb` are mapped to their long forms). NCM-specific: `--arch tok|ncm`, `--random-weights` (+ `--weights-seed`), `--tokenizer`, `--config`, `--device cpu|cuda`, `--dtype bf16|f32`, `--prefill-chunk`, `--quant none|q8|q4` (+ `--quant-group`, `--dense-head`; weight-only quantisation at load, see `../docs/quantisation.md`). Defaults: CUDA with bf16 when built with `--features cuda` and `-ngl` is not 0, else CPU with f32.
+`--model/-m`, `--host`, `--port` (0 picks a free one), `--ctx-size/-c` (total, allocated at launch; each request gets `ctx / parallel`), `--parallel/-np`, `--n-gpu-layers/-ngl` (0 means CPU), `--alias/-a`, `--temp`, `--top-k`, `--top-p` (llama-server's defaults: 0.8, 40, 0.95) are llama-server's. `--cache-type-k/-v`, `--jinja`, `--threads`, `--batch-size`, `--flash-attn`, `--mlock`, `--no-mmap` and a few more are accepted and ignored so the launch line works unchanged (`-ngl`, `-np`, `-fa`, `-ctk`, `-ctv`, `-ub`, `-tb`, `-cb` are mapped to their long forms). NCM-specific: `--arch tok|ncm`, `--random-weights` (+ `--weights-seed`), `--tokenizer`, `--config`, `--device cpu|cuda`, `--dtype bf16|f32`, `--prefill-chunk` (default 8192 for the v2 design, whose fused prefill kernels want long chunks; 512 for the fallback), `--quant none|q8|q4` (+ `--quant-group`, `--dense-head`; weight-only quantisation at load, a dense bf16 file converted as it loads, see `../docs/quantisation.md`), `--speculate` (self-speculative decoding, below). Defaults: CUDA with bf16 when built with `--features cuda` and `-ngl` is not 0, else CPU with f32.
 
 The architecture and config come from `--config`, else the weight file's header, else `config.toml` beside the weights, else the 250M config of `--arch` (the fallback attention design; pass `--config configs/ncm-250m-v2.toml` or `tok-250m-v2.toml` for v2, see `../docs/attention.md`). The tokenizer is `--tokenizer`, else `tokenizer.json` beside the weights; with `--random-weights` and none, a built-in byte-level tokenizer (ids 0 to 10 are the special tokens, 11 to 15 reserved, 16 to 271 bytes) is used.
 
@@ -83,7 +100,7 @@ Tool definitions go in the system turn (one compact `{"name","description","para
 
 ## Metrics
 
-Every response has llama-server's `timings` object: `prompt_n`, `prompt_ms`, `prompt_per_second` (prompt processing) and `predicted_n`, `predicted_ms`, `predicted_per_second` (decoding), timed separately with a device sync, plus `cache_bytes`. Tokens are reference-tokenizer tokens (the NCM's `k` per pass are counted individually). `predicted_per_second` excludes the token baseline's first token, which comes out of the prompt pass. The streaming finish chunk carries `timings` and the usage chunk (with `include_usage`) repeats them.
+Every response has llama-server's `timings` object: `prompt_n`, `prompt_ms`, `prompt_per_second` (prompt processing) and `predicted_n`, `predicted_ms`, `predicted_per_second` (decoding), timed separately with a device sync, plus `cache_bytes`, `graph_capture_ms` (capturing the request's decode graph, counted in neither `prompt_ms` nor `predicted_ms`) and `decode_path` (below). Tokens are reference-tokenizer tokens (the NCM's `k` per pass are counted individually). `predicted_per_second` excludes the token baseline's first token, which comes out of the prompt pass. The streaming finish chunk carries `timings` and the usage chunk (with `include_usage`) repeats them.
 
 ## Grammar-constrained tool calls (R2.4)
 

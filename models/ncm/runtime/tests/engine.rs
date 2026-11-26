@@ -139,6 +139,7 @@ fn contexts_too_small_for_the_model_are_refused() {
         weights: None,
         seed: 0,
         prefill_chunk: 16,
+        speculate: false,
         quant: None,
     };
     assert!(matches!(
@@ -283,6 +284,7 @@ fn quantised_engines_load_dense_and_quantised_weight_files() {
             weights: Some(weights.to_path_buf()),
             seed: 0,
             prefill_chunk: 16,
+            speculate: false,
             quant,
         };
         // Quantising a dense file at load and loading the quantised file give the same model.
