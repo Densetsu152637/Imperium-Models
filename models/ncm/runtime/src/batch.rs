@@ -1191,9 +1191,16 @@ impl Batcher {
         if !ncm_model::fused::graphs_active(self.device()) {
             return None;
         }
+        // Greedy rows only: a sampled request's draws must come from one generator for the whole
+        // reply, and its first concept (forced prompt tokens) and any step shared with a row
+        // the graph cannot take run eagerly with the host sampler, so a sampled row on the
+        // graph's device sampler would draw from two streams in a batch-dependent mix.
         let eligible = rows.iter().all(|&i| {
             let a = self.slots[i].active.as_ref().expect("decoding");
-            a.unappended.is_some() && a.pending.is_empty() && a.constraint.is_none()
+            a.unappended.is_some()
+                && a.pending.is_empty()
+                && a.constraint.is_none()
+                && a.sampler.is_greedy()
         });
         if !eligible {
             return None;
