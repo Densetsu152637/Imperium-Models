@@ -11,10 +11,12 @@
 //!    **forked** from that slot when its prefill ends: the caches are copied into the waiting
 //!    request's slot ([`ncm_model::NcmCache::copy_from`]), so identical prompts (the samples of
 //!    a self-consistency call) are prefilled once;
-//! 3. runs one prefill chunk of the prefilling slots: the next one in round robin, batched with
-//!    up to [`PREFILL_ROWS`] - 1 others that have at least as much of their prompt left (one
-//!    forward over `[rows, chunk]`, [`TokenLm::prefill_slots`] / [`NcmLm::prefill_slots`]), so
-//!    that long prompts interleave with the others' decoding;
+//! 3. runs one prefill chunk of every prefilling slot (round robin from the next one, up to
+//!    [`PREFILL_BUDGET`] tokens in all): each slot's chunk as long as its prompt has left, up
+//!    to the chunk size, all packed into one varlen forward ([`TokenLm::prefill_packed`],
+//!    [`NcmLm::append_packed`], [`HybridSession::prefill_packed`]: one row, each slot's segment
+//!    at its own position, nothing padded), so that long prompts interleave with the others'
+//!    decoding;
 //! 4. runs one decode step over every decoding slot: one token per slot for the token baseline,
 //!    one concept for the NCM. The batched step ([`TokenLm::step_slots`],
 //!    [`NcmLm::append_slots`] / [`NcmLm::decode_slots`]) runs the norms, input projections and
@@ -33,7 +35,7 @@
 //! memory rings and known prefixes, acceptance per row on the device), then one batched fill
 //! pass over the slots on their autoregressive fill, both replayed from graphs per slot set on
 //! CUDA ([`ncm_model::hybrid::PassGraphs`]); prefill chunks batch through one encoder pass
-//! ([`ncm_model::hybrid::HybridSession::prefill_slots`]), and identical prompts fork.
+//! ([`ncm_model::hybrid::HybridSession::prefill_packed`]), and identical prompts fork.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -183,9 +185,9 @@ struct Slot {
     active: Option<Active>,
 }
 
-/// Most prefilling slots batched into one prefill chunk: the step's rows are `chunk` tokens
-/// each, so this bounds how long a prefill step holds up the decoding slots.
-const PREFILL_ROWS: usize = 4;
+/// Most prompt tokens one prefill step packs over all prefilling slots: it bounds how long a
+/// prefill step holds up the decoding slots.
+const PREFILL_BUDGET: usize = 8192;
 
 /// A queued request.
 struct Waiting {
@@ -545,53 +547,51 @@ impl Batcher {
 
     // ------------------------------------------------------------------ prefill and forks
 
-    /// One prefill chunk of the next prefilling slot (round robin) and of up to
-    /// [`PREFILL_ROWS`] - 1 other prefilling slots with at least as much prompt left, in one
-    /// batched forward of equal-length rows (each slot at its own position).
+    /// One prefill chunk of every prefilling slot, round robin from the next one, up to
+    /// [`PREFILL_BUDGET`] tokens in all: chunks of different lengths (each up to the chunk size
+    /// and to what its prompt has left) packed into one varlen forward.
     fn prefill_step(&mut self) {
         let n = self.slots.len();
         let prefilling = |s: &Slot| s.active.as_ref().is_some_and(|a| a.phase == Phase::Prefill);
-        let Some(first) =
-            (0..n).map(|d| (self.next_prefill + d) % n).find(|&i| prefilling(&self.slots[i]))
-        else {
-            return;
-        };
         let k = match &self.model {
             Model::Tok(_) | Model::Hybrid(_) => 1,
             Model::Ncm(m) => m.concept_size(),
         };
-        let chunk = self.core.chunk;
-        // The hybrid's encoder takes at most ENCODER_CHUNK tokens per call (its sliding window
-        // attends over the window plus the whole piece).
+        // The NCM's and the hybrid's encoders take at most ENCODER_CHUNK tokens per segment
+        // (their sliding windows attend over the window plus the whole piece).
         let chunk = match &self.model {
-            Model::Hybrid(_) => chunk.min(ncm_model::ncm::ENCODER_CHUNK),
-            _ => chunk,
+            Model::Tok(_) => self.core.chunk,
+            _ => self.core.chunk.min(ncm_model::ncm::ENCODER_CHUNK),
         };
         // The NCM's chunks are whole concepts (its streams are too).
         let chunk = (chunk - chunk % k).max(k);
-        let left = |s: &Slot| {
-            let a = s.active.as_ref().expect("prefilling");
-            a.stream.len() - a.prefilled
-        };
-        let len = chunk.min(left(&self.slots[first]));
-        let mut rows = vec![first];
-        let mut last = first;
-        for d in 1..n {
-            if rows.len() >= PREFILL_ROWS {
+        let mut rows = Vec::new();
+        let mut lens = Vec::new();
+        let mut budget = PREFILL_BUDGET.max(chunk);
+        let mut last = None;
+        for d in 0..n {
+            let i = (self.next_prefill + d) % n;
+            if !prefilling(&self.slots[i]) {
+                continue;
+            }
+            let a = self.slots[i].active.as_ref().expect("prefilling");
+            let left = a.stream.len() - a.prefilled;
+            let len = chunk.min(left).min(budget - budget % k);
+            if len == 0 {
                 break;
             }
-            let i = (first + d) % n;
-            if prefilling(&self.slots[i]) && left(&self.slots[i]) >= len {
-                rows.push(i);
-                last = i;
-            }
+            rows.push(i);
+            lens.push(len);
+            last = Some(i);
+            budget -= len;
         }
+        let Some(last) = last else { return };
         self.next_prefill = (last + 1) % n;
         let device = self.device().clone();
         if rows.len() == 1 {
-            self.prefill_single(first, len, &device);
+            self.prefill_single(rows[0], lens[0], &device);
         } else {
-            self.prefill_rows(&rows, len, &device);
+            self.prefill_packed(&rows, &lens, &device);
         }
         for &i in &rows {
             let active = self.slots[i].active.as_ref().expect("prefilling");
@@ -625,20 +625,21 @@ impl Batcher {
         }
     }
 
-    /// The next `len` prompt tokens of each slot in `rows` in one batched forward.
-    fn prefill_rows(&mut self, rows: &[usize], len: usize, device: &Device) {
-        let mut ids = Vec::with_capacity(rows.len() * len);
-        for &i in rows {
+    /// The next `lens[r]` prompt tokens of each slot `rows[r]`, packed into one varlen forward.
+    fn prefill_packed(&mut self, rows: &[usize], lens: &[usize], device: &Device) {
+        let total: usize = lens.iter().sum();
+        let mut ids = Vec::with_capacity(total);
+        for (&i, &len) in rows.iter().zip(lens) {
             let a = self.slots[i].active.as_ref().expect("prefilling");
             ids.extend_from_slice(&a.stream[a.prefilled..a.prefilled + len]);
         }
-        let t = Tensor::from_data(TensorData::new(ids, [rows.len(), len]), device);
         // The slots of `rows` in that order: their caches and requests.
         let mut picked: Vec<Option<&mut Slot>> = self.slots.iter_mut().map(Some).collect();
         let mut slots: Vec<&mut Slot> =
             rows.iter().map(|&i| picked[i].take().expect("one row per slot")).collect();
         let out = match &self.model {
             Model::Tok(m) => {
+                let t = Tensor::from_data(TensorData::new(ids, [1, total]), device);
                 let mut caches: Vec<&mut [LayerCache]> = slots
                     .iter_mut()
                     .map(|s| match &mut s.caches {
@@ -646,9 +647,10 @@ impl Batcher {
                         _ => unreachable!("slots hold caches of the model"),
                     })
                     .collect();
-                Some(m.prefill_slots(t, &mut caches, len))
+                Some(m.prefill_packed(t, lens, &mut caches))
             }
             Model::Ncm(m) => {
+                let t = Tensor::from_data(TensorData::new(ids, [1, total]), device);
                 let mut caches: Vec<&mut NcmCache> = slots
                     .iter_mut()
                     .map(|s| match &mut s.caches {
@@ -656,9 +658,18 @@ impl Batcher {
                         _ => unreachable!("slots hold caches of the model"),
                     })
                     .collect();
-                Some(m.prefill_slots(t, &mut caches, len))
+                Some(m.append_packed(t, lens, &mut caches))
             }
             Model::Hybrid(m) => {
+                let mut at = 0;
+                let pieces: Vec<&[i32]> = lens
+                    .iter()
+                    .map(|&len| {
+                        let piece = &ids[at..at + len];
+                        at += len;
+                        piece
+                    })
+                    .collect();
                 let mut sessions: Vec<&mut HybridSession> = slots
                     .iter_mut()
                     .map(|s| match &mut s.caches {
@@ -666,11 +677,11 @@ impl Batcher {
                         _ => unreachable!("slots hold caches of the model"),
                     })
                     .collect();
-                HybridSession::prefill_slots(m, &mut sessions, t);
+                HybridSession::prefill_packed(m, &mut sessions, &pieces);
                 None
             }
         };
-        for (r, slot) in slots.into_iter().enumerate() {
+        for (r, (slot, &len)) in slots.into_iter().zip(lens).enumerate() {
             let active = slot.active.as_mut().expect("prefilling");
             active.prefilled += len;
             if active.prefilled >= active.stream.len() {
