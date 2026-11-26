@@ -282,3 +282,122 @@ fn ncm_warm_up_leaves_the_model_usable() {
     model.warm_up(37, 16, &device);
     model.warm_up(1, 16, &device);
 }
+
+/// Batched prefill chunks of several slots at different positions equal each slot prefilled
+/// alone, for both models in both designs.
+#[test]
+fn slot_prefill_equals_single_prefill() {
+    let device = device();
+    let v2 = ncm_model::tiny_v2(2, 2, 4);
+    for cfg in [tiny_tok(8), ncm_model::tiny_tok_v2(ncm_model::tiny_v2(4, 2, 8))] {
+        let model = TokenLm::new(&cfg, &device);
+        let heads = [tokens(&device, cfg.vocab_size, 5, 1), tokens(&device, cfg.vocab_size, 11, 2)];
+        let piece = tokens(&device, cfg.vocab_size, 12, 3).reshape([2, 6]);
+        let mut single: Vec<Vec<LayerCache>> = Vec::new();
+        let mut batched: Vec<Vec<LayerCache>> = Vec::new();
+        for h in &heads {
+            for set in [&mut single, &mut batched] {
+                let mut c = model.make_cache(32, 1, &device);
+                model.prefill(h.clone(), &mut c, 4);
+                set.push(c);
+            }
+        }
+        let want: Vec<f32> = (0..2)
+            .flat_map(|i| {
+                values(model.prefill(piece.clone().narrow(0, i, 1), &mut single[i], 4).unwrap())
+            })
+            .collect();
+        let mut rows: Vec<&mut [LayerCache]> =
+            batched.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.prefill_slots(piece, &mut rows, 4));
+        assert_close(&got, &want, 1e-4, 1e-4);
+    }
+    for cfg in [tiny_ncm(8, 4), ncm_model::tiny_ncm_v2(8, v2)] {
+        let model = NcmLm::new(&cfg, &device);
+        let k = cfg.k;
+        let heads =
+            [tokens(&device, cfg.vocab_size, 2 * k, 4), tokens(&device, cfg.vocab_size, 5 * k, 5)];
+        let piece = tokens(&device, cfg.vocab_size, 6 * k, 6).reshape([2, 3 * k]);
+        let mut single = Vec::new();
+        let mut batched = Vec::new();
+        for h in &heads {
+            for set in [&mut single, &mut batched] {
+                let mut c = model.make_cache(16 * k, 1, &device);
+                model.prefill(h.clone(), &mut c, 2 * k);
+                set.push(c);
+            }
+        }
+        let want: Vec<f32> = (0..2)
+            .flat_map(|i| {
+                values(model.prefill(piece.clone().narrow(0, i, 1), &mut single[i], 2 * k))
+            })
+            .collect();
+        let mut rows: Vec<&mut ncm_model::NcmCache> = batched.iter_mut().collect();
+        let got = values(model.prefill_slots(piece, &mut rows, 2 * k));
+        assert_close(&got, &want, 1e-4, 1e-4);
+    }
+}
+
+/// Batched slot steps (projections once over all rows, attention per row) equal each row
+/// stepped alone, for both models in both designs: slots at different positions.
+#[test]
+fn slot_steps_equal_single_steps() {
+    let device = device();
+    let v2 = ncm_model::tiny_v2(2, 2, 4);
+    for cfg in [tiny_tok(8), ncm_model::tiny_tok_v2(ncm_model::tiny_v2(4, 2, 8))] {
+        let model = TokenLm::new(&cfg, &device);
+        let prompts =
+            [tokens(&device, cfg.vocab_size, 9, 1), tokens(&device, cfg.vocab_size, 14, 2)];
+        let mut single: Vec<Vec<LayerCache>> = Vec::new();
+        let mut batched: Vec<Vec<LayerCache>> = Vec::new();
+        for p in &prompts {
+            for set in [&mut single, &mut batched] {
+                let mut c = model.make_cache(32, 1, &device);
+                model.prefill(p.clone(), &mut c, 4);
+                set.push(c);
+            }
+        }
+        let next = Tensor::<2, Int>::from_data(TensorData::new(vec![3i32, 7], [2, 1]), &device);
+        let want: Vec<f32> = (0..2)
+            .flat_map(|i| values(model.step(next.clone().narrow(0, i, 1), &mut single[i])))
+            .collect();
+        let mut rows: Vec<&mut [LayerCache]> =
+            batched.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.step_slots(next, &mut rows));
+        assert_close(&got, &want, 1e-4, 1e-4);
+    }
+    for cfg in [tiny_ncm(8, 4), ncm_model::tiny_ncm_v2(8, v2)] {
+        let model = NcmLm::new(&cfg, &device);
+        let k = cfg.k;
+        let prompts =
+            [tokens(&device, cfg.vocab_size, 3 * k, 3), tokens(&device, cfg.vocab_size, 5 * k, 4)];
+        let mut single = Vec::new();
+        let mut batched = Vec::new();
+        for p in &prompts {
+            for set in [&mut single, &mut batched] {
+                let mut c = model.make_cache(16 * k, 1, &device);
+                model.prefill(p.clone(), &mut c, 2 * k);
+                set.push(c);
+            }
+        }
+        let concept = tokens(&device, cfg.vocab_size, 2 * k, 5).reshape([2, k]);
+        let want: Vec<f32> = (0..2)
+            .flat_map(|i| {
+                values(model.append_tokens(concept.clone().narrow(0, i, 1), &mut single[i]))
+            })
+            .collect();
+        let mut rows: Vec<&mut ncm_model::NcmCache> = batched.iter_mut().collect();
+        let cond = model.append_slots(concept, &mut rows);
+        assert_close(&values(cond.clone()), &want, 1e-4, 1e-4);
+        // Greedy decoding of the next concept, batched against row by row.
+        let mut greedy =
+            |_: usize, logits: &Tensor<3>| logits.clone().argmax(2).reshape([logits.dims()[0], 1]);
+        let got = model.decode_slots(cond.clone(), &mut rows, &mut greedy);
+        let ints = |t: Tensor<2, Int>| t.into_data().convert::<i64>().try_to_vec::<i64>().unwrap();
+        for (i, cache) in single.iter_mut().enumerate() {
+            let row = cond.clone().narrow(0, i, 1);
+            let (want, _) = model.decode_concept(row, cache, None, false);
+            assert_eq!(ints(got.clone().narrow(0, i, 1)), ints(want));
+        }
+    }
+}

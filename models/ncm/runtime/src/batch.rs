@@ -11,8 +11,10 @@
 //!    **forked** from that slot when its prefill ends: the caches are copied into the waiting
 //!    request's slot ([`ncm_model::NcmCache::copy_from`]), so identical prompts (the samples of
 //!    a self-consistency call) are prefilled once;
-//! 3. runs one prefill chunk of one prefilling slot (round robin), so that a long prompt
-//!    interleaves with the others' decoding;
+//! 3. runs one prefill chunk of the prefilling slots: the next one in round robin, batched with
+//!    up to [`PREFILL_ROWS`] - 1 others that have at least as much of their prompt left (one
+//!    forward over `[rows, chunk]`, [`TokenLm::prefill_slots`] / [`NcmLm::prefill_slots`]), so
+//!    that long prompts interleave with the others' decoding;
 //! 4. runs one decode step over every decoding slot: one token per slot for the token baseline,
 //!    one concept for the NCM. The batched step ([`TokenLm::step_slots`],
 //!    [`NcmLm::append_slots`] / [`NcmLm::decode_slots`]) runs the norms, input projections and
@@ -140,6 +142,9 @@ struct Active {
     forked: bool,
     /// The next token, already drawn on the device by a batched graph replay.
     next: Option<u32>,
+    /// NCM: the concept just written, appended at the start of the next step (with the next
+    /// concept's decoder pass in one graph replay when the slot set has one).
+    unappended: Option<Vec<i32>>,
     /// The device sampler's settings (greedy: top-k 1), counter advanced per draw.
     #[cfg(feature = "cuda")]
     device: ncm_model::sample::SampleSettings,
@@ -151,6 +156,10 @@ struct Slot {
     last_used: u64,
     active: Option<Active>,
 }
+
+/// Most prefilling slots batched into one prefill chunk: the step's rows are `chunk` tokens
+/// each, so this bounds how long a prefill step holds up the decoding slots.
+const PREFILL_ROWS: usize = 4;
 
 /// A queued request.
 struct Waiting {
@@ -171,6 +180,9 @@ pub(crate) struct Batcher {
     /// The token baseline's batched step graphs, per slot set.
     #[cfg(feature = "cuda")]
     tok_graphs: ncm_model::tok::GraphedTokSlots,
+    /// The NCM's batched concept-step graphs, per slot set.
+    #[cfg(feature = "cuda")]
+    ncm_graphs: ncm_model::ncm::GraphedNcmSlots,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -194,14 +206,27 @@ impl Batcher {
             State::Ncm { model, cache, .. } => (Model::Ncm(model), Caches::Ncm(cache)),
             State::Empty => unreachable!("a built core has a model"),
         };
-        let mut slots = vec![Slot { caches: first, kept: Vec::new(), last_used: 0, active: None }];
-        for _ in 1..count {
-            let caches = match &model {
-                Model::Tok(m) => Caches::Tok(m.make_cache(capacity, 1, &device)),
-                Model::Ncm(m) => Caches::Ncm(m.make_cache(capacity, 1, &device)),
-            };
-            slots.push(Slot { caches, kept: Vec::new(), last_used: 0, active: None });
-        }
+        // With several slots, all of them get caches allocated together (on CUDA the retrieval
+        // layers' rows of shared buffers, so a batched step decodes them in one set of
+        // launches); one slot keeps the core's.
+        let slot = |caches| Slot { caches, kept: Vec::new(), last_used: 0, active: None };
+        let slots: Vec<Slot> = if count <= 1 {
+            vec![slot(first)]
+        } else {
+            drop(first);
+            match &model {
+                Model::Tok(m) => m
+                    .make_slot_caches(count, capacity, &device)
+                    .into_iter()
+                    .map(|c| slot(Caches::Tok(c)))
+                    .collect(),
+                Model::Ncm(m) => m
+                    .make_slot_caches(count, capacity, &device)
+                    .into_iter()
+                    .map(|c| slot(Caches::Ncm(c)))
+                    .collect(),
+            }
+        };
         Self {
             core,
             model,
@@ -212,6 +237,8 @@ impl Batcher {
             next_prefill: 0,
             #[cfg(feature = "cuda")]
             tok_graphs: Default::default(),
+            #[cfg(feature = "cuda")]
+            ncm_graphs: Default::default(),
         }
     }
 
@@ -251,7 +278,7 @@ impl Batcher {
     fn iterate(&mut self) {
         self.drop_cancelled();
         self.start_queued();
-        self.prefill_one();
+        self.prefill_step();
         self.decode_step();
         self.publish();
     }
@@ -417,6 +444,7 @@ impl Batcher {
             empty_concepts: 0,
             forked: false,
             next: None,
+            unappended: None,
             #[cfg(feature = "cuda")]
             device,
         });
@@ -427,45 +455,116 @@ impl Batcher {
 
     // ------------------------------------------------------------------ prefill and forks
 
-    /// One prefill chunk of the next prefilling slot (round robin).
-    fn prefill_one(&mut self) {
+    /// One prefill chunk of the next prefilling slot (round robin) and of up to
+    /// [`PREFILL_ROWS`] - 1 other prefilling slots with at least as much prompt left, in one
+    /// batched forward of equal-length rows (each slot at its own position).
+    fn prefill_step(&mut self) {
         let n = self.slots.len();
-        let Some(i) = (0..n)
-            .map(|d| (self.next_prefill + d) % n)
-            .find(|&i| self.slots[i].active.as_ref().is_some_and(|a| a.phase == Phase::Prefill))
+        let prefilling = |s: &Slot| s.active.as_ref().is_some_and(|a| a.phase == Phase::Prefill);
+        let Some(first) =
+            (0..n).map(|d| (self.next_prefill + d) % n).find(|&i| prefilling(&self.slots[i]))
         else {
             return;
         };
-        self.next_prefill = (i + 1) % n;
+        let k = match &self.model {
+            Model::Tok(_) => 1,
+            Model::Ncm(m) => m.concept_size(),
+        };
         let chunk = self.core.chunk;
+        // The NCM's chunks are whole concepts (its streams are too).
+        let chunk = (chunk - chunk % k).max(k);
+        let left = |s: &Slot| {
+            let a = s.active.as_ref().expect("prefilling");
+            a.stream.len() - a.prefilled
+        };
+        let len = chunk.min(left(&self.slots[first]));
+        let mut rows = vec![first];
+        let mut last = first;
+        for d in 1..n {
+            if rows.len() >= PREFILL_ROWS {
+                break;
+            }
+            let i = (first + d) % n;
+            if prefilling(&self.slots[i]) && left(&self.slots[i]) >= len {
+                rows.push(i);
+                last = i;
+            }
+        }
+        self.next_prefill = (last + 1) % n;
         let device = self.device().clone();
+        if rows.len() == 1 {
+            self.prefill_single(first, len, &device);
+        } else {
+            self.prefill_rows(&rows, len, &device);
+        }
+        for &i in &rows {
+            let active = self.slots[i].active.as_ref().expect("prefilling");
+            if active.prefilled >= active.stream.len() {
+                self.slots[i].active.as_mut().expect("prefilling").phase = Phase::Decode;
+                self.prompt_done(i);
+                self.fork_from(i);
+            }
+        }
+    }
+
+    /// The next `len` prompt tokens of slot `i` alone; the output once the prompt is in.
+    fn prefill_single(&mut self, i: usize, len: usize, device: &Device) {
         let slot = &mut self.slots[i];
         let active = slot.active.as_mut().expect("prefilling");
         let start = active.prefilled;
+        let piece = &active.stream[start..start + len];
+        let t = Tensor::from_data(TensorData::new(piece.to_vec(), [1, len]), device);
         let out = match (&self.model, &mut slot.caches) {
-            (Model::Tok(m), Caches::Tok(c)) => {
-                let len = chunk.min(active.stream.len() - start);
-                let piece = &active.stream[start..start + len];
-                let t = Tensor::from_data(TensorData::new(piece.to_vec(), [1, len]), &device);
-                active.prefilled += len;
-                m.prefill(t, c, chunk)
-            }
-            (Model::Ncm(m), Caches::Ncm(c)) => {
-                let k = m.concept_size();
-                let chunk = (chunk - chunk % k).max(k);
-                let len = chunk.min(active.stream.len() - start);
-                let piece = &active.stream[start..start + len];
-                let t = Tensor::from_data(TensorData::new(piece.to_vec(), [1, len]), &device);
-                active.prefilled += len;
-                Some(m.prefill(t, c, chunk))
-            }
+            (Model::Tok(m), Caches::Tok(c)) => m.prefill(t, c, len),
+            (Model::Ncm(m), Caches::Ncm(c)) => Some(m.prefill(t, c, len)),
             _ => unreachable!("slots hold caches of the model"),
         };
+        active.prefilled += len;
         if active.prefilled >= active.stream.len() {
             active.out = out;
-            active.phase = Phase::Decode;
-            self.prompt_done(i);
-            self.fork_from(i);
+        }
+    }
+
+    /// The next `len` prompt tokens of each slot in `rows` in one batched forward.
+    fn prefill_rows(&mut self, rows: &[usize], len: usize, device: &Device) {
+        let mut ids = Vec::with_capacity(rows.len() * len);
+        for &i in rows {
+            let a = self.slots[i].active.as_ref().expect("prefilling");
+            ids.extend_from_slice(&a.stream[a.prefilled..a.prefilled + len]);
+        }
+        let t = Tensor::from_data(TensorData::new(ids, [rows.len(), len]), device);
+        // The slots of `rows` in that order: their caches and requests.
+        let mut picked: Vec<Option<&mut Slot>> = self.slots.iter_mut().map(Some).collect();
+        let mut slots: Vec<&mut Slot> =
+            rows.iter().map(|&i| picked[i].take().expect("one row per slot")).collect();
+        let out = match &self.model {
+            Model::Tok(m) => {
+                let mut caches: Vec<&mut [LayerCache]> = slots
+                    .iter_mut()
+                    .map(|s| match &mut s.caches {
+                        Caches::Tok(c) => c.as_mut_slice(),
+                        Caches::Ncm(_) => unreachable!("slots hold caches of the model"),
+                    })
+                    .collect();
+                m.prefill_slots(t, &mut caches, len)
+            }
+            Model::Ncm(m) => {
+                let mut caches: Vec<&mut NcmCache> = slots
+                    .iter_mut()
+                    .map(|s| match &mut s.caches {
+                        Caches::Ncm(c) => c,
+                        Caches::Tok(_) => unreachable!("slots hold caches of the model"),
+                    })
+                    .collect();
+                m.prefill_slots(t, &mut caches, len)
+            }
+        };
+        for (r, slot) in slots.into_iter().enumerate() {
+            let active = slot.active.as_mut().expect("prefilling");
+            active.prefilled += len;
+            if active.prefilled >= active.stream.len() {
+                active.out = Some(out.clone().narrow(0, r, 1));
+            }
         }
     }
 
@@ -644,14 +743,20 @@ impl Batcher {
         eager
     }
 
-    /// NCM: one concept per slot from its condition (pending prompt tokens forced first), then
-    /// the written concepts appended in one batched step.
+    /// NCM: one concept per slot. The concept each slot wrote last step is appended first
+    /// (deferred, so that on CUDA the append and the next decoder pass run as one graph replay
+    /// of the slot set, [`ncm_model::ncm::GraphedNcmSlots`]); then the next concept is written
+    /// from each slot's condition (pending prompt tokens forced first).
     fn ncm_step(&mut self, rows: &[usize]) {
+        #[cfg(feature = "cuda")]
+        if let Some(picked) = self.ncm_graph_step(rows) {
+            self.ncm_emit(rows, &picked, &vec![0; rows.len()]);
+            return;
+        }
+        self.ncm_append_deferred(rows);
         let ids = self.ids();
-        let capacity = self.core.capacity;
         let device = self.device().clone();
         let Model::Ncm(model) = &self.model else { unreachable!("the NCM") };
-        let k = model.concept_size();
         let cond = Tensor::cat(
             rows.iter()
                 .map(|&i| {
@@ -711,26 +816,20 @@ impl Batcher {
             model.decode_slots(cond, &mut caches, &mut pick)
         };
         let picked = read_ids(&picked);
-        let mut appends = Vec::new();
-        for (r, &i) in rows.iter().enumerate() {
-            let skip = forced[r].len();
-            let concept_ids = &picked[r * k..(r + 1) * k];
-            let a = self.slots[i].active.as_mut().expect("decoding");
-            let before = a.emitted;
-            match emit_concept(a, concept_ids, skip, k, ids) {
-                Err(finish) => self.finish(i, finish),
-                Ok(concept) => {
-                    a.empty_concepts = if a.emitted == before { a.empty_concepts + 1 } else { 0 };
-                    if a.empty_concepts >= MAX_EMPTY_CONCEPTS {
-                        self.finish(i, Finish::Stop);
-                    } else if a.history.len() + k > capacity {
-                        self.finish(i, Finish::Length);
-                    } else {
-                        appends.push((i, concept));
-                    }
-                }
-            }
-        }
+        let skips: Vec<usize> = forced.iter().map(Vec::len).collect();
+        self.ncm_emit(rows, &picked, &skips);
+    }
+
+    /// Appends the concepts the slots of `rows` wrote last step (those that have one) in one
+    /// batched step; their conditions become the slots' `out`.
+    fn ncm_append_deferred(&mut self, rows: &[usize]) {
+        let appends: Vec<(usize, Vec<i32>)> = rows
+            .iter()
+            .filter_map(|&i| {
+                let a = self.slots[i].active.as_mut().expect("decoding");
+                a.unappended.take().map(|c| (i, c))
+            })
+            .collect();
         if appends.is_empty() {
             return;
         }
@@ -749,6 +848,77 @@ impl Batcher {
         }
     }
 
+    /// A slot set's step as one graph replay (CUDA, graphs on): when every row has a written
+    /// concept to append, nothing pending or constrained (the device sampler draws every row,
+    /// greedy rows by argmax). Returns the next concepts `[rows * k]`, or None to step eagerly.
+    #[cfg(feature = "cuda")]
+    fn ncm_graph_step(&mut self, rows: &[usize]) -> Option<Vec<u32>> {
+        if !ncm_model::fused::graphs_active(self.device()) {
+            return None;
+        }
+        let eligible = rows.iter().all(|&i| {
+            let a = self.slots[i].active.as_ref().expect("decoding");
+            a.unappended.is_some() && a.pending.is_empty() && a.constraint.is_none()
+        });
+        if !eligible {
+            return None;
+        }
+        let flat: Vec<i32> = rows
+            .iter()
+            .flat_map(|&i| {
+                let a = self.slots[i].active.as_ref().expect("decoding");
+                a.unappended.clone().expect("checked")
+            })
+            .collect();
+        let input = self.int_tensor(&flat, rows.len());
+        let settings: Vec<_> =
+            rows.iter().map(|&i| self.slots[i].active.as_ref().expect("decoding").device).collect();
+        let Model::Ncm(model) = &self.model else { unreachable!("the NCM") };
+        let k = model.concept_size();
+        let (next, cond) = {
+            let (mut caches, _) = slot_caches_ncm(&mut self.slots, rows);
+            self.ncm_graphs.step(model, rows, input, &mut caches, &settings)?
+        };
+        let picked = read_ids(&next);
+        for (row, &i) in rows.iter().enumerate() {
+            let a = self.slots[i].active.as_mut().expect("decoding");
+            let concept = a.unappended.take().expect("checked");
+            a.history.extend_from_slice(&concept);
+            // A view of the graph's output buffer: copied if the request ends (`finish`).
+            a.out = Some(cond.clone().narrow(0, row, 1));
+            a.device.counter = a.device.counter.wrapping_add(k as u32);
+        }
+        Some(picked)
+    }
+
+    /// Streams the concepts `picked` (`[rows * k]`, the first `skips[r]` of row r forced prompt
+    /// tokens) and keeps each continuing slot's concept to append next step.
+    fn ncm_emit(&mut self, rows: &[usize], picked: &[u32], skips: &[usize]) {
+        let ids = self.ids();
+        let capacity = self.core.capacity;
+        let Model::Ncm(model) = &self.model else { unreachable!("the NCM") };
+        let k = model.concept_size();
+        for (r, &i) in rows.iter().enumerate() {
+            let skip = skips[r];
+            let concept_ids = &picked[r * k..(r + 1) * k];
+            let a = self.slots[i].active.as_mut().expect("decoding");
+            let before = a.emitted;
+            match emit_concept(a, concept_ids, skip, k, ids) {
+                Err(finish) => self.finish(i, finish),
+                Ok(concept) => {
+                    a.empty_concepts = if a.emitted == before { a.empty_concepts + 1 } else { 0 };
+                    if a.empty_concepts >= MAX_EMPTY_CONCEPTS {
+                        self.finish(i, Finish::Stop);
+                    } else if a.history.len() + k > capacity {
+                        self.finish(i, Finish::Length);
+                    } else {
+                        a.unappended = Some(concept);
+                    }
+                }
+            }
+        }
+    }
+
     /// Ends the request on slot `i`: its stats go back, and the slot keeps the prompt's state
     /// and the state at the end of the reply for the next requests.
     fn finish(&mut self, i: usize, finish: Finish) {
@@ -761,7 +931,8 @@ impl Batcher {
         if let Some(prompt) = a.prompt_kept {
             if reuse && a.history.len() > a.stream.len() {
                 let tokens = a.history.clone();
-                let out = a.out.clone();
+                // A copy: the condition may be a view of a step graph's output buffer.
+                let out = a.out.clone().map(|o| o.mul_scalar(1.0));
                 next.push(match &slot.caches {
                     Caches::Tok(c) => SlotKept::Tok(Kept {
                         tokens,

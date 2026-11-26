@@ -108,24 +108,15 @@ impl DecoderBlock {
         caches: &mut [(&mut KvCache, &KvCache)],
         pending: Option<Tensor<3>>,
     ) -> (Tensor<3>, Option<Tensor<3>>) {
+        // Projections once over every slot's row, the attention per slot.
         let (x, h) = norm_after(&self.n1, x, pending);
-        let attn: Vec<Tensor<3>> = caches
-            .iter_mut()
-            .enumerate()
-            .map(|(i, (own, _))| {
-                self.self_attn.forward(h.clone().narrow(0, i, 1), rope_self, Some(&mut **own))
-            })
-            .collect();
-        let (x, h) = add_rms_norm(&self.n2, x, Tensor::cat(attn, 0));
-        let crossed: Vec<Tensor<3>> = caches
-            .iter()
-            .enumerate()
-            .map(|(i, (_, ring))| {
-                let (keys, values) = ring.view();
-                self.cross.forward(h.clone().narrow(0, i, 1), &rope_q[i], keys, values, None)
-            })
-            .collect();
-        let crossed = Tensor::cat(crossed, 0);
+        let attn = {
+            let mut own: Vec<&mut KvCache> = caches.iter_mut().map(|(own, _)| &mut **own).collect();
+            self.self_attn.forward_rows(h, rope_self, &mut own)
+        };
+        let (x, h) = add_rms_norm(&self.n2, x, attn);
+        let kvs: Vec<(Tensor<4>, Tensor<4>)> = caches.iter().map(|(_, ring)| ring.view()).collect();
+        let crossed = self.cross.forward_rows(h, rope_q, &kvs);
         if let Some(x) = self.mlp.residual_step(&self.n3, &x, Some(&crossed)) {
             return (x, None);
         }
@@ -472,6 +463,47 @@ impl NcmLm {
 
     // ------------------------------------------------------------------ incremental
 
+    /// `slots` caches (each for batch 1) for [`Self::append_slots`] and [`Self::decode_slots`]:
+    /// as many [`Self::make_cache`], except that the backbone's retrieval caches are rows of
+    /// shared buffers on CUDA ([`crate::layers::Stack::make_slot_caches`]), so a batched step
+    /// decodes each retrieval layer once for all slots.
+    pub fn make_slot_caches(
+        &self,
+        slots: usize,
+        max_tokens: usize,
+        device: &Device,
+    ) -> Vec<NcmCache> {
+        let concepts = max_tokens.div_ceil(self.k);
+        let backbones = self.backbone.make_slot_caches(slots, concepts, device);
+        backbones
+            .into_iter()
+            .map(|backbone| NcmCache {
+                backbone,
+                ..self.make_cache_without_backbone(max_tokens, device)
+            })
+            .collect()
+    }
+
+    /// [`Self::make_cache`] for batch 1 with an empty backbone (filled by the caller).
+    fn make_cache_without_backbone(&self, max_tokens: usize, device: &Device) -> NcmCache {
+        let mut cache = self.make_cache(0, 1, device);
+        cache.encoder = self.encoder.make_caches(max_tokens, 1, device);
+        cache.cross = (0..self.dec_blocks.len())
+            .map(|_| {
+                KvCache::make(
+                    1,
+                    self.dec_kv_heads,
+                    self.head_dim,
+                    max_tokens,
+                    Some(self.enc_window),
+                    device,
+                )
+            })
+            .collect();
+        cache.backbone = Vec::new();
+        cache
+    }
+
     pub fn make_cache(&self, max_tokens: usize, batch: usize, device: &Device) -> NcmCache {
         let concepts = max_tokens.div_ceil(self.k);
         NcmCache {
@@ -556,13 +588,14 @@ impl NcmLm {
         drop(written.into_data());
     }
 
-    /// [`Self::append_tokens`] of one concept per batch row, the rows separate streams (slots):
-    /// `tokens` `[B, k]`, row i appended to `caches[i]` (built for batch 1). Returns each
-    /// row's next condition `[B, 1, d]`.
+    /// [`Self::append_tokens`] of whole concepts per batch row, the rows separate streams
+    /// (slots): `tokens` `[B, t]` (`t` a multiple of k: one concept per decode step, a prefill
+    /// chunk for [`Self::prefill_slots`]), row i appended to `caches[i]` (built for batch 1) at
+    /// its own position. Returns each row's next condition `[B, 1, d]`.
     pub fn append_slots(&self, tokens: Tensor<2, Int>, caches: &mut [&mut NcmCache]) -> Tensor<3> {
         let k = self.k;
         let [b, t] = tokens.dims();
-        assert!(t == k && b == caches.len(), "one concept per slot");
+        assert!(t > 0 && t % k == 0 && b == caches.len(), "whole concepts for every slot");
         let device = tokens.device();
         let x = self.emb.forward(tokens);
         let states = {
@@ -570,24 +603,51 @@ impl NcmLm {
                 caches.iter_mut().map(|c| c.encoder.as_mut_slice()).collect();
             self.encoder.forward_slots(x, &mut enc)
         };
-        for (i, cache) in caches.iter_mut().enumerate() {
-            let rope_k = self.rope(cache.tokens, k, &device);
-            let row = states.clone().narrow(0, i, 1);
-            for (blk, ring) in self.dec_blocks.iter().zip(cache.cross.iter_mut()) {
-                let (keys, values) = blk.cross.make_kv(row.clone(), &rope_k);
-                ring.write(keys, values);
+        // The cross-attention key/value projections once over every slot's row, RoPE and the
+        // ring write per slot.
+        let ropes: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, t, &device)).collect();
+        for (l, blk) in self.dec_blocks.iter().enumerate() {
+            let kvs = blk.cross.make_kv_rows(states.clone(), &ropes);
+            for (cache, (keys, values)) in caches.iter_mut().zip(kvs) {
+                cache.cross[l].write(keys, values);
             }
         }
-        let concepts = self.pool.forward(states.reshape([b, 1, k * self.local_dim]));
+        let n = t / k;
+        let concepts = self.pool.forward(states.reshape([b, n, k * self.local_dim]));
         let h = {
             let mut bb: Vec<&mut [LayerCache]> =
                 caches.iter_mut().map(|c| c.backbone.as_mut_slice()).collect();
             self.backbone.forward_slots(concepts, &mut bb)
         };
         for cache in caches.iter_mut() {
-            cache.tokens += k;
+            cache.tokens += t;
         }
-        self.cond_proj.forward(h)
+        self.cond_proj.forward(if n == 1 { h } else { h.narrow(1, n - 1, 1) })
+    }
+
+    /// [`Self::prefill`] of one prompt piece per batch row, the rows separate streams (slots)
+    /// each at its own position: `tokens` `[B, n]` (`n` a multiple of k), row i into
+    /// `caches[i]`, in chunks of `chunk` tokens (at most [`ENCODER_CHUNK`]) through
+    /// [`Self::append_slots`], so the projections and MLPs of every slot's chunk run as one
+    /// batch. Returns each row's next condition `[B, 1, d]`.
+    pub fn prefill_slots(
+        &self,
+        tokens: Tensor<2, Int>,
+        caches: &mut [&mut NcmCache],
+        chunk: usize,
+    ) -> Tensor<3> {
+        let k = self.k;
+        let chunk = chunk.min(ENCODER_CHUNK);
+        let chunk = (chunk - chunk % k).max(k);
+        let n = tokens.dims()[1];
+        let mut cond = None;
+        let mut start = 0;
+        while start < n {
+            let len = chunk.min(n - start);
+            cond = Some(self.append_slots(tokens.clone().narrow(1, start, len), caches));
+            start += len;
+        }
+        cond.expect("prompt pieces must not be empty")
     }
 
     /// [`Self::decode_concept_with`] for a batch of separate streams: `cond` `[B, 1, d]`, row i
@@ -599,14 +659,29 @@ impl NcmLm {
         caches: &mut [&mut NcmCache],
         pick: &mut dyn FnMut(usize, &Tensor<3>) -> Tensor<2, Int>,
     ) -> Tensor<2, Int> {
+        let k = self.k;
+        let device = cond.device();
+        let rope_self = self.rope(0, k, &device);
+        let rope_q: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, k, &device)).collect();
+        self.decode_slots_with_ropes(cond, caches, &rope_self, &rope_q, pick)
+    }
+
+    /// [`Self::decode_slots`] with the RoPE tables given: the concept's own positions
+    /// (`rope_self`, 0..k) and each row's absolute positions (`rope_q[i]`). No host uploads,
+    /// so it can run inside a CUDA graph capture.
+    pub(crate) fn decode_slots_with_ropes(
+        &self,
+        cond: Tensor<3>,
+        caches: &mut [&mut NcmCache],
+        rope_self: &Rope,
+        rope_q: &[Rope],
+        pick: &mut dyn FnMut(usize, &Tensor<3>) -> Tensor<2, Int>,
+    ) -> Tensor<2, Int> {
         let (k, d) = (self.k, self.local_dim);
         let [b, _, _] = cond.dims();
-        let device = cond.device();
         for cache in caches.iter_mut() {
             cache.dec_self.iter_mut().for_each(KvCache::reset);
         }
-        let rope_self = self.rope(0, k, &device);
-        let rope_q: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, k, &device)).collect();
         let mut tokens = Vec::with_capacity(k);
         let mut inp = self.start_emb.val().reshape([1, 1, d]).expand([b, 1, d]);
         for j in 0..k {
@@ -1404,5 +1479,273 @@ impl NcmLm {
         };
         let (graph, out) = crate::graph::record(&device, cache, 2, run, undo)?;
         Ok(StepGraph { graph, out, inputs })
+    }
+}
+
+/// NCM concept steps of several separate streams (slots) batched together, as one captured
+/// CUDA graph per set of slots, captured lazily and kept (up to
+/// [`crate::tok::SLOT_GRAPHS`]): [`NcmLm::append_slots`] of each slot's written concept
+/// (encoder, the cross-attention keys, pooling and the backbone step, each slot's layers
+/// through its own [`crate::layers::StackStep`] and cursors, the retrieval layers of pooled
+/// slot caches in one set of launches) and then [`NcmLm::decode_slots`] of the next concept,
+/// greedy or with the device sampler, one settings set per row. Before each replay every
+/// slot's cursors, positions and RoPE tables are staged and uploaded once; after it the host
+/// positions advance. A set waits until every slot's cross-attention ring is full.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedNcmSlots {
+    graphs: Vec<NcmSlotsEntry>,
+}
+
+/// A slot set and its graph (or why its capture failed).
+#[cfg(feature = "cuda")]
+type NcmSlotsEntry = (Vec<usize>, Result<Box<NcmSlotsGraph>, String>);
+
+#[cfg(feature = "cuda")]
+struct NcmSlotsGraph {
+    graph: crate::graph::Captured,
+    /// The rows' written concepts `[B, k]` (i32).
+    tokens: Tensor<2, Int>,
+    staging: crate::graph::Staging,
+    slots: Vec<SlotInputs>,
+    params: crate::sample::SampleParams,
+    /// Held for its buffers, which the graph reads (the concept's own RoPE positions).
+    #[allow(dead_code)]
+    rope_self: Rope,
+    /// The rows' next concepts `[B, k]`, and the conditions `[B, 1, d]` they were written from.
+    output: (Tensor<2, Int>, Tensor<3>),
+    /// The epochs of the caches the graph was captured against ([`NcmCache`]).
+    epochs: Vec<u64>,
+}
+
+/// One slot's fixed inputs in a [`GraphedNcmSlots`] graph.
+#[cfg(feature = "cuda")]
+struct SlotInputs {
+    cursors: crate::graph::CursorSet,
+    encoder: crate::layers::StackStep,
+    backbone: crate::layers::StackStep,
+    /// Each decoder layer's cross-attention ring, in `cursors`.
+    cross: Vec<usize>,
+    /// RoPE tables of the written concept's positions, and of the next concept's, and where
+    /// each is staged.
+    rope_k: (Rope, (usize, usize)),
+    rope_q: (Rope, (usize, usize)),
+}
+
+#[cfg(feature = "cuda")]
+impl SlotInputs {
+    /// Stages the slot's cursors, positions and RoPE tables at its cache's position.
+    fn refresh(&mut self, model: &NcmLm, cache: &NcmCache, staging: &mut crate::graph::Staging) {
+        let (k, base, scale) = (model.k, model.rope_base, model.rope_scale);
+        let cursors = &mut self.cursors;
+        self.encoder.refresh(&model.encoder, &cache.encoder, cursors, staging);
+        self.backbone.refresh(&model.backbone, &cache.backbone, cursors, staging);
+        for (&i, c) in self.cross.iter().zip(&cache.cross) {
+            cursors.sync(i, c);
+        }
+        cursors.refresh(staging);
+        let off = crate::layers::Yarn::OFF;
+        self.rope_k.0.stage(staging, self.rope_k.1, cache.tokens, (base, scale, off));
+        self.rope_q.0.stage(staging, self.rope_q.1, cache.tokens + k, (base, scale, off));
+    }
+
+    /// Moves the slot's host positions on after a replay.
+    fn advance(&self, k: usize, cache: &mut NcmCache) {
+        self.encoder.advance(&mut cache.encoder);
+        for c in &mut cache.cross {
+            c.advance(k);
+        }
+        self.backbone.advance(&mut cache.backbone);
+        cache.tokens += k;
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedNcmSlots {
+    /// The next concept `[B, k]` of each slot of `key` (in order; `caches` theirs) after
+    /// appending `tokens` `[B, k]` (each row the concept that slot just wrote), each row picked
+    /// per `settings` (greedy rows take [`crate::sample::SampleSettings::GREEDY`]; counters as
+    /// the requests stand, advancing by k per concept), from the slot set's graph (captured now
+    /// if new and every slot's ring is full). None when no graph can serve: the caller steps
+    /// eagerly ([`NcmLm::append_slots`], [`NcmLm::decode_slots`]). Also returns each row's
+    /// condition `[B, 1, d]` after the append (what `append_slots` would return). Both are the
+    /// graph's output buffers: read or copy them before the next call for the same slots.
+    pub fn step(
+        &mut self,
+        model: &NcmLm,
+        key: &[usize],
+        tokens: Tensor<2, Int>,
+        caches: &mut [&mut NcmCache],
+        settings: &[crate::sample::SampleSettings],
+    ) -> Option<(Tensor<2, Int>, Tensor<3>)> {
+        let device = tokens.device();
+        let rings_full = caches
+            .iter()
+            .all(|c| c.cross.iter().all(|r| r.window().is_some() && r.len() >= r.capacity()));
+        if !crate::fused::graphs_active(&device) || tokens.dims()[1] != model.k || !rings_full {
+            return None;
+        }
+        // A graph captured against other caches (or before a cache's buffers changed) is stale.
+        let epochs: Vec<u64> = caches.iter().map(|c| c.epoch).collect();
+        self.graphs.retain(|(k, g)| k != key || g.as_ref().map_or(true, |g| g.epochs == epochs));
+        if !self.graphs.iter().any(|(k, _)| k == key) {
+            if self.graphs.len() >= crate::tok::SLOT_GRAPHS {
+                drop(self.graphs.remove(0));
+            }
+            let graph = model.capture_slots_step(&tokens, caches, settings).map(Box::new);
+            self.graphs.push((key.to_vec(), graph));
+        }
+        let (_, Ok(g)) = self.graphs.iter_mut().find(|(k, _)| k == key)? else {
+            return None;
+        };
+        let tokens = tokens.cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(&g.tokens, tokens, 0, 0);
+        g.params.set_rows(settings);
+        for (slot, cache) in g.slots.iter_mut().zip(caches.iter()) {
+            slot.refresh(model, cache, &mut g.staging);
+        }
+        g.staging.upload(&device);
+        // Safety: the graph's buffers are held by `g`, the model's weights and the slots'
+        // caches, all alive across the replay (which checks its thread).
+        unsafe { crate::graph::replay(&device, &g.graph, "batched concept step") };
+        for (slot, cache) in g.slots.iter().zip(caches.iter_mut()) {
+            slot.advance(model.k, cache);
+        }
+        Some(g.output.clone())
+    }
+
+    /// Why a slot set's step runs eagerly, if its capture failed.
+    pub fn failure(&self, key: &[usize]) -> Option<&str> {
+        self.graphs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, g)| g.as_ref().err())
+            .map(String::as_str)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl NcmLm {
+    /// Warms up and records one batched concept step of the slots `caches` over fixed input
+    /// buffers, leaving the caches as they were.
+    fn capture_slots_step(
+        &self,
+        tokens: &Tensor<2, Int>,
+        caches: &mut [&mut NcmCache],
+        settings: &[crate::sample::SampleSettings],
+    ) -> Result<NcmSlotsGraph, String> {
+        use crate::graph::{CursorSet, restore_kv, save_kv, write_kv};
+        use crate::layers::StackStep;
+        let device = tokens.device();
+        let (k, d) = (self.k, self.local_dim);
+        let b = caches.len();
+        let mut staging = crate::graph::Staging::default();
+        let mut slots = Vec::with_capacity(b);
+        for cache in caches.iter() {
+            let mut cursors = CursorSet::default();
+            let encoder =
+                StackStep::new(&self.encoder, &cache.encoder, k, &mut cursors, &mut staging)?;
+            let cross = cache
+                .cross
+                .iter()
+                .map(|c| cursors.add(c, k, &mut staging))
+                .collect::<Result<Vec<_>, _>>()?;
+            let backbone =
+                StackStep::new(&self.backbone, &cache.backbone, 1, &mut cursors, &mut staging)?;
+            let mut rope = |start: usize| {
+                let rope = self.rope(start, k, &device).fixed();
+                let at = rope.add_to(&mut staging);
+                (rope, at)
+            };
+            let rope_k = rope(cache.tokens);
+            let rope_q = rope(cache.tokens + k);
+            slots.push(SlotInputs { cursors, encoder, backbone, cross, rope_k, rope_q });
+        }
+        let input = Tensor::<2, Int>::zeros([b, k], &device).cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(
+            &input,
+            tokens.clone().cast(burn::tensor::IntDType::I32),
+            0,
+            0,
+        );
+        let params = crate::sample::SampleParams::rows(&device, b);
+        params.set_rows(settings);
+        for (slot, cache) in slots.iter_mut().zip(caches.iter()) {
+            slot.refresh(self, cache, &mut staging);
+        }
+        staging.upload(&device);
+        let rope_self = self.rope(0, k, &device).fixed();
+        let saved: Vec<_> = slots
+            .iter()
+            .zip(caches.iter())
+            .map(|(slot, c)| {
+                (
+                    slot.encoder.save(&c.encoder),
+                    c.cross.iter().map(|r| save_kv(r, k)).collect::<Vec<_>>(),
+                    slot.backbone.save(&c.backbone),
+                )
+            })
+            .collect();
+        let (g_slots, g_staging, g_input, g_params, g_rope_self) =
+            (&slots, &staging, &input, &params, &rope_self);
+        let run = |caches: &mut [&mut NcmCache]| {
+            g_staging.scatter();
+            let kv: Vec<_> = g_slots.iter().map(|s| s.cursors.steps()).collect();
+            let x = self.emb.forward(g_input.clone());
+            let states = {
+                let steps: Vec<&StackStep> = g_slots.iter().map(|s| &s.encoder).collect();
+                let mut enc: Vec<&mut [LayerCache]> =
+                    caches.iter_mut().map(|c| c.encoder.as_mut_slice()).collect();
+                StackStep::run_slots(&self.encoder, &steps, x, &mut enc, &kv)
+            };
+            // The cross-attention keys and values: the projection once over every row, RoPE
+            // and the ring write per slot.
+            let ropes_k: Vec<Rope> = g_slots.iter().map(|s| s.rope_k.0.clone()).collect();
+            for (l, blk) in self.dec_blocks.iter().enumerate() {
+                let kvs = blk.cross.make_kv_rows(states.clone(), &ropes_k);
+                for (i, (cache, (keys, values))) in caches.iter_mut().zip(kvs).enumerate() {
+                    write_kv(&mut cache.cross[l], keys, values, &kv[i][g_slots[i].cross[l]]);
+                }
+            }
+            let concept = self.pool.forward(states.reshape([b, 1, k * d]));
+            let h = {
+                let steps: Vec<&StackStep> = g_slots.iter().map(|s| &s.backbone).collect();
+                let mut bb: Vec<&mut [LayerCache]> =
+                    caches.iter_mut().map(|c| c.backbone.as_mut_slice()).collect();
+                StackStep::run_slots(&self.backbone, &steps, concept, &mut bb, &kv)
+            };
+            let cond = self.cond_proj.forward(h);
+            let ropes_q: Vec<Rope> = g_slots.iter().map(|s| s.rope_q.0.clone()).collect();
+            let mut pick = |j: usize, logits: &Tensor<3>| sample_pick(logits, g_params, j);
+            let next = self.decode_slots_with_ropes(
+                cond.clone(),
+                caches,
+                g_rope_self,
+                &ropes_q,
+                &mut pick,
+            );
+            (next, cond)
+        };
+        let undo = |caches: &mut [&mut NcmCache]| {
+            for (cache, s) in caches.iter_mut().zip(&saved) {
+                StackStep::restore(&mut cache.encoder, &s.0);
+                for (ring, r) in cache.cross.iter_mut().zip(&s.1) {
+                    restore_kv(ring, r);
+                }
+                StackStep::restore(&mut cache.backbone, &s.2);
+            }
+        };
+        let (graph, output) = crate::graph::record(&device, caches, 2, run, undo)?;
+        let epochs = caches.iter().map(|c| c.epoch).collect();
+        Ok(NcmSlotsGraph {
+            graph,
+            tokens: input,
+            staging,
+            slots,
+            params,
+            rope_self,
+            output,
+            epochs,
+        })
     }
 }

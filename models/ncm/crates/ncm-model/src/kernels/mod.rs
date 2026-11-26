@@ -12,7 +12,7 @@ mod delta;
 mod gemv;
 pub mod hybrid;
 mod norm;
-mod quant;
+pub(crate) mod quant;
 mod retrieval;
 
 use burn::backend::tensor::{BoolTensor, FloatTensor, IntTensor};
@@ -433,7 +433,8 @@ impl NcmKernels for CubeBackend {
         // for q8; two for q4, whose decoding rather than its loads limits it.
         let vec = if bits == 4 { 2 } else { 4 };
         let strides = packed.meta.strides().to_vec();
-        if rows * (d_in + d_in / 32 + 1) <= quant::QX
+        // Any width: the kernel stages x a tile at a time.
+        if rows <= crate::quant::GEMV_ROWS
             && strides[1] == 1
             && strides[0].is_multiple_of(vec)
             && words.is_multiple_of(vec)
@@ -452,6 +453,7 @@ impl NcmKernels for CubeBackend {
                     d_in,
                     n_len,
                     words,
+                    quant::staged_tile(rows, d_in, quant::QX),
                     bits,
                     rows,
                     group_words,
@@ -914,7 +916,7 @@ impl NcmKernels for CubeBackend {
                 part_max.clone().into_tensor_arg(),
                 part_sum.clone().into_tensor_arg(),
                 part_acc.clone().into_tensor_arg(),
-                position.into_tensor_arg(),
+                position.clone().into_tensor_arg(),
                 chunks,
                 tiles,
                 d.topk,
@@ -937,6 +939,7 @@ impl NcmKernels for CubeBackend {
                 part_sum.into_tensor_arg(),
                 part_acc.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
+                position.into_tensor_arg(),
                 chunks,
                 h,
                 d.v_dim,
@@ -1352,6 +1355,28 @@ pub fn enable_kernel_cache(root: Option<std::path::PathBuf>) -> Option<std::path
     config.compilation.cache = true;
     config.environment.path = CacheConfig::Directory(dir.clone());
     CubeClRuntimeConfig::try_set(config).then_some(dir)
+}
+
+/// The id of the device buffer behind a dispatch tensor (cubecl tensors; None elsewhere).
+fn dispatch_buffer_id(t: burn::backend::DispatchTensor) -> Option<usize> {
+    use burn::backend::{BackendTensor, DispatchTensorKind};
+    let handle = match t.kind {
+        DispatchTensorKind::Cube(BackendTensor::Float(c)) => c.handle,
+        DispatchTensorKind::Cube(BackendTensor::Int(c)) => c.handle,
+        _ => return None,
+    };
+    Some(handle.memory.descriptor().id.value)
+}
+
+/// The id of the device buffer behind `t` (cubecl tensors; None elsewhere): views of one
+/// buffer share it, so it tells whether a view still aliases the buffer it was cut from.
+pub fn buffer_id<const D: usize>(t: &Tensor<D>) -> Option<usize> {
+    dispatch_buffer_id(t.clone().into_dispatch())
+}
+
+/// [`buffer_id`] of an int tensor.
+pub fn int_buffer_id<const D: usize>(t: &Tensor<D, Int>) -> Option<usize> {
+    dispatch_buffer_id(t.clone().into_dispatch())
 }
 
 #[cfg(test)]

@@ -141,8 +141,13 @@ impl KvCache {
     /// Makes this cache a copy of `src` (same shape): contents and position, in this cache's
     /// own buffers on CUDA (forking one request's state into another slot).
     pub fn copy_from(&mut self, src: &KvCache) {
-        store(self.k.as_mut().expect("cache"), src.k.clone().expect("cache"));
-        store(self.v.as_mut().expect("cache"), src.v.clone().expect("cache"));
+        // A growing cache copies only the positions `src` holds; a ring all of it.
+        let held = match self.window {
+            None => src.length.min(self.capacity),
+            Some(_) => self.capacity,
+        };
+        store_prefix(self.k.as_mut().expect("cache"), src.k.clone().expect("cache"), 2, held);
+        store_prefix(self.v.as_mut().expect("cache"), src.v.clone().expect("cache"), 2, held);
         self.length = src.length;
     }
 
@@ -310,13 +315,42 @@ pub(crate) fn copy_of<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
     t.clone()
 }
 
-/// [`store`] for int tensors.
-pub(crate) fn store_int<const D: usize>(slot: &mut Tensor<D, Int>, value: Tensor<D, Int>) {
+/// Sets the first `len` entries along `axis` of `slot` to `value`'s (a forked cache's used
+/// prefix; the rest of `slot` is left as it is, as positions past a cache's length are never
+/// read): written into `slot`'s own buffer on CUDA with the fused kernels on, so a fork copies
+/// what its source holds rather than its whole capacity. Elsewhere `slot` becomes `value`.
+pub(crate) fn store_prefix<const D: usize>(
+    slot: &mut Tensor<D>,
+    value: Tensor<D>,
+    axis: usize,
+    len: usize,
+) {
     #[cfg(feature = "cuda")]
     if crate::fused::active(&slot.device()) {
-        crate::inplace::write_int(slot, value, 0, 0);
+        if len > 0 {
+            crate::inplace::write_float(slot, value.narrow(axis, 0, len), axis, 0);
+        }
         return;
     }
+    let _ = (axis, len);
+    *slot = value;
+}
+
+/// [`store_prefix`] for int tensors (8-bit indexer-key codes).
+pub(crate) fn store_int_prefix<const D: usize>(
+    slot: &mut Tensor<D, Int>,
+    value: Tensor<D, Int>,
+    axis: usize,
+    len: usize,
+) {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&slot.device()) {
+        if len > 0 {
+            crate::inplace::write_int(slot, value.narrow(axis, 0, len), axis, 0);
+        }
+        return;
+    }
+    let _ = (axis, len);
     *slot = value;
 }
 

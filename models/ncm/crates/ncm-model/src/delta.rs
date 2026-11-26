@@ -399,18 +399,32 @@ impl GatedDeltaNet {
     }
 
     /// [`Self::forward`] from the input projection `p` `[B, T, W]`.
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     pub(crate) fn forward_projected(
         &self,
         p: Tensor<3>,
-        mut cache: Option<&mut DeltaCache>,
+        cache: Option<&mut DeltaCache>,
     ) -> Tensor<3> {
+        self.project_out(self.core_projected(p, cache))
+    }
+
+    /// The output projection of [`Self::core_projected`]'s result.
+    pub(crate) fn project_out(&self, out: crate::layers::MixOut) -> Tensor<3> {
+        out.project(&self.o)
+    }
+
+    /// [`Self::forward_projected`] up to the output projection.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    pub(crate) fn core_projected(
+        &self,
+        p: Tensor<3>,
+        mut cache: Option<&mut DeltaCache>,
+    ) -> crate::layers::MixOut {
         #[cfg(feature = "cuda")]
         if let Some(c) = cache.as_deref_mut()
             && p.dims()[1] <= self.chunk
             && crate::fused::active(&p.device())
         {
-            return self.forward_fused(p, c);
+            return self.core_fused(p, c);
         }
         let [b, t, _] = p.dims();
         let (h, hd) = (self.heads, self.head_dim);
@@ -447,13 +461,13 @@ impl GatedDeltaNet {
             cache.length += t;
         }
         let out = self.norm.forward(out).swap_dims(1, 2).reshape([b, t, h * hd]);
-        self.o.forward(out * sigmoid(gate))
+        crate::layers::MixOut { x: out, gate: Some(sigmoid(gate)) }
     }
 
     /// The cached path of [`Self::forward`] as one fused kernel between the two projections:
     /// decode steps and short runs (up to a chunk), token by token.
     #[cfg(feature = "cuda")]
-    fn forward_fused(&self, p: Tensor<3>, cache: &mut DeltaCache) -> Tensor<3> {
+    fn core_fused(&self, p: Tensor<3>, cache: &mut DeltaCache) -> crate::layers::MixOut {
         let t = p.dims()[1];
         // The kernel updates the cache in place, so it must own packed buffers (a reference
         // prefill leaves views and pitched rows); after the first step this is a no-op.
@@ -471,6 +485,7 @@ impl GatedDeltaNet {
             self.norm.epsilon,
         );
         cache.length += t;
-        self.o.forward(out)
+        // The kernel has applied the gate.
+        crate::layers::MixOut { x: out, gate: None }
     }
 }

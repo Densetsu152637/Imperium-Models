@@ -1153,3 +1153,92 @@ pub fn level_tail_matches(device: &Device, tol: f32) {
         }
     }
 }
+
+/// Slot caches allocated together ([`ncm_model::TokenLm::make_slot_caches`], the retrieval
+/// layers' rows of shared buffers, decoded in one set of launches) give the same batched steps
+/// as separately allocated slot caches, for slots at different positions and past the point
+/// where retrieval turns sparse (blocks of 4, top 2, window 8).
+pub fn pooled_slot_steps_match(device: &Device, tol: f32) {
+    let cfg = ncm_model::tiny_tok_v2(tiny_v2(4, 2, 8));
+    device.seed(3);
+    let model = ncm_model::TokenLm::new(&cfg, device);
+    let mut pooled = model.make_slot_caches(3, 96, device);
+    let mut separate: Vec<_> = (0..3).map(|_| model.make_cache(96, 1, device)).collect();
+    for (i, len) in [21usize, 40, 33].into_iter().enumerate() {
+        let data: Vec<i32> = (0..len).map(|j| ((j * 7 + i * 13) % cfg.vocab_size) as i32).collect();
+        let prompt = Tensor::<2, Int>::from_data(TensorData::new(data, [1, len]), device);
+        model.prefill(prompt.clone(), &mut pooled[i], 16);
+        model.prefill(prompt, &mut separate[i], 16);
+    }
+    for step in 0..12 {
+        let ids: Vec<i32> = (0..3).map(|i| ((step * 5 + i * 3) % cfg.vocab_size) as i32).collect();
+        let token = Tensor::<2, Int>::from_data(TensorData::new(ids, [3, 1]), device);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            pooled.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.step_slots(token.clone(), &mut rows));
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            separate.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let want = values(model.step_slots(token, &mut rows));
+        assert_close(&format!("pooled slot step {step}"), &got, &want, &want, tol);
+    }
+    // A subset of the pool, out of row order (slot 1 idle): idle rows neither read nor write,
+    // so slot 1 continues as if never touched.
+    for step in 0..6 {
+        let ids: Vec<i32> = (0..2).map(|i| ((step * 3 + i * 5) % cfg.vocab_size) as i32).collect();
+        let token = Tensor::<2, Int>::from_data(TensorData::new(ids, [2, 1]), device);
+        let (a, rest) = pooled.split_at_mut(1);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            vec![rest[1].as_mut_slice(), a[0].as_mut_slice()];
+        let got = values(model.step_slots(token.clone(), &mut rows));
+        let (a, rest) = separate.split_at_mut(1);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            vec![rest[1].as_mut_slice(), a[0].as_mut_slice()];
+        let want = values(model.step_slots(token, &mut rows));
+        assert_close(&format!("pooled subset step {step}"), &got, &want, &want, tol);
+    }
+    let token = Tensor::<2, Int>::from_data(TensorData::new(vec![1i32, 2, 3], [3, 1]), device);
+    let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+        pooled.iter_mut().map(|c| c.as_mut_slice()).collect();
+    let got = values(model.step_slots(token.clone(), &mut rows));
+    let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+        separate.iter_mut().map(|c| c.as_mut_slice()).collect();
+    let want = values(model.step_slots(token, &mut rows));
+    assert_close("pooled step after the subset", &got, &want, &want, tol);
+}
+
+/// The NCM's batched concept-step graph ([`ncm_model::ncm::GraphedNcmSlots`], greedy) gives
+/// the same concepts as the eager batched step (`append_slots`, then `decode_slots` by
+/// argmax), for two slots at different positions with pooled slot caches.
+pub fn graphed_ncm_slots_match_eager(device: &Device) {
+    use ncm_model::sample::SampleSettings;
+    let cfg = tiny_ncm_v2(8, tiny_v2(2, 2, 4));
+    device.seed(9);
+    let model = NcmLm::new(&cfg, device);
+    let k = cfg.k;
+    let mut graphed = model.make_slot_caches(2, 64 * k, device);
+    let mut eager = model.make_slot_caches(2, 64 * k, device);
+    for (i, concepts) in [5usize, 8].into_iter().enumerate() {
+        let n = concepts * k;
+        let data: Vec<i32> = (0..n).map(|j| ((j * 11 + i * 7) % cfg.vocab_size) as i32).collect();
+        let prompt = Tensor::<2, Int>::from_data(TensorData::new(data, [1, n]), device);
+        model.prefill(prompt.clone(), &mut graphed[i], 4 * k);
+        model.prefill(prompt, &mut eager[i], 4 * k);
+    }
+    let mut graphs = ncm_model::ncm::GraphedNcmSlots::default();
+    let settings = [SampleSettings::GREEDY; 2];
+    let mut written: Vec<i32> = (0..2 * k).map(|j| (j * 3 % cfg.vocab_size) as i32).collect();
+    for step in 0..6 {
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(written.clone(), [2, k]), device);
+        let mut g: Vec<&mut ncm_model::NcmCache> = graphed.iter_mut().collect();
+        let got = graphs.step(&model, &[0, 1], tokens.clone(), &mut g, &settings);
+        let mut e: Vec<&mut ncm_model::NcmCache> = eager.iter_mut().collect();
+        let cond = model.append_slots(tokens, &mut e);
+        let mut argmax = |_: usize, logits: &Tensor<3>| argmax_last(logits.clone()).reshape([2, 1]);
+        let want = ints(model.decode_slots(cond, &mut e, &mut argmax));
+        match got {
+            Some((next, _)) => assert_eq!(ints(next), want, "step {step}: concepts differ"),
+            None => panic!("step {step}: no graph ({:?})", graphs.failure(&[0, 1])),
+        }
+        written = want.iter().map(|&t| t as i32).collect();
+    }
+}

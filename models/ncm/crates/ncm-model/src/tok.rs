@@ -88,6 +88,17 @@ impl TokenLm {
         self.logits(self.hidden(tokens, caches))
     }
 
+    /// `slots` cache sets (each for batch 1) for [`Self::step_slots`], the retrieval layers'
+    /// in shared buffers on CUDA ([`crate::layers::Stack::make_slot_caches`]).
+    pub fn make_slot_caches(
+        &self,
+        slots: usize,
+        max_tokens: usize,
+        device: &Device,
+    ) -> Vec<Vec<LayerCache>> {
+        self.stack.make_slot_caches(slots, max_tokens, device)
+    }
+
     pub fn make_cache(&self, max_tokens: usize, batch: usize, device: &Device) -> Vec<LayerCache> {
         self.stack.make_caches(max_tokens, batch, device)
     }
@@ -112,6 +123,32 @@ impl TokenLm {
             let len = h.dims()[1];
             self.logits(h.narrow(1, len - 1, 1))
         })
+    }
+
+    /// [`Self::prefill`] of one prompt piece per batch row, the rows separate streams (slots)
+    /// each at its own position: `tokens` `[B, n]`, row i into `caches[i]` (built for batch 1),
+    /// in chunks of `chunk` tokens ([`crate::layers::Stack::forward_slots`]: the projections
+    /// and MLPs of every slot's chunk as one batch, the mixers per slot). Returns the logits of
+    /// each row's last position `[B, 1, V]`.
+    pub fn prefill_slots(
+        &self,
+        tokens: Tensor<2, Int>,
+        caches: &mut [&mut [LayerCache]],
+        chunk: usize,
+    ) -> Tensor<3> {
+        let n = tokens.dims()[1];
+        let chunk = chunk.max(1);
+        let mut last = None;
+        let mut start = 0;
+        while start < n {
+            let len = chunk.min(n - start);
+            let x = self.emb.forward(tokens.clone().narrow(1, start, len));
+            last = Some(self.stack.forward_slots(x, caches));
+            start += len;
+        }
+        let h = last.expect("prompt pieces must not be empty");
+        let len = h.dims()[1];
+        self.logits(h.narrow(1, len - 1, 1))
     }
 
     /// One decode step for tokens `[B, 1]` whose rows are separate streams, row i with its own

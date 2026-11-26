@@ -461,8 +461,31 @@ impl Attention {
         self.forward_in(self.input(x), rope, cache)
     }
 
+    /// [`Self::forward`] of `x` `[B, T, d]` whose batch rows are separate streams, row i with
+    /// its own cache `caches[i]` (built for batch 1) and the same RoPE positions: the input and
+    /// output projections run once over every row, the attention per row.
+    pub fn forward_rows(
+        &self,
+        x: Tensor<3>,
+        rope: &Rope,
+        caches: &mut [&mut KvCache],
+    ) -> Tensor<3> {
+        let input = self.input(x);
+        let rows: Vec<MixOut> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(i, cache)| self.core_in(input.row(i), rope, Some(&mut **cache)))
+            .collect();
+        self.project_out(MixOut::cat(rows))
+    }
+
     /// [`Self::forward`] from the input projections ([`Self::input`]).
     fn forward_in(&self, input: AttnIn, rope: &Rope, cache: Option<&mut KvCache>) -> Tensor<3> {
+        self.project_out(self.core_in(input, rope, cache))
+    }
+
+    /// [`Self::forward_in`] up to the output projection.
+    fn core_in(&self, input: AttnIn, rope: &Rope, cache: Option<&mut KvCache>) -> MixOut {
         let t = input.qkv.dims()[1];
         let device = input.qkv.device();
         let (gate, q, k, v) = self.project_from(input, rope);
@@ -477,21 +500,16 @@ impl Attention {
                 attend(q, keys, values, mask)
             }
         };
-        self.output(out, gate)
+        MixOut::heads(out, gate)
     }
 
     /// [`Self::forward`] with a cache inside a captured graph: the new keys and values land at
     /// the step's device slot and the step's device mask hides what the eager path leaves out
     /// ([`crate::graph`]). Runs of more than one token attend over the ring before the write
     /// and their own keys, like [`KvCache::append`].
+    /// The output projection is left to the caller ([`Self::project_out`]).
     #[cfg(feature = "cuda")]
-    fn forward_step(
-        &self,
-        input: AttnIn,
-        rope: &Rope,
-        cache: &mut KvCache,
-        step: &KvStep,
-    ) -> Tensor<3> {
+    fn core_step(&self, input: AttnIn, rope: &Rope, cache: &mut KvCache, step: &KvStep) -> MixOut {
         let t = input.qkv.dims()[1];
         let (gate, q, k, v) = self.project_from(input, rope);
         let (keys, values) = if t == 1 {
@@ -505,7 +523,7 @@ impl Attention {
             crate::graph::write_kv(cache, k, v, step);
             (keys, values)
         };
-        self.output(attend(q, keys, values, Some(step.mask.clone())), gate)
+        MixOut::heads(attend(q, keys, values, Some(step.mask.clone())), gate)
     }
 
     /// Attention over `x` itself without a cache, with the given `[T, T]` mask (`true` hides a
@@ -584,26 +602,78 @@ impl Attention {
 
     /// Heads `[B, H, T, D]` merged, gated (v2) and projected out.
     fn output(&self, out: Tensor<4>, gate: Option<Tensor<3>>) -> Tensor<3> {
+        self.project_out(MixOut::heads(out, gate))
+    }
+
+    /// The output projection of a [`MixOut`] (gated first).
+    pub(crate) fn project_out(&self, out: MixOut) -> Tensor<3> {
+        out.project(&self.o)
+    }
+}
+
+/// A sequence mixer's result before its output projection: the merged heads `[B, T, W]` and,
+/// when not yet applied, the sigmoid output gate of the same shape. Keeping the projection
+/// apart lets a batched step ([`Stack::forward_slots`]) run each slot's mixer core on its own
+/// caches and the output projection once over every slot's rows.
+pub(crate) struct MixOut {
+    pub(crate) x: Tensor<3>,
+    pub(crate) gate: Option<Tensor<3>>,
+}
+
+impl MixOut {
+    /// Heads `[B, H, T, D]` merged to `[B, T, H D]`, with the gate still to apply.
+    pub(crate) fn heads(out: Tensor<4>, gate: Option<Tensor<3>>) -> Self {
         let [b, h, t, hd] = out.dims();
-        let out = out.swap_dims(1, 2).reshape([b, t, h * hd]);
-        // The gate's product in the output GEMV's prologue (CUDA, decode-sized runs).
+        Self { x: out.swap_dims(1, 2).reshape([b, t, h * hd]), gate }
+    }
+
+    /// Batch rows of several results stacked (gates kept apart only when every row has one).
+    pub(crate) fn cat(rows: Vec<MixOut>) -> Self {
+        let gated = rows.iter().all(|r| r.gate.is_some());
+        let (mut xs, mut gates) = (Vec::with_capacity(rows.len()), Vec::new());
+        for row in rows {
+            match (gated, row.gate) {
+                (true, Some(g)) => {
+                    xs.push(row.x);
+                    gates.push(g);
+                }
+                (_, Some(g)) => xs.push(row.x * g),
+                (_, None) => xs.push(row.x),
+            }
+        }
+        let gate = gated.then(|| Tensor::cat(gates, 0));
+        Self { x: Tensor::cat(xs, 0), gate }
+    }
+
+    /// `(x * gate) W` through `o`, the gate's product in the GEMV's prologue on CUDA for
+    /// decode-sized runs.
+    pub(crate) fn project(self, o: &Linear) -> Tensor<3> {
+        let [b, t, w] = self.x.dims();
         #[cfg(feature = "cuda")]
-        if let Some(gate) = &gate
-            && crate::fused::fused_mlp_active(&out.device())
+        if let Some(gate) = &self.gate
+            && crate::fused::fused_mlp_active(&self.x.device())
         {
             let rows = b * t;
-            let (x2, g2) =
-                (out.clone().reshape([rows, h * hd]), gate.clone().reshape([rows, h * hd]));
-            if let Some(y) = crate::mlp_fused::gated_linear(x2, g2, &self.o) {
+            let (x2, g2) = (self.x.clone().reshape([rows, w]), gate.clone().reshape([rows, w]));
+            if let Some(y) = crate::mlp_fused::gated_linear(x2, g2, o) {
                 let d = y.dims()[1];
                 return y.reshape([b, t, d]);
             }
         }
-        let out = match gate {
-            Some(gate) => out * gate,
-            None => out,
+        let _ = (b, t, w);
+        let x = match self.gate {
+            Some(gate) => self.x * gate,
+            None => self.x,
         };
-        self.o.forward(out)
+        o.forward(x)
+    }
+}
+
+impl AttnIn {
+    /// Batch row `i` (one slot's).
+    fn row(&self, i: usize) -> AttnIn {
+        let pick = |t: &Tensor<3>| t.clone().narrow(0, i, 1);
+        AttnIn { gate: self.gate.as_ref().map(pick), qkv: pick(&self.qkv) }
     }
 }
 
@@ -633,9 +703,7 @@ impl MixInput {
         match self {
             Self::Normed(h) => Self::Normed(pick(h)),
             Self::Projected(p) => Self::Projected(pick(p)),
-            Self::Attention(a) => {
-                Self::Attention(AttnIn { gate: a.gate.as_ref().map(pick), qkv: pick(&a.qkv) })
-            }
+            Self::Attention(a) => Self::Attention(a.row(i)),
         }
     }
 }
@@ -672,13 +740,52 @@ impl CrossAttention {
 
     /// Keys (with RoPE) and values `[B, KVH, T, D]` for encoder states `[B, T, d_kv]`.
     pub fn make_kv(&self, states: Tensor<3>, rope: &Rope) -> (Tensor<4>, Tensor<4>) {
-        let [b, t, _] = states.dims();
-        let (kvh, hd) = (self.kv_heads, self.head_dim);
+        self.kv_from(self.kv.forward(states), rope)
+    }
+
+    /// [`Self::make_kv`] for batch rows that are separate streams, row i at the positions of
+    /// `ropes[i]`: the key/value projection once over every row, RoPE per row.
+    pub fn make_kv_rows(&self, states: Tensor<3>, ropes: &[Rope]) -> Vec<(Tensor<4>, Tensor<4>)> {
         let kv = self.kv.forward(states);
+        ropes
+            .iter()
+            .enumerate()
+            .map(|(i, rope)| self.kv_from(kv.clone().narrow(0, i, 1), rope))
+            .collect()
+    }
+
+    /// Keys (with RoPE) and values `[B, KVH, T, D]` from the joint projection `kv`.
+    fn kv_from(&self, kv: Tensor<3>, rope: &Rope) -> (Tensor<4>, Tensor<4>) {
+        let [b, t, _] = kv.dims();
+        let (kvh, hd) = (self.kv_heads, self.head_dim);
         let k = kv.clone().narrow(2, 0, kvh * hd);
         let v = kv.narrow(2, kvh * hd, kvh * hd);
         let k = apply_rope(k.reshape([b, t, kvh, hd]).swap_dims(1, 2), rope);
         (k, v.reshape([b, t, kvh, hd]).swap_dims(1, 2))
+    }
+
+    /// [`Self::forward`] for batch rows that are separate streams: row i of `x` `[B, T, d]` at
+    /// the positions of `ropes[i]` against `kvs[i]`. The query and output projections run once
+    /// over every row, the attention per row.
+    pub fn forward_rows(
+        &self,
+        x: Tensor<3>,
+        ropes: &[Rope],
+        kvs: &[(Tensor<4>, Tensor<4>)],
+    ) -> Tensor<3> {
+        let [b, t, _] = x.dims();
+        let (h, hd) = (self.heads, self.head_dim);
+        let q = self.q.forward(x).reshape([b, t, h, hd]).swap_dims(1, 2);
+        let rows: Vec<Tensor<4>> = kvs
+            .iter()
+            .enumerate()
+            .map(|(i, (keys, values))| {
+                let qi = apply_rope(q.clone().narrow(0, i, 1), &ropes[i]);
+                attend(qi, keys.clone(), values.clone(), None)
+            })
+            .collect();
+        let out = Tensor::cat(rows, 0);
+        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * hd]))
     }
 
     pub fn forward(
@@ -810,6 +917,76 @@ impl Block {
         cache: Option<&mut LayerCache>,
         step: Option<&KvStep>,
     ) -> Tensor<3> {
+        self.project_out(self.mix_core(input, start, ropes, cache, step))
+    }
+
+    /// A retrieval layer's one-token step over slots whose caches are rows of one pool
+    /// ([`SparseRetrieval::make_slot_caches`]; any subset, idle rows skipped by the kernels) on
+    /// CUDA, eager or captured: all slots in one set of launches. None when that does not
+    /// apply.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn pooled_retrieval(
+        &self,
+        input: &MixInput,
+        ropes: &[&Ropes],
+        caches: &mut [&mut [LayerCache]],
+        layer: usize,
+    ) -> Option<MixOut> {
+        // Inside a captured slot step too: each slot's StackStep stages its position into its
+        // row of the pool's position buffer, which the batched kernels read.
+        #[cfg(feature = "cuda")]
+        if let (Mixer::Retrieval(ret), MixInput::Projected(p)) = (&self.attn, input)
+            && p.dims()[1] == 1
+            && crate::fused::active(&p.device())
+        {
+            let lats: Option<Vec<&crate::retrieval::LatentCache>> = caches
+                .iter()
+                .map(|c| match &c[layer] {
+                    LayerCache::Latent(l) => Some(l),
+                    _ => None,
+                })
+                .collect();
+            if !lats.is_some_and(|l| SparseRetrieval::rows_pooled(&l)) {
+                return None;
+            }
+            let mut lats: Vec<&mut crate::retrieval::LatentCache> =
+                caches.iter_mut().map(|c| c[layer].latent()).collect();
+            let tables: Vec<&Rope> = ropes
+                .iter()
+                .map(|r| r.retrieval.as_ref().expect("the stack built this table"))
+                .collect();
+            return Some(ret.decode_rows(p.clone(), &tables, &mut lats));
+        }
+        None
+    }
+
+    /// The mixer's input projections of the normed input `h` (all batch rows at once).
+    fn project_in(&self, h: Tensor<3>) -> MixInput {
+        match &self.attn {
+            Mixer::Attention(attn) => MixInput::Attention(attn.input(h)),
+            Mixer::DeltaNet(delta) => MixInput::Projected(delta.input_projection().forward(h)),
+            Mixer::Retrieval(ret) => MixInput::Projected(ret.input_projection().forward(h)),
+        }
+    }
+
+    /// The mixer's output projection.
+    fn project_out(&self, out: MixOut) -> Tensor<3> {
+        match &self.attn {
+            Mixer::Attention(attn) => attn.project_out(out),
+            Mixer::DeltaNet(delta) => delta.project_out(out),
+            Mixer::Retrieval(ret) => ret.project_out(out),
+        }
+    }
+
+    /// [`Self::mix`] up to the output projection.
+    fn mix_core(
+        &self,
+        input: MixInput,
+        start: usize,
+        ropes: &Ropes,
+        cache: Option<&mut LayerCache>,
+        step: Option<&KvStep>,
+    ) -> MixOut {
         fn table(rope: &Option<Rope>) -> &Rope {
             rope.as_ref().expect("the stack built this table")
         }
@@ -825,11 +1002,11 @@ impl Block {
                     #[cfg(feature = "cuda")]
                     Some(step) => {
                         let cache = cache.expect("a graphed step has caches").kv();
-                        attn.forward_step(input, rope, cache, step)
+                        attn.core_step(input, rope, cache, step)
                     }
                     #[cfg(not(feature = "cuda"))]
                     Some(step) => match *step {},
-                    None => attn.forward_in(input, rope, cache.map(LayerCache::kv)),
+                    None => attn.core_in(input, rope, cache.map(LayerCache::kv)),
                 }
             }
             Mixer::DeltaNet(delta) => {
@@ -838,7 +1015,7 @@ impl Block {
                     MixInput::Projected(p) => p,
                     MixInput::Attention(_) => unreachable!("a DeltaNet layer's projection"),
                 };
-                delta.forward_projected(p, cache.map(LayerCache::delta))
+                delta.core_projected(p, cache.map(LayerCache::delta))
             }
             Mixer::Retrieval(ret) => {
                 let p = match input {
@@ -847,7 +1024,7 @@ impl Block {
                     MixInput::Attention(_) => unreachable!("a retrieval layer's projection"),
                 };
                 let rope = table(&ropes.retrieval);
-                ret.forward_projected(p, start, rope, cache.map(LayerCache::latent))
+                ret.core_projected(p, start, rope, cache.map(LayerCache::latent))
             }
         }
     }
@@ -900,19 +1077,29 @@ impl Block {
         let (x, input) = match fused {
             Some(input) => (x, input),
             None => {
+                // The input projections once over every slot's row.
                 let (x, h) = norm_after(&self.n1, x, pending);
-                (x, MixInput::Normed(h))
+                (x, self.project_in(h))
             }
         };
-        let rows: Vec<Tensor<3>> = caches
-            .iter_mut()
-            .enumerate()
-            .map(|(i, c)| {
-                let step = steps.and_then(|s| s[i][layer].as_ref());
-                self.mix(input.row(i), starts[i], ropes[i], Some(&mut c[layer]), step)
-            })
-            .collect();
-        let mixed = Tensor::cat(rows, 0);
+        // Each slot's mixer core on its own caches (retrieval decode of pooled slots in one set
+        // of launches), then the output projection once over all rows: one weight read per
+        // layer instead of one per slot.
+        let core = match self.pooled_retrieval(&input, ropes, caches, layer) {
+            Some(core) => core,
+            None => {
+                let rows: Vec<MixOut> = caches
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let step = steps.and_then(|s| s[i][layer].as_ref());
+                        self.mix_core(input.row(i), starts[i], ropes[i], Some(&mut c[layer]), step)
+                    })
+                    .collect();
+                MixOut::cat(rows)
+            }
+        };
+        let mixed = self.project_out(core);
         if let Some(x) = self.mlp.residual_step(&self.n2, &x, Some(&mixed)) {
             return (x, None);
         }
@@ -1192,6 +1379,48 @@ impl Stack {
             (x, pending) = block.forward_slots(x, pending, starts, ropes, caches, i, steps);
         }
         norm_after(&self.norm, x, pending).1
+    }
+
+    /// `slots` cache sets (each for batch 1) for [`Self::forward_slots`]: as many
+    /// [`Self::make_caches`], except that on CUDA each retrieval layer's caches are rows of
+    /// shared buffers with one position buffer per stack, so a batched one-token step over all
+    /// slots in order decodes each retrieval layer in one set of launches.
+    pub fn make_slot_caches(
+        &self,
+        slots: usize,
+        max_positions: usize,
+        device: &Device,
+    ) -> Vec<Vec<LayerCache>> {
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(device) && slots > 1 {
+            let position = Tensor::<1, burn::tensor::Int>::zeros([slots], device)
+                .cast(burn::tensor::IntDType::I32);
+            let position_id = crate::retrieval::fresh_id();
+            let mut sets: Vec<Vec<LayerCache>> = (0..slots).map(|_| Vec::new()).collect();
+            for block in &self.blocks {
+                match &block.attn {
+                    Mixer::Retrieval(ret) => {
+                        let rows = ret.make_slot_caches(
+                            slots,
+                            max_positions,
+                            &position,
+                            position_id,
+                            device,
+                        );
+                        for (set, cache) in sets.iter_mut().zip(rows) {
+                            set.push(LayerCache::Latent(cache));
+                        }
+                    }
+                    _ => {
+                        for set in sets.iter_mut() {
+                            set.push(block.make_cache(max_positions, 1, device));
+                        }
+                    }
+                }
+            }
+            return sets;
+        }
+        (0..slots).map(|_| self.make_caches(max_positions, 1, device)).collect()
     }
 
     /// One cache per layer for runs of up to `max_positions`.

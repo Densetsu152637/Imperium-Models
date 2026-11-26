@@ -23,7 +23,7 @@ use burn::nn::{Linear as DenseLinear, RmsNorm};
 use burn::tensor::activation::{relu, sigmoid, softmax};
 use burn::tensor::{Bool, Device, Int, IntDType, Tensor, s};
 
-use crate::layers::{Rope, apply_rope, dense_linear, linear, rms_norm};
+use crate::layers::{MixOut, Rope, apply_rope, dense_linear, linear, rms_norm};
 use crate::quant::QLinear as Linear;
 
 /// Shape of a sparse retrieval layer.
@@ -117,6 +117,7 @@ impl ScoreKeys {
 /// A retrieval cache's indexer keys.
 // One per retrieval layer: the size gap between the variants is not worth boxing for.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub enum IndexKeys {
     /// At the run dtype, `[B, S, di]`.
     Float(Tensor<3>),
@@ -174,6 +175,18 @@ impl IndexKeys {
         }
     }
 
+    /// Batch row `i` of the keys (a view of the same buffers).
+    #[cfg(feature = "cuda")]
+    fn row(&self, i: usize) -> Self {
+        match self {
+            Self::Float(k) => Self::Float(k.clone().narrow(0, i, 1)),
+            Self::Int8 { codes, scales } => Self::Int8 {
+                codes: codes.clone().narrow(0, i, 1),
+                scales: scales.clone().narrow(0, i, 1),
+            },
+        }
+    }
+
     /// The first `n` positions' keys for scoring.
     fn view(&self, n: usize) -> ScoreKeys {
         match self {
@@ -184,6 +197,32 @@ impl IndexKeys {
             },
         }
     }
+}
+
+/// A fresh identifier for position buffers and slot pools.
+#[cfg(feature = "cuda")]
+pub(crate) fn fresh_id() -> u64 {
+    next_id()
+}
+
+#[cfg(feature = "cuda")]
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Slot caches of one retrieval layer allocated together: the shared buffers `[rows, S, *]`,
+/// the position buffer `[rows]` (one per slot, shared by a stack's retrieval layers) and this
+/// cache's row.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct PoolRow {
+    id: u64,
+    row: usize,
+    rows: usize,
+    kv: Tensor<3>,
+    keys: IndexKeys,
+    position: Tensor<1, Int>,
 }
 
 /// One retrieval layer's cache: `[latent | RoPE key]` and the indexer key per position. It
@@ -197,6 +236,11 @@ pub struct LatentCache {
     /// Identifies `position` (see [`LatentCache::share_position`]).
     #[cfg(feature = "cuda")]
     position_id: u64,
+    /// When this cache is one row of slot caches allocated together
+    /// ([`SparseRetrieval::make_slot_caches`]): the shared buffers and its row, so that a
+    /// batched step decodes every slot in one set of launches.
+    #[cfg(feature = "cuda")]
+    pooled: Option<PoolRow>,
     capacity: usize,
     length: usize,
     itemsize: usize,
@@ -220,10 +264,9 @@ impl LatentCache {
             #[cfg(feature = "cuda")]
             position: Tensor::<1, Int>::zeros([1], device).cast(burn::tensor::IntDType::I32),
             #[cfg(feature = "cuda")]
-            position_id: {
-                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            },
+            position_id: next_id(),
+            #[cfg(feature = "cuda")]
+            pooled: None,
             capacity,
             length: 0,
             itemsize,
@@ -238,16 +281,45 @@ impl LatentCache {
     /// Makes this cache a copy of `src` (same shape): latents, indexer keys and position, in
     /// this cache's own buffers on CUDA.
     pub fn copy_from(&mut self, src: &LatentCache) {
-        crate::cache::store(self.kv.as_mut().expect("cache"), src.kv.clone().expect("cache"));
+        use crate::cache::{store_int_prefix, store_prefix};
+        // Only the positions `src` holds (append-only storage: nothing past them is read).
+        let n = src.length.min(self.capacity);
+        store_prefix(self.kv.as_mut().expect("cache"), src.kv.clone().expect("cache"), 1, n);
         match (self.keys.as_mut().expect("cache"), src.keys.as_ref().expect("cache")) {
-            (IndexKeys::Float(k), IndexKeys::Float(s)) => crate::cache::store(k, s.clone()),
+            (IndexKeys::Float(k), IndexKeys::Float(s)) => store_prefix(k, s.clone(), 1, n),
             (IndexKeys::Int8 { codes, scales }, IndexKeys::Int8 { codes: c, scales: sc }) => {
-                crate::cache::store_int(codes, c.clone());
-                crate::cache::store(scales, sc.clone());
+                store_int_prefix(codes, c.clone(), 1, n);
+                store_prefix(scales, sc.clone(), 1, n);
             }
             _ => panic!("copies come from a cache of the same layout"),
         }
         self.length = src.length;
+        #[cfg(feature = "cuda")]
+        self.check_pooled();
+    }
+
+    /// Whether a pooled cache's latents, indexer keys and position are still views of the
+    /// pool's buffers (an in-place write keeps them; a replacing one would silently detach the
+    /// slot from batched decoding). True for a cache outside a pool.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn aliases_pool(&self) -> bool {
+        use crate::kernels::{buffer_id, int_buffer_id};
+        let Some(pool) = self.pooled.as_ref() else {
+            return true;
+        };
+        let keys = |k: &IndexKeys| match k {
+            IndexKeys::Float(t) => buffer_id(t),
+            IndexKeys::Int8 { codes, .. } => int_buffer_id(codes),
+        };
+        buffer_id(&pool.kv) == self.kv.as_ref().and_then(buffer_id)
+            && self.keys.as_ref().and_then(keys) == keys(&pool.keys)
+            && int_buffer_id(&self.position) == int_buffer_id(&pool.position)
+    }
+
+    /// Debug builds: panics when a pooled cache no longer aliases its pool.
+    #[cfg(feature = "cuda")]
+    fn check_pooled(&self) {
+        debug_assert!(self.aliases_pool(), "a pooled retrieval cache detached from its pool");
     }
 
     /// Positions the cache holds at most.
@@ -271,6 +343,9 @@ impl LatentCache {
     pub(crate) fn share_position(&mut self, other: &LatentCache) {
         self.position = other.position.clone();
         self.position_id = other.position_id;
+        if let (Some(mine), Some(theirs)) = (self.pooled.as_mut(), other.pooled.as_ref()) {
+            mine.position = theirs.position.clone();
+        }
     }
 
     /// Identifies the position buffer (shared by [`Self::share_position`]).
@@ -321,6 +396,7 @@ impl LatentCache {
             crate::inplace::write_float(self.kv.as_ref().expect("cache"), kv, 1, start);
             self.keys.as_ref().expect("cache").write_into(start, keys);
             self.length += t;
+            self.check_pooled();
             return;
         }
         let old_kv = self.kv.take().expect("cache");
@@ -411,6 +487,148 @@ impl SparseRetrieval {
         LatentCache::new(batch, width, self.index_dim, int8, max_positions, device)
     }
 
+    /// `rows` slot caches (each for batch 1) whose buffers are rows of shared ones, with the
+    /// next positions in `position` (`[rows]`, i32, row i for slot i; a stack's retrieval
+    /// layers share it). Each behaves as [`Self::make_cache`]'s; a batched step over all of
+    /// them in row order decodes in one set of launches ([`Self::decode_rows`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn make_slot_caches(
+        &self,
+        rows: usize,
+        max_positions: usize,
+        position: &Tensor<1, Int>,
+        position_id: u64,
+        device: &Device,
+    ) -> Vec<LatentCache> {
+        let pool = self.make_cache(max_positions, rows, device);
+        let (kv, keys) = (pool.kv.expect("cache"), pool.keys.expect("cache"));
+        let id = next_id();
+        (0..rows)
+            .map(|row| LatentCache {
+                kv: Some(kv.clone().narrow(0, row, 1)),
+                keys: Some(keys.row(row)),
+                position: position.clone().narrow(0, row, 1),
+                position_id,
+                pooled: Some(PoolRow {
+                    id,
+                    row,
+                    rows,
+                    kv: kv.clone(),
+                    keys: keys.clone(),
+                    position: position.clone(),
+                }),
+                capacity: max_positions,
+                length: 0,
+                itemsize: pool.itemsize,
+            })
+            .collect()
+    }
+
+    /// Whether `caches` are distinct rows of one slot pool, each still a view of the pool's
+    /// buffers with room for a position (so [`Self::decode_rows`] takes them): any subset of
+    /// the pool's slots, in any order.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rows_pooled(caches: &[&LatentCache]) -> bool {
+        let Some(Some(first)) = caches.first().map(|c| c.pooled.as_ref()) else {
+            return false;
+        };
+        let mut seen = vec![false; first.rows];
+        caches.iter().all(|c| {
+            let Some(p) = c.pooled.as_ref() else { return false };
+            let fresh = p.id == first.id && !std::mem::replace(&mut seen[p.row], true);
+            fresh && c.length < c.capacity && c.aliases_pool()
+        })
+    }
+
+    /// One-token fused decode of pooled slots at once: `p` `[n, 1, W]` (row i the input
+    /// projection of `caches[i]`), `ropes[i]` the tables of its position. The same kernels as
+    /// [`Self::decode_fused`] over the whole pool's buffers, one launch set: each active row at
+    /// its own position, the pool's idle rows marked with position -1 (the kernels skip them:
+    /// they neither read nor write). Eagerly every position is uploaded at once; inside a
+    /// captured slot step each active slot's [`crate::layers::StackStep`] stages its own and
+    /// the idle rows are filled with -1 by the graph.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn decode_rows(
+        &self,
+        p: Tensor<3>,
+        ropes: &[&Rope],
+        caches: &mut [&mut LatentCache],
+    ) -> MixOut {
+        let pool = caches[0].pooled.clone().expect("pooled caches");
+        let device = p.device();
+        let rows: Vec<usize> =
+            caches.iter().map(|c| c.pooled.as_ref().expect("pooled").row).collect();
+        let n = rows.len();
+        let whole = n == pool.rows && rows.iter().enumerate().all(|(i, &r)| i == r);
+        // Each pool row's slot index in `caches`, or None for an idle row.
+        let mut slot_of = vec![None; pool.rows];
+        for (i, &r) in rows.iter().enumerate() {
+            slot_of[r] = Some(i);
+        }
+        if !crate::fused::capturing() {
+            let mut pos = vec![-1i32; pool.rows];
+            for (cache, &r) in caches.iter().zip(&rows) {
+                pos[r] = cache.length as i32;
+            }
+            let pos = burn::tensor::TensorData::new(pos, [pool.rows]);
+            let pos = Tensor::<1, Int>::from_data(pos, &device).cast(IntDType::I32);
+            crate::kernels::assign_int_into(&pool.position, pos, 0, 0);
+        } else {
+            for (r, slot) in slot_of.iter().enumerate() {
+                if slot.is_none() {
+                    let idle = Tensor::<1, Int>::full([1], -1, &device).cast(IntDType::I32);
+                    crate::kernels::assign_int_into(&pool.position, idle, 0, r);
+                }
+            }
+        }
+        // The inputs and RoPE tables laid out by pool row (idle rows: zeros, any table).
+        let (p_all, tables) = if whole {
+            let (cos, sin): (Vec<Tensor<4>>, Vec<Tensor<4>>) =
+                ropes.iter().map(|r| r.tables()).unzip();
+            (p, (Tensor::cat(cos, 0), Tensor::cat(sin, 0)))
+        } else {
+            let [_, t, w] = p.dims();
+            let mut xs = Vec::with_capacity(pool.rows);
+            let (mut cos, mut sin) = (Vec::new(), Vec::new());
+            for slot in &slot_of {
+                let i = slot.unwrap_or(0);
+                xs.push(match slot {
+                    Some(i) => p.clone().narrow(0, *i, 1),
+                    None => Tensor::<3>::zeros([1, t, w], &device),
+                });
+                let (c, s) = ropes[i].tables();
+                cos.push(c);
+                sin.push(s);
+            }
+            (Tensor::cat(xs, 0), (Tensor::cat(cos, 0), Tensor::cat(sin, 0)))
+        };
+        let norms =
+            [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
+        let out = crate::kernels::retrieval_decode(
+            p_all,
+            norms,
+            tables,
+            self.uk.weight.val(),
+            self.uv.weight.val(),
+            &pool.kv,
+            &pool.keys,
+            &pool.position,
+            self.kernel_dims(),
+        );
+        // The active rows' outputs, in `caches` order (idle rows hold nothing).
+        let out = if whole {
+            out
+        } else {
+            Tensor::cat(rows.iter().map(|&r| out.clone().narrow(0, r, 1)).collect(), 0)
+        };
+        for cache in caches.iter_mut() {
+            cache.check_pooled();
+            cache.length += 1;
+        }
+        // The combine kernel has applied the gate.
+        MixOut { x: out, gate: None }
+    }
+
     fn scale(&self) -> f64 {
         1.0 / ((self.nope_dim + self.rope_dim) as f64).sqrt()
     }
@@ -438,7 +656,7 @@ impl SparseRetrieval {
     /// The fused one-token decode ([`crate::kernels::retrieval_decode`]): the same cache write,
     /// selection and attention as the reference, between the two projections.
     #[cfg(feature = "cuda")]
-    fn decode_fused(&self, p: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
+    fn decode_fused(&self, p: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> MixOut {
         let pos = cache.length;
         assert!(pos < cache.capacity, "cache capacity {} exceeded", cache.capacity);
         let dims = self.kernel_dims();
@@ -459,7 +677,8 @@ impl SparseRetrieval {
             dims,
         );
         cache.length += 1;
-        self.o.forward(out)
+        // The combine kernel has applied the gate.
+        MixOut { x: out, gate: None }
     }
 
     /// `x` `[B, T, d]` at absolute positions `start..start + T`; `rope` holds the tables of those
@@ -483,14 +702,30 @@ impl SparseRetrieval {
     }
 
     /// [`Self::forward`] from the input projection `p` `[B, T, W]`.
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     pub(crate) fn forward_projected(
         &self,
         p: Tensor<3>,
         start: usize,
         rope: &Rope,
-        mut cache: Option<&mut LatentCache>,
+        cache: Option<&mut LatentCache>,
     ) -> Tensor<3> {
+        self.project_out(self.core_projected(p, start, rope, cache))
+    }
+
+    /// The output projection of [`Self::core_projected`]'s result.
+    pub(crate) fn project_out(&self, out: MixOut) -> Tensor<3> {
+        out.project(&self.o)
+    }
+
+    /// [`Self::forward_projected`] up to the output projection.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    pub(crate) fn core_projected(
+        &self,
+        p: Tensor<3>,
+        start: usize,
+        rope: &Rope,
+        mut cache: Option<&mut LatentCache>,
+    ) -> MixOut {
         #[cfg(feature = "cuda")]
         if let Some(c) = cache.as_deref_mut()
             && p.dims()[1] == 1
@@ -538,7 +773,7 @@ impl SparseRetrieval {
                 #[cfg(feature = "cuda")]
                 if t > 1 && !self.dense && crate::fused::active(&q_nope.device()) {
                     let out = self.attend_prefill(q_nope, q_rope, &index, cache, start);
-                    return self.output(out, gate);
+                    return MixOut::heads(out, Some(sigmoid(gate)));
                 }
                 let (kv, keys) = cache.view();
                 if t == 1 && !self.dense {
@@ -549,13 +784,7 @@ impl SparseRetrieval {
                 }
             }
         };
-        self.output(out, gate)
-    }
-
-    /// The attention output `[B, H, T, dv]` gated by `gate` `[B, T, H dv]` and projected.
-    fn output(&self, out: Tensor<4>, gate: Tensor<3>) -> Tensor<3> {
-        let [b, h, t, dv] = out.dims();
-        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * dv]) * sigmoid(gate))
+        MixOut::heads(out, Some(sigmoid(gate)))
     }
 
     /// Sparse prefill of `T > 1` queries at positions `start..` whose entries are already in
