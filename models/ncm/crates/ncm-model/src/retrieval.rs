@@ -194,6 +194,9 @@ pub struct LatentCache {
     /// The next position on the device (`[1]`, i32), read by the fused decode kernels.
     #[cfg(feature = "cuda")]
     position: Tensor<1, Int>,
+    /// Identifies `position` (see [`LatentCache::share_position`]).
+    #[cfg(feature = "cuda")]
+    position_id: u64,
     capacity: usize,
     length: usize,
     itemsize: usize,
@@ -216,6 +219,11 @@ impl LatentCache {
             keys: Some(keys),
             #[cfg(feature = "cuda")]
             position: Tensor::<1, Int>::zeros([1], device).cast(burn::tensor::IntDType::I32),
+            #[cfg(feature = "cuda")]
+            position_id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             capacity,
             length: 0,
             itemsize,
@@ -239,6 +247,21 @@ impl LatentCache {
         let pos = burn::tensor::TensorData::new(vec![self.length as i32], [1]);
         let pos = Tensor::<1, Int>::from_data(pos, &device).cast(burn::tensor::IntDType::I32);
         crate::kernels::assign_int_into(&self.position, pos, 0, 0);
+    }
+
+    /// Makes this cache read and write the position buffer of `other` (a cache of the same
+    /// stack, always at the same position): a captured graph then stages one position for all
+    /// of a stack's retrieval layers.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn share_position(&mut self, other: &LatentCache) {
+        self.position = other.position.clone();
+        self.position_id = other.position_id;
+    }
+
+    /// Identifies the position buffer (shared by [`Self::share_position`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn position_id(&self) -> u64 {
+        self.position_id
     }
 
     /// The device buffer of the next position (`[1]`, i32) the fused kernels read; a captured

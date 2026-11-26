@@ -168,6 +168,34 @@ pub fn fused_projections_match(device: &Device, tol: f32) {
     }
 }
 
+/// The fused RoPE kernel ([`ncm_model::rope_fused::rope`], plain and after QK-norm) against
+/// `layers::apply_rope` of the (normed) heads on the CUDA reference path and on the CPU in f32:
+/// strided (swapped) inputs, head widths 64, 128 and 16, a few positions.
+pub fn fused_rope_matches(device: &Device, tol: f32) {
+    use ncm_model::layers::{apply_rope, rms_norm};
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (b, h, t, d) in [(1, 8, 1, 64), (2, 4, 3, 128), (1, 2, 5, 16)] {
+        device.seed(8);
+        let x = Tensor::<4>::random([b, t, h, d], normal, device);
+        let swapped = x.clone().swap_dims(1, 2);
+        let rope = Rope::new(37, t, d, 10_000.0, 1.0, device);
+        let cpu_rope = Rope::new(37, t, d, 10_000.0, 1.0, &cpu());
+        let norm = rms_norm(d, 1e-6, device);
+        let cpu_norm = cpu_copy(&norm);
+        let got = ncm_model::rope_fused::rope(swapped.clone(), &rope, None).expect("these widths");
+        let cuda_ref = reference(|| apply_rope(swapped.clone(), &rope));
+        let want = apply_rope(to_cpu(&swapped), &cpu_rope);
+        let what = format!("rope {b}x{h}x{t}x{d}");
+        assert_close(&what, &values(got), &values(cuda_ref), &values(want), tol);
+        let gamma = Some((norm.gamma.val(), 1e-6));
+        let got = ncm_model::rope_fused::rope(swapped.clone(), &rope, gamma).expect("these widths");
+        let cuda_ref = reference(|| apply_rope(norm.forward(x.clone()).swap_dims(1, 2), &rope));
+        let want = apply_rope(cpu_norm.forward(to_cpu(&x)).swap_dims(1, 2), &cpu_rope);
+        let what = format!("qk-norm rope {b}x{h}x{t}x{d}");
+        assert_close(&what, &values(got), &values(cuda_ref), &values(want), tol);
+    }
+}
+
 /// The fused RMSNorm kernels (plain, and after a residual add) against Burn's `RmsNorm` on the
 /// CPU in f32 with the same weights and inputs: the models' widths at one and four rows,
 /// QK-norm's per-head rows, and a strided (narrowed) input. Also against the CUDA reference

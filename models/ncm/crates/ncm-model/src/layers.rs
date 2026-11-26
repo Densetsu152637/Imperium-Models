@@ -269,8 +269,29 @@ pub(crate) fn norm_after(
     }
 }
 
-/// Rotate `x` `[B, H, T, D]` by the position tables.
+/// QK-norm then RoPE: `x` `[B, T, H, D]` normed per head row by `norm`, moved to
+/// `[B, H, T, D]` and rotated; one launch on CUDA with the fused kernels on.
+fn norm_rope(norm: &RmsNorm, x: Tensor<4>, rope: &Rope) -> Tensor<4> {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&x.device()) {
+        let swapped = x.clone().swap_dims(1, 2);
+        let gamma = (norm.gamma.val(), norm.epsilon);
+        if let Some(y) = crate::rope_fused::rope(swapped, rope, Some(gamma)) {
+            return y;
+        }
+    }
+    apply_rope(crate::fused::rms_norm(norm, x).swap_dims(1, 2), rope)
+}
+
+/// Rotate `x` `[B, H, T, D]` by the position tables: one launch on CUDA with the fused
+/// kernels on ([`crate::rope_fused::rope`]), the reference ops otherwise.
 pub fn apply_rope(x: Tensor<4>, rope: &Rope) -> Tensor<4> {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&x.device())
+        && let Some(y) = crate::rope_fused::rope(x.clone(), rope, None)
+    {
+        return y;
+    }
     x.clone().matmul(rope.rot.clone()) * rope.sin.clone() + x * rope.cos.clone()
 }
 
@@ -530,8 +551,7 @@ impl Attention {
             (Some(q_norm), Some(k_norm)) => {
                 let q = qkv.clone().narrow(2, 0, h * hd).reshape([b, t, h, hd]);
                 let k = qkv.clone().narrow(2, h * hd, kvh * hd).reshape([b, t, kvh, hd]);
-                let q = apply_rope(crate::fused::rms_norm(q_norm, q).swap_dims(1, 2), rope);
-                (q, apply_rope(crate::fused::rms_norm(k_norm, k).swap_dims(1, 2), rope))
+                (norm_rope(q_norm, q, rope), norm_rope(k_norm, k, rope))
             }
             _ => {
                 // Queries and keys share positions, so one RoPE pass covers both.
@@ -1079,7 +1099,32 @@ impl Stack {
         batch: usize,
         device: &Device,
     ) -> Vec<LayerCache> {
-        self.blocks.iter().map(|b| b.make_cache(max_positions, batch, device)).collect()
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        let mut caches: Vec<LayerCache> =
+            self.blocks.iter().map(|b| b.make_cache(max_positions, batch, device)).collect();
+        // The retrieval layers are always at one position: one shared position buffer, which a
+        // captured step stages once.
+        #[cfg(feature = "cuda")]
+        {
+            let mut first: Option<usize> = None;
+            for i in 0..caches.len() {
+                if !matches!(caches[i], LayerCache::Latent(_)) {
+                    continue;
+                }
+                match first {
+                    None => first = Some(i),
+                    Some(f) => {
+                        let (head, tail) = caches.split_at_mut(i);
+                        if let (LayerCache::Latent(owner), LayerCache::Latent(c)) =
+                            (&head[f], &mut tail[0])
+                        {
+                            c.share_position(owner);
+                        }
+                    }
+                }
+            }
+        }
+        caches
     }
 }
 
@@ -1124,6 +1169,7 @@ impl StackStep {
     ) -> Result<Self, String> {
         let device = stack.norm.gamma.device();
         let (mut cursors, mut positions) = (Vec::new(), Vec::new());
+        let mut staged_ids: Vec<(u64, usize)> = Vec::new();
         for cache in caches {
             cursors.push(match cache {
                 LayerCache::Kv(kv) => Some(set.add(kv, t, staging)?),
@@ -1133,7 +1179,17 @@ impl StackStep {
                 LayerCache::Latent(_) if t > 1 => {
                     return Err(format!("retrieval layers step one token at a time, not {t}"));
                 }
-                LayerCache::Latent(c) => Some(staging.add_ints(c.position().clone())),
+                LayerCache::Latent(c) => {
+                    Some(match staged_ids.iter().find(|(id, _)| *id == c.position_id()) {
+                        // A position buffer shared with an earlier layer is staged once.
+                        Some(&(_, at)) => at,
+                        None => {
+                            let at = staging.add_ints(c.position().clone());
+                            staged_ids.push((c.position_id(), at));
+                            at
+                        }
+                    })
+                }
                 _ => None,
             });
         }

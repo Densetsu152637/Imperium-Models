@@ -169,3 +169,9 @@ fn fused_projections_match_unfused_bf16() {
     let (device, _lock) = setup(DTYPE);
     fused_projections_match(&device, TOL);
 }
+
+#[test]
+fn fused_rope_matches_reference_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    fused_rope_matches(&device, TOL);
+}
