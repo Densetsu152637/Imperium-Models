@@ -858,3 +858,121 @@ fn one_b_configs_have_their_parameter_counts() {
     assert_near("ncm-1b", ncm, 1_041_473_672.0, 0.01);
     assert!((ncm as f64 / tok as f64 - 1.0).abs() <= 0.02, "ncm {ncm} vs tok {tok}");
 }
+
+// ----------------------------------------------------------------------------- batched slots
+
+/// Decodes `blocks` blocks of every session in lockstep, as the server's batcher does: one
+/// batched block pass over the sessions due one, then one batched fill pass over those filling.
+fn lockstep(
+    model: &HybridLm,
+    sessions: &mut [FastSession],
+    opts: &DecodeOptions,
+    blocks: usize,
+) -> Vec<Vec<i32>> {
+    use ncm_model::hybrid::{BlockPhase, PassGraphs, ar_pass_slots, block_pass_slots};
+    let l = model.config().block;
+    let mut graphs = PassGraphs::default();
+    let mut out = vec![Vec::new(); sessions.len()];
+    for _ in 0..blocks {
+        let mut runs: Vec<_> = sessions.iter_mut().map(|s| s.begin_block(model, l, opts)).collect();
+        loop {
+            let pass: Vec<usize> =
+                (0..runs.len()).filter(|&i| runs[i].phase() == BlockPhase::Pass).collect();
+            if !pass.is_empty() {
+                let mut prepared = Vec::new();
+                for &i in &pass {
+                    prepared.push(sessions[i].prepare_pass(model, &runs[i], opts));
+                }
+                // One mode per test run (the options are shared), so one batch.
+                let mode = prepared[0].0;
+                let settings: Vec<_> = prepared.into_iter().map(|p| p.1).collect();
+                let refs: Vec<&FastSession> = pass.iter().map(|&i| &sessions[i]).collect();
+                let results = block_pass_slots(model, &refs, &pass, mode, &settings, &mut graphs);
+                for (&i, r) in pass.iter().zip(results) {
+                    sessions[i].apply_pass(model, &mut runs[i], r, opts, &mut Hooks::default());
+                }
+            }
+            let fill: Vec<usize> =
+                (0..runs.len()).filter(|&i| runs[i].phase() == BlockPhase::Fill).collect();
+            if !fill.is_empty() {
+                let settings: Vec<_> =
+                    fill.iter().map(|&i| sessions[i].prepare_fill(model, &runs[i], opts)).collect();
+                let refs: Vec<&FastSession> = fill.iter().map(|&i| &sessions[i]).collect();
+                let (ids, _) = ar_pass_slots(model, &refs, &fill, false, &settings, &mut graphs);
+                for (&i, row) in fill.iter().zip(ids) {
+                    let p = runs[i].next_position();
+                    let mut no_row = || -> Vec<f32> { unreachable!("a greedy fill reads no row") };
+                    sessions[i].apply_fill(
+                        &mut runs[i],
+                        row[p],
+                        &mut no_row,
+                        opts,
+                        &mut Hooks::default(),
+                    );
+                }
+            }
+            if runs.iter().all(|r| r.phase() == BlockPhase::Done) {
+                break;
+            }
+        }
+        for (i, run) in runs.into_iter().enumerate() {
+            let block = sessions[i].end_block(model, run);
+            out[i].extend_from_slice(&block.tokens);
+        }
+    }
+    out
+}
+
+/// Slots decoded together (batched block and fill passes) decode what each decodes alone, at
+/// temperature 0, verified and parallel, from prompts of different lengths and offsets.
+#[test]
+fn batched_slots_decode_what_single_sessions_do() {
+    let (model, cfg, h, device) = tiny_model(60);
+    let l = h.block;
+    let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 10 * l, 61));
+    let prompts = [&stream[..l + 3], &stream[l..3 * l], &stream[2 * l + 5..4 * l + 1]];
+    for opts in [greedy(true), DecodeOptions { tau: Some(0.0), ..DecodeOptions::default() }] {
+        let mut want = Vec::new();
+        for p in prompts {
+            let mut s = FastSession::new(&model, 10 * l, &device);
+            s.prefill(&model, p);
+            let mut tokens = Vec::new();
+            for _ in 0..2 {
+                tokens.extend(s.decode_block(&model, l, &opts, &mut Hooks::default()).tokens);
+            }
+            want.push(tokens);
+        }
+        let mut sessions: Vec<FastSession> = prompts
+            .iter()
+            .map(|p| {
+                let mut s = FastSession::new(&model, 10 * l, &device);
+                s.prefill(&model, p);
+                s
+            })
+            .collect();
+        let got = lockstep(&model, &mut sessions, &opts, 2);
+        assert_eq!(got, want, "{opts:?}");
+    }
+}
+
+/// Batched prefill of equal-length chunks leaves each session as prefilling it alone does.
+#[test]
+fn batched_hybrid_prefill_matches_single() {
+    let (model, cfg, h, device) = tiny_model(62);
+    let l = h.block;
+    let a = host_ints(tokens(&device, cfg.vocab_size, 1, 3 * l + 2, 63));
+    let b = host_ints(tokens(&device, cfg.vocab_size, 1, 3 * l + 2, 64));
+    let mut one = HybridSession::new(&model, 8 * l, &device);
+    one.prefill(&model, &a);
+    let mut sa = HybridSession::new(&model, 8 * l, &device);
+    let mut sb = HybridSession::new(&model, 8 * l, &device);
+    let mut ids = a.clone();
+    ids.extend_from_slice(&b);
+    let t = Tensor::<2, Int>::from_data(TensorData::new(ids, [2, 3 * l + 2]), &device);
+    HybridSession::prefill_slots(&model, &mut [&mut sa, &mut sb], t);
+    assert_eq!(sa.tokens(), one.tokens());
+    assert_eq!(sa.blocks(), one.blocks());
+    assert_close(&values(sa.condition()), &values(one.condition()), 1e-4, 1e-3);
+    let open = a[3 * l..].to_vec();
+    assert_close(&sa.ar_logprobs(&model, &open), &one.ar_logprobs(&model, &open), 1e-4, 1e-3);
+}

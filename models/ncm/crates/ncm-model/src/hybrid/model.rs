@@ -92,8 +92,8 @@ pub struct FastMemory<'a> {
     pub seq_bias: &'a Tensor<2>,
     pub extra: &'a [(Tensor<4>, Tensor<4>)],
     pub extra_bias: &'a Tensor<2>,
-    /// The queries' tables (one row per query).
-    pub q_rope: &'a Rope,
+    /// The queries' tables (one row per query, per batch row when slots are batched).
+    pub q_rope: &'a super::memory::RopeTables,
 }
 
 impl MemBlock {
@@ -671,7 +671,8 @@ impl HybridLm {
     /// The backbone slots `[1, S, d]` of a condition `[1, 1, bb]`.
     pub fn slot_vectors(&self, cond: Tensor<3>) -> Tensor<3> {
         let (s, d) = (self.h.slots, self.local_dim);
-        self.slots.forward(cond).reshape([1, s, d])
+        let b = cond.dims()[0];
+        self.slots.forward(cond).reshape([b, s, d])
     }
 
     /// Retrieved-token entries `[1, Rt, d]` of their ids `[1, Rt]` (block-major, L per block).
@@ -741,9 +742,9 @@ impl HybridLm {
     /// Token-decoder inputs `[1, L, d]` of block tokens `[1, L]` (position i reads token
     /// i - 1), plus the projected reconstruction `[1, L, C]` when given.
     pub fn decoder_input_fast(&self, tokens: Tensor<2, Int>, zhat: Option<Tensor<3>>) -> Tensor<3> {
-        let [_, l] = tokens.dims();
+        let [b, l] = tokens.dims();
         let d = self.local_dim;
-        let start = self.dec_start.val().reshape([1, 1, d]);
+        let start = self.dec_start.val().reshape([1, 1, d]).expand([b, 1, d]);
         let x = Tensor::cat(vec![start, self.emb.forward(tokens.narrow(1, 0, l - 1))], 1);
         match zhat {
             Some(z) => x + self.z_in.forward(z),

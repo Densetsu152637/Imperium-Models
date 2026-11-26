@@ -26,8 +26,11 @@ pub mod train;
 pub mod vq;
 
 pub use decode::{BlockOut, BlockStats, DecodeOptions, Hooks, HybridSession, HybridSnapshot};
-pub use fast::{FastSession, PassMode, PassResult};
-pub use memory::Memory;
+pub use fast::{
+    BlockPhase, BlockRun, DrawSettings, FastSession, PassGraphs, PassMode, PassResult,
+    ar_pass_slots, block_pass_slots,
+};
+pub use memory::{Memory, RopeTables};
 pub use model::{HybridLm, HybridLoss, HybridParts, TrainOut, TrainPlan, TrainTargets};
 pub use vq::{BlockTokenizer, Ema, Quantised, TokenizerOut, sample_keep, tokenizer_loss};
 

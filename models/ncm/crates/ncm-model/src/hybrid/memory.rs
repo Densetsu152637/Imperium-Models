@@ -22,6 +22,61 @@ use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 use crate::layers::{Rope, apply_rope, linear};
 use crate::quant::QLinear as Linear;
 
+/// RoPE tables with a row per position and optionally per batch row `[B or 1, 1, T, D]`
+/// (`cos`, `sin` repeated over both halves): the fast path's queries and per-block entries,
+/// whose positions differ per slot when slots are batched. Applied with plain tensor ops,
+/// broadcasting over heads (and over the batch when B is 1).
+#[derive(Clone, Debug)]
+pub struct RopeTables {
+    pub cos: Tensor<4>,
+    pub sin: Tensor<4>,
+}
+
+impl RopeTables {
+    /// Plain RoPE (no scaling) tables for `positions`, one row each `[1, 1, T, D]`.
+    pub fn at(positions: &[usize], head_dim: usize, base: f64, device: &Device) -> Self {
+        let n = positions.len();
+        let (mut cos, mut sin) = (vec![0f32; n * head_dim], vec![0f32; n * head_dim]);
+        let rows = cos.chunks_mut(head_dim).zip(sin.chunks_mut(head_dim));
+        for (&pos, (c, s)) in positions.iter().zip(rows) {
+            crate::layers::rope_values(pos, head_dim, base, 1.0, crate::layers::Yarn::OFF, c, s);
+        }
+        let shape = [1, 1, n, head_dim];
+        Self {
+            cos: Tensor::from_data(TensorData::new(cos, shape), device),
+            sin: Tensor::from_data(TensorData::new(sin, shape), device),
+        }
+    }
+
+    /// Rows `start..start + len`.
+    pub fn rows(&self, start: usize, len: usize) -> Self {
+        Self {
+            cos: self.cos.clone().narrow(2, start, len),
+            sin: self.sin.clone().narrow(2, start, len),
+        }
+    }
+
+    /// The tables of several slots stacked along the batch `[B, 1, T, D]`.
+    pub fn stack(tables: &[&RopeTables]) -> Self {
+        if tables.len() == 1 {
+            return tables[0].clone();
+        }
+        Self {
+            cos: Tensor::cat(tables.iter().map(|t| t.cos.clone()).collect(), 0),
+            sin: Tensor::cat(tables.iter().map(|t| t.sin.clone()).collect(), 0),
+        }
+    }
+
+    /// `x` `[B, H, T, D]` rotated: `x cos + [-x2, x1] sin`.
+    pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        let d = x.dims()[3];
+        let h = d / 2;
+        let rot =
+            Tensor::cat(vec![x.clone().narrow(3, h, d - h).neg(), x.clone().narrow(3, 0, h)], 3);
+        x * self.cos.clone() + rot * self.sin.clone()
+    }
+}
+
 /// The layer-independent memory of `nb` blocks (see the module docs).
 #[derive(Clone, Debug)]
 pub struct Memory {
@@ -197,6 +252,17 @@ impl MemoryAttention {
         self.head_dim
     }
 
+    /// [`Self::project_rows`] with per-row (and per-batch-row) tables.
+    pub fn project_rows_tables(&self, x: Tensor<3>, rope: &RopeTables) -> (Tensor<4>, Tensor<4>) {
+        let hd = self.head_dim;
+        let [b, t, _] = x.dims();
+        let kv = self.kv.forward(x);
+        let k = kv.clone().narrow(2, 0, self.kv_heads * hd);
+        let v = kv.narrow(2, self.kv_heads * hd, self.kv_heads * hd);
+        let k = rope.apply(k.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2));
+        (k, v.reshape([b, t, self.kv_heads, hd]).swap_dims(1, 2))
+    }
+
     pub fn kv_heads(&self) -> usize {
         self.kv_heads
     }
@@ -209,7 +275,7 @@ impl MemoryAttention {
     pub fn forward_biased(
         &self,
         x: Tensor<3>,
-        q_rope: &Rope,
+        q_rope: &RopeTables,
         seq: Option<(&Tensor<4>, &Tensor<4>, &Tensor<2>)>,
         extra: (&Tensor<4>, &Tensor<4>, &Tensor<2>),
     ) -> Tensor<3> {
@@ -220,18 +286,18 @@ impl MemoryAttention {
             let [b, kvh, n, d] = t.dims();
             t.clone().unsqueeze_dim::<5>(2).expand([b, kvh, groups, n, d]).reshape([b, h, n, d])
         };
-        let q = apply_rope(self.q.forward(x).reshape([b, nq, h, hd]).swap_dims(1, 2), q_rope);
+        let q = q_rope.apply(self.q.forward(x).reshape([b, nq, h, hd]).swap_dims(1, 2));
         let scale = 1.0 / (hd as f64).sqrt();
         let (ek, ev, ebias) = extra;
-        let e = ebias.dims()[1];
+        let [eb, e] = ebias.dims();
         let s_extra = q.clone().matmul(expand(ek).swap_dims(2, 3)) * scale
-            + ebias.clone().reshape([1, 1, 1, e]);
+            + ebias.clone().reshape([eb, 1, 1, e]);
         let out = match seq {
             None => softmax(s_extra, 3).matmul(expand(ev)),
             Some((sk, sv, sbias)) => {
-                let n = sbias.dims()[1];
+                let [sb, n] = sbias.dims();
                 let s_seq = q.matmul(expand(sk).swap_dims(2, 3)) * scale
-                    + sbias.clone().reshape([1, 1, 1, n]);
+                    + sbias.clone().reshape([sb, 1, 1, n]);
                 let p = softmax(Tensor::cat(vec![s_seq, s_extra], 3), 3);
                 p.clone().narrow(3, 0, n).matmul(expand(sv)) + p.narrow(3, n, e).matmul(expand(ev))
             }
@@ -450,18 +516,18 @@ impl CopyHead {
         let mut scores = Vec::new();
         let mut ids = Vec::new();
         if let Some((keys, next, bias)) = seq {
-            let n = bias.dims()[1];
+            let [bb, n] = bias.dims();
             scores.push(
                 cq.clone().matmul(keys.clone().swap_dims(1, 2)) * scale
-                    + bias.clone().reshape([1, 1, n]),
+                    + bias.clone().reshape([bb, 1, n]),
             );
             ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
         }
         if let Some((entries, next, bias)) = retrieved {
-            let n = bias.dims()[1];
+            let [bb, n] = bias.dims();
             let keys = self.k.forward(entries);
             scores.push(
-                cq.clone().matmul(keys.swap_dims(1, 2)) * scale + bias.clone().reshape([1, 1, n]),
+                cq.clone().matmul(keys.swap_dims(1, 2)) * scale + bias.clone().reshape([bb, 1, n]),
             );
             ids.push(next.clone().reshape([b, 1, n]).expand([b, nq, n]));
         }

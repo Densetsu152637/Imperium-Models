@@ -259,6 +259,58 @@ impl HybridSession {
         self.verified_span = false;
     }
 
+    /// This session made a copy of `src` (a session of the same model and size: a request
+    /// forked from another slot's prefill), in its own caches' buffers on CUDA.
+    pub fn copy_from(&mut self, src: &HybridSession) {
+        self.tokens = src.tokens.clone();
+        for (c, s) in self.encoder.iter_mut().zip(&src.encoder) {
+            c.copy_from(s);
+        }
+        for (c, s) in self.backbone.iter_mut().zip(&src.backbone) {
+            c.copy_from(s);
+        }
+        self.states = src.states.clone();
+        self.states_start = src.states_start;
+        self.encoded = src.encoded;
+        self.pooled = src.pooled.clone();
+        self.cond = src.cond.clone();
+        self.blocks = src.blocks;
+        self.verified_span = false;
+    }
+
+    /// Appends `tokens` `[B, len]` (row i to `sessions[i]`, all of them encoded up to their
+    /// ends) with one batched encoder pass over the rows ([`crate::layers::Stack::forward_slots`]),
+    /// then steps each session's backbone over the blocks its row completes.
+    pub fn prefill_slots(
+        model: &HybridLm,
+        sessions: &mut [&mut HybridSession],
+        tokens: Tensor<2, Int>,
+    ) {
+        let [b, len] = tokens.dims();
+        assert_eq!(b, sessions.len(), "one row per session");
+        let host: Vec<i32> =
+            tokens.clone().into_data().convert::<i32>().try_to_vec::<i32>().expect("ints");
+        for (s, row) in sessions.iter_mut().zip(host.chunks(len)) {
+            assert_eq!(s.encoded, s.tokens.len(), "sessions encoded up to their ends");
+            s.tokens.extend_from_slice(row);
+        }
+        let x = model.embed(tokens);
+        let states = {
+            let mut caches: Vec<&mut [LayerCache]> =
+                sessions.iter_mut().map(|s| s.encoder.as_mut_slice()).collect();
+            model.encoder().forward_slots(x, &mut caches)
+        };
+        for (i, s) in sessions.iter_mut().enumerate() {
+            let row = states.clone().narrow(0, i, 1);
+            s.states = Some(match s.states.take() {
+                Some(old) => Tensor::cat(vec![old, row], 1),
+                None => row,
+            });
+            s.encoded += len;
+            s.step_complete_blocks(model);
+        }
+    }
+
     /// Back to an empty stream, in the caches' own buffers on CUDA (a server reuses one
     /// session, and the graphs captured against it, across requests).
     pub fn reset(&mut self, model: &HybridLm) {
@@ -870,11 +922,6 @@ fn sample(
     }
     let p = distribution(scores, t, top_p, top_k);
     draw(&p, 1.0, uniform())
-}
-
-/// [`argmax`] for the fast path.
-pub(crate) fn argmax_row(row: &[f32]) -> usize {
-    argmax(row)
 }
 
 /// [`sample`] for the fast path.
