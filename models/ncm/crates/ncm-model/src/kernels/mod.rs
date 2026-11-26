@@ -543,7 +543,6 @@ impl NcmKernels for CubeBackend {
         let client = q.client.clone();
         let plane = client.properties().hardware.plane_size_max as usize;
         assert_eq!(plane, retrieval::PREFILL_LANES, "the prefill kernel takes 32-lane planes");
-        let tile = retrieval::prefill_tile(q.dtype.size());
         unsafe {
             retrieval::ret_prefill_attend_kernel::launch_unchecked(
                 &client,
@@ -562,7 +561,7 @@ impl NcmKernels for CubeBackend {
                 dims.rope_dim,
                 dims.block,
                 dims.local,
-                tile,
+                retrieval::PREFILL_TILE,
                 dtype,
             );
         }

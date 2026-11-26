@@ -90,6 +90,9 @@ impl DecoderBlock {
     }
 }
 
+/// Most tokens the encoder takes in one call during prefill (see [`NcmLm::append_tokens`]).
+pub const ENCODER_CHUNK: usize = 1024;
+
 /// All caches of one NCM generation run.
 pub struct NcmCache {
     pub backbone: Vec<LayerCache>,
@@ -400,7 +403,7 @@ impl NcmLm {
         let [b, t] = tokens.dims();
         assert!(t % k == 0, "token count must be a multiple of k={k}");
         let device = tokens.device();
-        let states = self.encoder.forward(self.emb.forward(tokens), Some(&mut cache.encoder));
+        let states = self.encode(tokens, cache);
         let rope_k = self.rope(cache.tokens, t, &device);
         for (blk, kv_cache) in self.dec_blocks.iter().zip(cache.cross.iter_mut()) {
             let (keys, values) = blk.cross.make_kv(states.clone(), &rope_k);
@@ -413,6 +416,25 @@ impl NcmLm {
         let h = self.backbone.forward(concepts, Some(&mut cache.backbone));
         cache.tokens += t;
         self.cond_proj.forward(h.narrow(1, t / k - 1, 1))
+    }
+
+    /// The encoder states `[B, T, d]` of `tokens` `[B, T]`, continuing from its cache. Long runs
+    /// go through in pieces of [`ENCODER_CHUNK`] tokens: the sliding-window layers attend over
+    /// their window plus the whole piece, so one long piece would cost quadratically in it.
+    fn encode(&self, tokens: Tensor<2, Int>, cache: &mut NcmCache) -> Tensor<3> {
+        let t = tokens.dims()[1];
+        let x = self.emb.forward(tokens);
+        if t <= ENCODER_CHUNK {
+            return self.encoder.forward(x, Some(&mut cache.encoder));
+        }
+        let pieces = (0..t)
+            .step_by(ENCODER_CHUNK)
+            .map(|start| {
+                let len = ENCODER_CHUNK.min(t - start);
+                self.encoder.forward(x.clone().narrow(1, start, len), Some(&mut cache.encoder))
+            })
+            .collect();
+        Tensor::cat(pieces, 1)
     }
 
     /// Feed a prompt (length a multiple of k) in chunks; returns the next-concept condition.

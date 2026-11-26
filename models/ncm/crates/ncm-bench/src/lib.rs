@@ -34,7 +34,7 @@ pub const PASS_RATIO: f64 = 1.5;
 pub const WEAK_RATIO: f64 = 1.2;
 /// The v2 NCM may be at most 25% slower than the fallback NCM (plan, local test plan step 2).
 pub const FALLBACK_FLOOR: f64 = 0.75;
-/// Prompt tokens per prefill call (`--prefill-chunk`).
+/// Prompt tokens per prefill call of the model being measured (`--prefill-chunk`).
 static PREFILL_CHUNK: AtomicUsize = AtomicUsize::new(512);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -158,9 +158,13 @@ pub struct Cli {
     /// Keep the tied output head dense when quantising.
     #[arg(long)]
     pub dense_head: bool,
-    /// Prompt tokens per prefill call.
-    #[arg(long, default_value_t = 512)]
-    pub prefill_chunk: usize,
+    /// Prompt tokens per prefill call [default: 8192 for v2, whose layers prefill sparsely,
+    /// 512 for the fallback design, whose full-attention layers build `[chunk, context]` scores].
+    #[arg(long)]
+    pub prefill_chunk: Option<usize>,
+    /// Cache the v2 indexer keys at the run dtype instead of 8-bit codes.
+    #[arg(long)]
+    pub float_index_keys: bool,
 }
 
 impl Cli {
@@ -583,7 +587,6 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         return Err(format!("--assume-accept {rate} is not between 0 and 1"));
     }
     set_fused_attention(cli.fused_attention);
-    PREFILL_CHUNK.store(cli.prefill_chunk.max(1), Ordering::Relaxed);
     set_fused_kernels(!cli.reference_kernels);
     set_cuda_graphs(!cli.no_cuda_graphs);
     let spec = cli.quant_spec()?;
@@ -600,7 +603,18 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     let mut rates: Vec<(&str, Design, Rates)> = Vec::new();
     for design in cli.design.designs() {
         for kind in &kinds {
-            let cfg = config_for(kind, design, cli.tiny);
+            let chunk = match design {
+                Design::V2 => 8192,
+                Design::Fallback => 512,
+            };
+            PREFILL_CHUNK.store(cli.prefill_chunk.unwrap_or(chunk).max(1), Ordering::Relaxed);
+            let mut cfg = config_for(kind, design, cli.tiny);
+            if cli.float_index_keys {
+                match &mut cfg {
+                    Config::Tok(c) => c.v2.idx_8bit = false,
+                    Config::Ncm(c) => c.v2.idx_8bit = false,
+                }
+            }
             let (result, decode) = bench_model(&cfg, cli, &device, itemsize, spec);
             results.push(result);
             rates.push((kind, design, decode));

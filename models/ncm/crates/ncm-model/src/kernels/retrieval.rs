@@ -606,11 +606,8 @@ pub(crate) const PREFILL_LANES: usize = 32;
 /// Planes per cube of [`ret_prefill_attend_kernel`].
 pub(crate) const PREFILL_PLANES: usize = CUBE / PREFILL_LANES;
 
-/// Positions per tile of [`ret_prefill_attend_kernel`] for a run dtype of `itemsize` bytes: as
-/// many as keep the staged rows and the query within 48 KiB of shared memory, at most a plane.
-pub(crate) fn prefill_tile(itemsize: usize) -> usize {
-    if itemsize <= 2 { PREFILL_LANES } else { PREFILL_PLANES }
-}
+/// Positions per tile of [`ret_prefill_attend_kernel`]: one plane.
+pub(crate) const PREFILL_TILE: usize = PREFILL_LANES;
 
 /// Prefill selection for a group of `q` queries (chunk rows `t0 ..`, absolute positions
 /// `start + t0 ..`), one cube per (batch row, query). `raw` `[B, hi, q, S']` holds the indexer
@@ -748,12 +745,11 @@ pub(crate) fn ret_select_kernel<F: Float>(
 /// through their strides). Writes the normalised latent sums `out` `[B, T, H, l]`
 /// (contiguous), before the value up-projection.
 ///
-/// Each tile of cache rows is staged in shared memory once (independent coalesced loads), then
-/// read twice: for the scores, where each plane takes `tile / 8` positions and its lanes split
-/// the row width, every lane keeping the partial dot products of those positions and all heads
-/// in registers (one query and one cached value feed many products); and for the weighted sums,
-/// where each unit owns latent columns of every head. The tile is at most a plane wide, so the
-/// softmax update is one lane per position.
+/// The scores of a tile: each plane takes `tile / 8` positions and its lanes split the row
+/// width, every lane keeping the partial dot products of those positions and all heads in
+/// registers (one query value and one cached value feed many products, the loads unrolled so
+/// they overlap). The weighted sums: each unit owns latent columns of every head. The tile is
+/// a plane wide, so the softmax update is one lane per position.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ret_prefill_attend_kernel<F: Float>(
@@ -780,12 +776,10 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
     let cols = comptime!(latent.div_ceil(CUBE));
     let per = comptime!(tile / PREFILL_PLANES);
     let steps = comptime!(width.div_ceil(PREFILL_LANES));
-    let copies = comptime!((tile * width).div_ceil(CUBE));
     let tid = UNIT_POS as usize;
     let lane = UNIT_POS_PLANE as usize;
     let plane = tid / PREFILL_LANES;
     let mut q_sh = Shared::<[F]>::new_slice(heads * width);
-    let mut kv_sh = Shared::<[F]>::new_slice(tile * width);
     let mut sc = Shared::<[f32]>::new_slice(heads * tile);
     let mut at = Shared::<[u32]>::new_slice(tile);
     let mut ok = Shared::<[u32]>::new_slice(tile);
@@ -837,26 +831,16 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
             ok[tid] = select(visible, 1u32, 0u32);
         }
         sync_cube();
-        // Stage the tile's rows (hidden positions as zeros).
-        #[unroll]
-        for r in 0..copies {
-            let e = tid + r * CUBE;
-            if e < tile * width {
-                let s = e / width;
-                let d = e % width;
-                let mut x = F::cast_from(0.0f32);
-                if ok[s] == 1 {
-                    x = kv[row0 + usize::cast_from(at[s]) * k1 + d * k2];
-                }
-                kv_sh[e] = x;
-            }
-        }
-        sync_cube();
         // Scores: plane `plane` takes positions `plane * per ..`, its lanes splitting the width.
         let mut part = Array::<f32>::new(comptime!(per * heads));
         #[unroll]
         for a in 0..per * heads {
             part[a] = 0.0f32;
+        }
+        let mut rows = Array::<usize>::new(per);
+        #[unroll]
+        for j in 0..per {
+            rows[j] = row0 + usize::cast_from(at[plane * per + j]) * k1;
         }
         #[unroll]
         for m in 0..steps {
@@ -869,7 +853,8 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
                 }
                 #[unroll]
                 for j in 0..per {
-                    let x = f32::cast_from(kv_sh[(plane * per + j) * width + d]);
+                    // Hidden positions read row 0 (always cached) and are masked below.
+                    let x = f32::cast_from(kv[rows[j] + d * k2]);
                     #[unroll]
                     for h in 0..heads {
                         part[j * heads + h] += qv[h] * x;
@@ -923,13 +908,13 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
                 for h in 0..heads {
                     acc[h * cols + j] *= corr[h];
                 }
+                #[unroll]
                 for s in 0..tile {
-                    if ok[s] == 1 {
-                        let x = f32::cast_from(kv_sh[s * width + c]);
-                        #[unroll]
-                        for h in 0..heads {
-                            acc[h * cols + j] += sc[h * tile + s] * x;
-                        }
+                    // Hidden positions weigh zero.
+                    let x = f32::cast_from(kv[row0 + usize::cast_from(at[s]) * k1 + c * k2]);
+                    #[unroll]
+                    for h in 0..heads {
+                        acc[h * cols + j] += sc[h * tile + s] * x;
                     }
                 }
             }
