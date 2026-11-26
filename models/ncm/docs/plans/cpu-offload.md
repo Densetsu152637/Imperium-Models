@@ -1,13 +1,40 @@
 # Plan: CPU offload for the NCM runtime
 
-Revision: 2026-11-26, written against `b1f20c6` (feat/ncm-review-fixes tip), last updated 2026-11-26. Nothing in it is implemented or measured yet. Every number marked *est.* is an estimate.
+Revision: 2026-11-26, written against `b1f20c6` (feat/ncm-review-fixes tip), last updated 2026-11-26 (rev 2: plan-gate review of `9eb3b68`). Nothing in it is implemented or measured yet. Every number marked *est.* is an estimate.
+
+> **Note, 2026-11-26: NCM numbers are provisional.** The user chose a hybrid NCM. The 4-token local decoder is replaced by the Stanford NCM paper's coarse-to-fine parallel decoder over blocks of about 32–64 tokens, and the backbone runs once per block. The design is in progress in `Imperium-Research/docs/next-concept-modelling/architecture.md`.
+>
+> Until the block shape is fixed, every NCM-specific number below is provisional:
+> - whether the NCM needs tiering at 1M tokens at all;
+> - the token thresholds where retrieval traffic starts and goes flat;
+> - the NCM estimates in Stages 3, 4 and 6;
+> - which stage owns `GraphedStep` and `speculative.rs`.
+>
+> The token-baseline numbers stand.
+>
+> With the backbone running once per 32–64 tokens, 1M tokens is only 16k–32k backbone positions (*est.* about 0.16–0.31 GiB of NCM retrieval cache), so the NCM may never need tiering at 1M. Streaming backbone layers (Stage 6), on the other hand, gets cheaper per token, so it may move ahead of Stage 4 for the NCM once re-estimated. Stage 0 redoes these numbers.
+>
+> The planner and footprint take `tokens_per_position` as a parameter instead of hard-coding k = 4: 1 for the token baseline, k or the block length for the NCM.
 
 Goals (each one passes or fails):
 
-1. With the v2 retrieval caches tiered, the token baseline at 1,048,576 tokens of context fits in less than 2 GiB of cache VRAM (12.52 GiB today), and the NCM fits in less than 0.3 GiB (2.51 GiB today). Check: `ncm-server --print-footprint --arch tok --random-weights -c 1048576 --cache-offload on` shows device cache bytes under 2 GiB, and the same command with `--arch ncm` shows under 0.3 GiB.
+1. With the v2 retrieval caches tiered, cache VRAM at 1,048,576 tokens of context stays under the bounds below. Cache VRAM here means every device byte the caches own:
+   - indexer keys;
+   - the decode tail rings;
+   - the prefill chunk-staging buffers;
+   - the union slab, at its minimum size of 1,024 blocks.
+
+   Bounds:
+   - token baseline: under 2 GiB (*est.* 1.45 GiB; 12.52 GiB today);
+   - NCM: under 0.4 GiB (*est.* 0.36 GiB at the current 4-token shape; 2.51 GiB today; provisional).
+
+   Check: `ncm-server --print-footprint --arch tok --random-weights -c 1048576 --cache-offload on` shows the device cache total, with one row per part, under 2 GiB. The same command with `--arch ncm` shows under 0.4 GiB.
 2. Tiered decode returns the same results as device-resident decode: identical logits in f32 and identical greedy tokens in bf16, both eager and graphed, for both models. Check: `cargo test -p ncm-model --features cuda --test offload`.
 3. With a forced VRAM budget, `ncm-server` launches, places the model by itself and serves requests at a context that does not fit fully resident on the GPU. Check: `cargo test -p ncm-server --features cuda --test offload_e2e` (it starts the server with `--vram-budget`).
 4. NCM v2 decode at 128k context with the cache tiered on PCIe 5.0 x16 runs at 85% or more of resident decode speed. Check: `ncm-bench --model ncm --design v2 --context 131072 --cache-offload on` against the same run with `off`.
+   - At the current shape this needs at least about 35 GB/s on cold-block reads: 18.9 MB in at most 0.54 ms per concept.
+   - The decode-path gate in Stage 0a uses this same 35 GB/s threshold (see Risks).
+   - The threshold is re-derived in Stage 0 once the block shape is fixed.
 5. `-ngl N` with N below the backbone depth streams the remaining backbone layers over PCIe and still decodes correctly. Check: `cargo test -p ncm-model --features cuda --test offload streamed_layers`.
 6. CI stays green on CPU: `scripts/check.sh`. Placement, footprint and flag parsing are all tested without a GPU.
 
@@ -28,7 +55,7 @@ Goals (each one passes or fails):
   - shape-stable prefill, the persistent compile cache and top-k select (touch `cache.rs`, `layers.rs` attention and `retrieval.rs`);
   - the fused norm/GEMV/MLP work (touches `kernels/gemv.rs`, `kernels/quant.rs`, `kernels/norm.rs` and the `layers.rs` MLP).
 
-  Stage 0 rebases this plan's paths onto the result.
+  The hybrid NCM block decoder has also landed (see the note above). Stage 0 rebases this plan's paths and numbers onto the result.
 - Burn 0.22.1 with burn-cuda/cubecl 0.11.4. A CUDA build sits on a PCIe 4.0 or 5.0 x16 link.
 - Effective bandwidth over PCIe *est.*:
   - PCIe 5.0 x16: about 40 GB/s for zero-copy kernel reads and about 50 GB/s for pinned memcpy.
@@ -73,8 +100,10 @@ Order:
 ### (b) Retrieval-cache tiering: chosen
 
 Each retrieval layer's `LatentCache` splits into two tiers:
-- **Device tail ring** of `ret_local + ret_block` positions (1,088). It always holds the local window and the block being filled.
+- **Device tail ring** of `ret_local + ret_block` positions (1,088), sized for decode only. It always holds the local window and the block being filled.
 - **Cold store** of complete blocks in pinned host memory.
+
+Prefill adds a third, transient device buffer per layer, described under "Prefill staging" below.
 
 The indexer keys stay whole on the device, so scoring, block maxima and top-k (`ret_index_kernel` and `ret_topk_kernel`) are unchanged.
 
@@ -84,16 +113,49 @@ Why this works:
 
 How the attend kernels read the tiers:
 - **Decode (`ret_attend_kernel`):** reads selected cold blocks directly from host-mapped pinned memory (zero-copy over UVA, at a fixed device pointer) and the local window from the tail ring.
-- **Prefill (`ret_prefill_attend_kernel`):** uses *union staging* (Stage 4) instead, because many queries in a chunk re-read the same blocks.
+- **Prefill (`ret_prefill_attend_kernel`):** reads the chunk-staging buffer plus the union slab (Stage 4), because many queries in a chunk re-read the same blocks.
+
+### Prefill staging and the union slab
+
+A prefill chunk (8,192 positions for the token baseline; 2,048 concepts for the NCM at k = 4) is far larger than the 1,088-position ring. So each retrieval layer gets a **device chunk-staging buffer** of `(ret_local + ret_block + chunk) × 1,152 B`.
+
+How a chunk runs:
+1. At chunk start, the ring's pre-chunk tail is copied into the head of the staging buffer (device to device). Then `ret_prep` writes the chunk's entries after it, so one buffer covers every query's local window.
+2. Picked blocks fall into two groups:
+
+   | Picked block | Where it is read |
+   |---|---|
+   | Inside staging (index ≥ `staging_first_block`) | Directly from staging |
+   | Older (cold) | Through the union slab |
+
+   The union slab works like this:
+   - A device kernel builds the union of the older blocks the chunk's queries picked.
+   - A gather copies those blocks from the cold store into one **union slab** shared by all layers. Its size is chosen by the planner: at least 1,024 blocks (75.5 MB), at most every candidate block.
+   - The attend kernel reads the slab through a block-to-slot remap.
+   - If the union overflows the slab, the query chunk is split.
+3. After the layer's chunk:
+   - every block completed inside the chunk is spilled from staging to the cold store;
+   - the last 1,088 positions are copied back into the ring.
+
+Footprint term per model: `retrieval_layers × (ret_local + ret_block + chunk) × 1,152 B`.
+- Token baseline: 10 × 9,280 × 1,152 B ≈ 107 MB.
+- NCM: 8 × 3,136 × 1,152 B ≈ 29 MB (provisional).
+
+Halving the prefill chunk (fit step 3) shrinks it.
+
+**Decision:** the union slab and the staging buffers count as cache VRAM, both in goal 1 and in `--print-footprint`. The planner sizes the slab from the budget left over after everything else.
 
 Why zero-copy:
 - Selection happens on the device.
 - Explicit host-issued copies would need the picked indices on the host. That is a device-to-host sync per layer per step, which breaks CUDA graphs and adds about 8 × 20 µs per concept *est.*
 - A kernel that reads mapped host memory needs no sync. It also keeps fixed addresses, so it is graph-safe.
 
-Device VRAM after tiering, at 1M:
-- NCM: indexer keys 0.254 GiB plus tail rings 8 × 1,088 × 1,152 B = 10 MB, about **0.27 GiB** (was 2.51).
-- Token baseline: 1.27 GiB + 12.5 MB, about **1.29 GiB** (was 12.52).
+Device VRAM after tiering, at 1M, with the minimum 1,024-block slab:
+
+| | Indexer keys | Rings | Staging | Slab | Total | Today |
+|---|---|---|---|---|---|---|
+| NCM (provisional) | 0.254 GiB | 10 MB | 29 MB | 72 MiB | about **0.36 GiB** | 2.51 GiB |
+| Token baseline | 1.27 GiB | 12.5 MB | 107 MB | 72 MiB | about **1.45 GiB** | 12.52 GiB |
 
 Host memory (pinned): 2.25 GiB for the NCM and 11.25 GiB for the token baseline.
 
@@ -179,9 +241,12 @@ How `--fit` (default `on`) chooses:
 
 Pinned host memory cannot be swapped, so the planner also checks available physical RAM. It keeps a host margin of at least 25% of RAM or 4 GiB.
 
-Rules for the planner:
-- An explicit `-ngl` below the layer count, `--cache-offload on|off` and `-nkvo` are always respected.
-- `-ngl` ≥ the layer count (Imperium's 999) is treated as "as many as fit": fit may lower it, and says so on stderr.
+Rules for the planner (root decisions, 2026-11-26):
+- Explicit flags from Imperium win: an explicit `-ngl` below the layer count, `--cache-offload on|off` and `-nkvo` are always respected.
+- ncm-server's own fit applies only where placement is unspecified or `auto`.
+- `-ngl` ≥ the layer count (Imperium's 999), `all` or `auto` means "as many as fit": fit may lower it, and says so on stderr.
+
+Everything is parameterised by `tokens_per_position`, so the hybrid NCM's block length drops in without planner changes.
 
 New flags:
 
@@ -215,9 +280,13 @@ New flags:
   - Latents stay at the run dtype (non-goal).
   - The footprint counts quantised bytes.
 - **Prefix-reuse snapshots**
-  - A latent snapshot remains just a length.
-  - `LatentCache::snapshot` (via `LayerCache::snapshot`) flushes the partial tail block to the cold store.
-  - `restore`/`rewind` refills the device tail ring from the host: at most 1,088 × 1,152 B = 1.25 MB per layer.
+  - `LayerCache::snapshot` takes `&self` (`cache.rs:342`), so a snapshot cannot flush into the cold store.
+  - Instead, a tiered latent snapshot becomes `LayerSnapshot::Latent { len, tail }`, where `tail` is a device copy of the partial block: at most 63 positions × 1,152 B, taken with `copy_of`, as `KvCache::snapshot` already does for rings.
+  - Positions in complete blocks are already on the host, because they were spilled when the block completed.
+  - `restore(&mut self)` does two things:
+    - refills the ring's complete-block part from the cold store (at most 1,088 × 1,152 B = 1.25 MB per layer);
+    - writes `tail` back into the ring.
+  - Resident caches keep the plain length (`tail: None`).
   - Both `Kept` entries in `engine.rs` therefore stay valid.
 - **Single engine thread.**
   - Placement, pinned allocation (at `Core` construction) and spills all run on `ncm-engine`, so no new OS threads are added.
@@ -237,23 +306,51 @@ New flags:
 
 ### Risks and revisit conditions
 
-- **Can cubecl 0.11.4 bind host-mapped memory?** This is the main risk. Stage 1 spikes it: `cuMemHostAlloc(DEVICEMAP)` or `cuMemHostRegister`, then the device pointer as a cubecl binding. If it cannot, the fallbacks are, in order:
+- **Can cubecl 0.11.4 bind host-mapped memory?** This is the main risk. Stage 0a spikes it, with no dependencies: `cuMemHostAlloc(DEVICEMAP)` or `cuMemHostRegister`, then the device pointer as a cubecl binding. If it cannot, the fallbacks are, in order:
   1. a small cudarc PTX gather kernel on the same stream, which copies the picked blocks into a device slab, followed by the remap variant of the attend kernel;
   2. patching cubecl-cuda;
   3. host index readback (eager only, slower).
-- **Zero-copy bandwidth** may fall well below 40 GB/s. If Stage 3 measures under 25 GB/s on PCIe 5, make the gather-into-slab path from fallback 1 the default for decode too.
+- **Decode gate, tied to goal 4.** Stage 0a measures two bandwidths on PCIe 5:
+  - zero-copy reads from inside an attend-shaped kernel;
+  - a dedicated wide-load gather kernel into a slab.
+
+  Then:
+  - If the in-attend read reaches at least 35 GB/s, decode reads cold blocks in place.
+  - Below that, decode uses gather-into-slab plus the remap attend, provided the gather reaches 35 GB/s.
+  - If neither reaches 35 GB/s, goal 4 is reported as unmet and its threshold goes back to root. It is not loosened silently.
 - **Selection churn** of the trained model decides whether Stage 7 is worth doing.
 
-## Stage 0: Rebase onto the landed optimisation round
-- **Objective:** confirm that the optimisation branches have merged, and update this plan's owned paths, kernel names and speed baselines to what landed.
-- **Depends on:** the optimisation branches being merged to `main`.
+## Stage 0a: Host-mapped memory spike
+- **Objective:**
+  - Prove a cubecl 0.11.4 kernel can read and write pinned host memory mapped into the device at a fixed address, eagerly and inside a captured graph.
+  - Measure the two decode-gate bandwidths: in-attend zero-copy reads of 64-position blocks, and a dedicated gather kernel into a slab.
+  - It is a throwaway spike. Only the result and the chosen mechanism are kept.
+- **Depends on:** none. It can run as soon as GPU testing resumes, in parallel with everything else.
+- **Owned paths:** a scratch spike crate or branch, not merged; its result is recorded in this plan.
+- **Acceptance checks:**
+  - The spike's eager and replayed reads match the host data.
+  - Both bandwidths and the resulting decode path (in place, gather-into-slab, or escalate to root) are recorded in Outcome, against the 35 GB/s gate.
+- **Status:** pending
+- **Outcome:**
+- **Handoff notes:** picks the fallback order in Risks. It also fixes the decode path that Stages 2 and 3 build.
+
+## Stage 0: Rebase onto the landed optimisation round and block decoder
+- **Objective:**
+  - Confirm that the optimisation branches and the hybrid NCM block decoder have merged.
+  - Update this plan's owned paths, kernel names and speed baselines to what landed.
+  - Re-derive the provisional NCM numbers, including the goal 4 threshold and the Stage 4 versus Stage 6 order for the NCM.
+- **Depends on:** the optimisation branches being merged to `main`; the block decoder having landed.
 - **Owned paths:** `models/ncm/docs/plans/cpu-offload.md`
 - **Acceptance checks:**
   - Every path and kernel named below exists on `main`: `rg -n "ret_attend_kernel|ret_prefill_attend_kernel|LatentCache" models/ncm/crates`.
   - The baselines are re-recorded from `ncm-bench --model ncm --design v2 --context 2048 131072`.
+  - The note at the top is replaced by settled NCM numbers.
 - **Status:** pending
 - **Outcome:**
-- **Handoff notes:** no code. If top-k select moved out of `kernels/retrieval.rs`, re-point Stage 3.
+- **Handoff notes:**
+  - No code.
+  - If top-k select moved out of `kernels/retrieval.rs`, re-point Stage 3.
+  - Settle which stage owns `GraphedStep` and `speculative.rs` after the decoder change.
 
 ## Stage 1: Placement model, footprint and flags (no behaviour change)
 - **Objective:**
@@ -267,37 +364,39 @@ New flags:
   - `crates/ncm-model/src/ncm.rs` (`ncm_cache_bytes`) and `tok.rs`: per-tier splits
   - `runtime/src/{cli.rs, engine.rs (start-up line only), app.rs}`
 - **Acceptance checks:**
-  - Planner unit tests give the expected placements for 4, 8 and 16 GB budgets at 2k, 128k and 1M for both models, and the per-tier sums match `ncm_cache_bytes`: `cargo test -p ncm-model placement`.
+  - Planner unit tests give the expected placements for 4, 8 and 16 GB budgets at 2k, 128k and 1M for both models. They also check:
+    - the per-tier sums match `ncm_cache_bytes`;
+    - the staging and slab terms are included;
+    - results are right for several values of `tokens_per_position`;
+    - the planner refuses, naming the largest context that fits, when a budget cannot hold even the tiered placement (for example, the token baseline at 1M under 2 GiB).
+
+    Command: `cargo test -p ncm-model placement`.
   - CLI parsing tests pass: `cargo test -p ncm-server cli`.
   - `scripts/check.sh` passes.
 - **Status:** pending
 - **Outcome:**
 - **Handoff notes:**
-  - Free-VRAM and free-RAM queries live in the runtime, not ncm-model: `cuMemGetInfo` behind `cuda`, and on Windows `GlobalMemoryStatusEx` through `windows-sys` or the `sysinfo` crate (needs dependency approval).
+  - Free-VRAM and free-RAM queries live in the runtime, not ncm-model: `cuMemGetInfo` behind `cuda`, and free RAM through `windows-sys` (`GlobalMemoryStatusEx`) or `sysinfo`. Both dependencies were approved by root on 2026-11-26.
   - Prefill transients and the CUDA context are estimated constants until Stage 5 measures them.
 
-## Stage 2: Host-mapped memory primitive (spike, then module)
+## Stage 2: Host-mapped memory primitive (module)
 - **Objective:**
-  - Prove a cubecl 0.11.4 kernel can read and write pinned host memory mapped into the device at a fixed address, inside a captured graph.
-  - Wrap that in `host.rs` (`HostBuffer`: alloc, device view, async copy-in and copy-out on the run stream, drop) and the `ColdStore` trait with the `MappedHost` and `Resident` implementations.
-- **Depends on:** stage 1 (types only).
+  - Turn the mechanism Stage 0a chose into `host.rs` (`HostBuffer`: alloc, device view, async copy-in and copy-out on the run stream, drop) and the `ColdStore` trait with the `MappedHost` and `Resident` implementations.
+- **Depends on:** stage 0a; stage 1 (types only).
 - **Owned paths:**
   - `crates/ncm-model/src/{host.rs, kernels/mod.rs (binding helper), inplace.rs (copy helpers)}`
-  - `crates/ncm-model/Cargo.toml`: cudarc, if it is not already a direct dependency
-- **Acceptance checks:**
-  - A round-trip test passes: a kernel reads a mapped buffer, the result equals the host data, eager and replayed: `cargo test -p ncm-model --features cuda --test offload host_buffer`.
-  - A microbench reports the zero-copy read bandwidth of 64-position blocks (recorded in Outcome).
+  - `crates/ncm-model/Cargo.toml`: cudarc as a direct dependency if needed (approved)
+- **Acceptance checks:** a round-trip test passes: a kernel reads a mapped buffer, the result equals the host data, eager and replayed: `cargo test -p ncm-model --features cuda --test offload host_buffer`.
 - **Status:** pending
 - **Outcome:**
-- **Handoff notes:**
-  - This is the decision gate for the fallback order in the risks above.
-  - Record the measured GB/s here and update the decode estimate.
+- **Handoff notes:** if Stage 0a chose gather-into-slab, this stage also owns the gather kernel.
 
 ## Stage 3: Tiered retrieval cache, decode
 - **Objective:**
   - Split `LatentCache` into the device tail ring and a `ColdStore` of complete blocks:
     - spill each completed block from the host-tracked position;
-    - flush the partial tail on `snapshot`, and refill the ring on `rewind`/`restore`;
+    - `snapshot(&self)` copies the partial block on the device into `LayerSnapshot::Latent { len, tail }`;
+    - `restore` refills the ring from the cold store plus `tail`;
     - `nbytes` reports both tiers.
   - Teach `ret_prep_kernel` to write into the ring slot (`position mod ring`).
   - Teach `ret_attend_kernel` to read selected cold blocks through the cold binding and the window from the ring.
@@ -317,23 +416,34 @@ New flags:
 - **Status:** pending
 - **Outcome:**
 - **Handoff notes:**
-  - Ring size `ret_local + ret_block`. The slot arithmetic must match `candidate_blocks`.
-  - Until Stage 4 lands, prefill with a tiered cache uses the reference gather path, so it is slow but correct.
+  - Ring size `ret_local + ret_block`, for decode only. The slot arithmetic must match `candidate_blocks`.
+  - Until Stage 4 lands, a tiered cache is prefilled resident and then converted: blocks are spilled and the ring is filled after prefill. That costs full VRAM during prefill, but it is correct, and it is only allowed with an explicit `--cache-offload on`.
+  - The NCM `GraphedStep` part is provisional until Stage 0 settles the block decoder.
 
-## Stage 4: Tiered prefill (union staging)
-- **Objective:**
-  - Per retrieval layer and prefill chunk:
-    1. a device kernel builds the bitmap and the compacted list of blocks picked by any query (`ret_select_kernel` output);
-    2. a gather copies those cold blocks into a fixed device slab (capacity `U_max` blocks; default 4,096 blocks, about 302 MB, shared by the layers);
-    3. `ret_prefill_attend_kernel` reads through a block-to-slot remap.
-  - On overflow, split the query chunk.
+## Stage 4: Tiered prefill (chunk staging and union slab)
+- **Objective:** per retrieval layer and prefill chunk, as in "Prefill staging and the union slab":
+  1. copy the ring's tail into the head of the chunk-staging buffer, and have `ret_prep` write the chunk after it;
+  2. a device kernel builds the bitmap and the compacted list of cold blocks (those older than `staging_first_block`) picked by any query, from the `ret_select_kernel` output;
+  3. a gather copies those blocks into the shared union slab (planner-sized, at least 1,024 blocks);
+  4. `ret_prefill_attend_kernel` reads blocks inside staging directly, and cold blocks through the block-to-slot remap;
+  5. after the chunk, spill the blocks completed inside it from staging to the cold store, and copy the last 1,088 positions back into the ring.
+
+  On slab overflow, split the query chunk.
 - **Depends on:** stage 3.
 - **Owned paths:**
-  - `crates/ncm-model/src/{retrieval.rs (prefill), kernels/retrieval.rs (select, prefill attend, new union/gather kernels)}`
-  - the `placement.rs` slab term
+  - `crates/ncm-model/src/{retrieval.rs (prefill), kernels/retrieval.rs (prep target, select, prefill attend, new union/gather kernels)}`
+  - `crates/ncm-model/src/cache.rs` (staging buffer in `LatentCache`)
+  - the `placement.rs` staging and slab terms
 - **Acceptance checks:**
-  - Tiered prefill equals resident prefill for chunks whose union overflows `U_max` and for chunks where it does not: `cargo test -p ncm-model --features cuda --test offload prefill`.
-  - The 1M-token token-baseline prefill completes under a 4 GiB `--vram-budget`, and the time is recorded: `ncm-bench --model tok --design v2 --context 1048576 --vram-budget 4096`.
+  - Tiered prefill equals resident prefill (f32 bitwise, bf16 greedy tokens afterwards) in each of these cases:
+    - a chunk larger than the ring, whose queries pick blocks inside the chunk itself;
+    - a union that overflows the slab;
+    - a union that does not;
+    - a prompt ending mid-block, followed by decode.
+
+    Command: `cargo test -p ncm-model --features cuda --test offload prefill`.
+  - The footprint of staging plus slab matches the allocated bytes: `cargo test -p ncm-model --features cuda --test offload prefill_footprint`.
+  - The 1M-token token-baseline prefill completes under a 6 GiB `--vram-budget`, and the time is recorded: `ncm-bench --model tok --design v2 --context 1048576 --vram-budget 6144`.
 - **Status:** pending
 - **Outcome:**
 - **Handoff notes:**
@@ -350,8 +460,16 @@ New flags:
   - `runtime/src/{engine.rs, cli.rs, app.rs, server.rs (props/footprint in health, if exposed)}`
   - `runtime/README.md`, `crates/ncm-model/src/placement.rs`
 - **Acceptance checks:**
-  - End to end, the server starts under budgets of 2, 4 and 8 GiB at contexts that do not fit resident, picks tiering, and its completions match a resident run: `cargo test -p ncm-server --features cuda --test offload_e2e`.
-  - With Imperium's line (`-ngl 999 -c 1048576`) under a 4 GiB budget, the server starts, logs the tiering, and serves.
+  - End to end, the server starts, picks tiering, and its completions match a resident run of the same model on a short prompt, in each case below. All use `--random-weights` and `--fit-target 512`. Command: `cargo test -p ncm-server --features cuda --test offload_e2e`.
+
+    | Case | Model | Context | `--vram-budget` | Resident would need *est.* | Tiered needs *est.* |
+    |---|---|---|---|---|---|
+    | a | NCM v2 (provisional) | 1,048,576 | 3 GiB | about 4.5 GiB | about 2.4 GiB |
+    | b | Token v2 | 262,144 | 4 GiB | about 5.1 GiB | about 2.3 GiB |
+    | c | Token v2 | 1,048,576 | 6 GiB | about 14.5 GiB | about 3.5 GiB, plus 11.25 GiB pinned host RAM |
+
+    Case c uses Imperium's launch line (`-ngl 999 -c 1048576`) and must also log the tiering. It needs enough free RAM; on a machine without it, the test checks the planner's clear refusal instead.
+  - The token baseline at 1M is not tested under 2 GiB; Stage 1's planner unit tests cover that refusal.
   - Peak VRAM, read from `cuMemGetInfo` in the test, stays within budget minus target.
 - **Status:** pending
 - **Outcome:**
@@ -375,6 +493,7 @@ New flags:
 - **Outcome:**
 - **Handoff notes:**
   - Mostly for larger future models; the gain at 250M is small.
+  - Under the hybrid NCM, the backbone runs once per 32–64-token block, so streaming costs 8–16 times less per token than at k = 4. Streaming 8 bf16 layers would cost about 0.08–0.16 ms per token *est.* This stage may move ahead of Stage 4 for the NCM once Stage 0 re-estimates.
   - If zero-copy GEMV measures under about 60% of pinned memcpy bandwidth, stage each layer through the slab in decode too, inside the graph as a captured memcpy from pinned memory.
 
 ## Stage 7 (gated): Hot-block reuse
