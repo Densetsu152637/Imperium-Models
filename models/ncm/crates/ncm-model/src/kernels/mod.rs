@@ -755,10 +755,16 @@ impl NcmKernels for CubeBackend {
         let client = q.client.clone();
         let plane = client.properties().hardware.plane_size_max as usize;
         assert_eq!(plane, retrieval::PREFILL_LANES, "the prefill kernel takes 32-lane planes");
+        // The largest head group up to PREFILL_HEAD_GROUP that splits the heads evenly (16
+        // heads at 1B: two groups of 8, each keeping 250M's register footprint).
+        let hg = (1..=retrieval::PREFILL_HEAD_GROUP.min(h))
+            .rev()
+            .find(|g| h.is_multiple_of(*g))
+            .unwrap_or(1);
         unsafe {
             retrieval::ret_prefill_attend_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * t) as u32, 1, 1),
+                CubeCount::Static((b * t * (h / hg)) as u32, 1, 1),
                 CubeDim::new_1d(CUBE as u32),
                 q.into_tensor_arg(),
                 kv.into_tensor_arg(),
@@ -769,6 +775,7 @@ impl NcmKernels for CubeBackend {
                 t,
                 dims.topk,
                 h,
+                hg,
                 dims.latent,
                 dims.rope_dim,
                 dims.block,

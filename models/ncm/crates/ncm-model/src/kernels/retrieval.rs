@@ -1080,8 +1080,12 @@ pub(crate) fn ret_select_kernel<F: Float>(
     }
 }
 
+/// Most query heads per cube of [`ret_prefill_attend_kernel`] (its partial dot products and
+/// latent sums of every head of the group stay in registers); more heads split into groups.
+pub(crate) const PREFILL_HEAD_GROUP: usize = 8;
+
 /// Sparse prefill attention on the cached latents, one cube per (batch row, query of the chunk
-/// at absolute position `start + t`): the query's `count` picked blocks (their positions at
+/// at absolute position `start + t`, group of `hg` query heads): the query's `count` picked blocks (their positions at
 /// least `local` before it) and its local window (the last `min(local, pos + 1)` positions),
 /// with an online softmax over tiles of `tile` positions. `q` `[B, H, T, l + dr]` is the
 /// absorbed query with the softmax scale folded in, `kv` `[B, S, l + dr]` the cache (both read
@@ -1105,6 +1109,7 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
     t_total: usize,
     k: usize,
     #[comptime] heads: usize,
+    #[comptime] hg: usize,
     #[comptime] latent: usize,
     #[comptime] dr: usize,
     #[comptime] block: usize,
@@ -1112,8 +1117,13 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
     #[comptime] tile: usize,
     #[define(F)] _dtype: ElemType,
 ) {
-    let b = CUBE_POS / t_total;
-    let t = CUBE_POS % t_total;
+    // Cube = (batch row, query, head group of `hg` heads).
+    let groups = comptime!(heads / hg);
+    let cube = CUBE_POS;
+    let h0 = (cube % groups) * hg;
+    let bt = cube / groups;
+    let b = bt / t_total;
+    let t = bt % t_total;
     let pos = start + t;
     let width = comptime!(latent + dr);
     let cols = comptime!(latent.div_ceil(CUBE));
@@ -1122,28 +1132,28 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
     let tid = UNIT_POS as usize;
     let lane = UNIT_POS_PLANE as usize;
     let plane = tid / PREFILL_LANES;
-    let mut q_sh = Shared::<[F]>::new_slice(heads * width);
-    let mut sc = Shared::<[f32]>::new_slice(heads * tile);
+    let mut q_sh = Shared::<[F]>::new_slice(hg * width);
+    let mut sc = Shared::<[f32]>::new_slice(hg * tile);
     let mut at = Shared::<[u32]>::new_slice(tile);
     let mut ok = Shared::<[u32]>::new_slice(tile);
-    let mut m_sh = Shared::<[f32]>::new_slice(heads);
-    let mut l_sh = Shared::<[f32]>::new_slice(heads);
-    let mut corr = Shared::<[f32]>::new_slice(heads);
+    let mut m_sh = Shared::<[f32]>::new_slice(hg);
+    let mut l_sh = Shared::<[f32]>::new_slice(hg);
+    let mut corr = Shared::<[f32]>::new_slice(hg);
     let (q0, q1, q2, q3) = (q.stride(0), q.stride(1), q.stride(2), q.stride(3));
     let mut idx = tid;
-    while idx < heads * width {
+    while idx < hg * width {
         let h = idx / width;
         let d = idx % width;
-        q_sh[idx] = q[b * q0 + h * q1 + t * q2 + d * q3];
+        q_sh[idx] = q[b * q0 + (h0 + h) * q1 + t * q2 + d * q3];
         idx += CUBE;
     }
-    if tid < heads {
+    if tid < hg {
         m_sh[tid] = f32::new(-1.0e30f32);
         l_sh[tid] = 0.0f32;
     }
-    let mut acc = Array::<f32>::new(comptime!(heads * cols));
+    let mut acc = Array::<f32>::new(comptime!(hg * cols));
     #[unroll]
-    for a in 0..heads * cols {
+    for a in 0..hg * cols {
         acc[a] = 0.0f32;
     }
     let n_sel = usize::cast_from(count[b * t_total + t]);
@@ -1175,9 +1185,9 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
         }
         sync_cube();
         // Scores: plane `plane` takes positions `plane * per ..`, its lanes splitting the width.
-        let mut part = Array::<f32>::new(comptime!(per * heads));
+        let mut part = Array::<f32>::new(comptime!(per * hg));
         #[unroll]
-        for a in 0..per * heads {
+        for a in 0..per * hg {
             part[a] = 0.0f32;
         }
         let mut rows = Array::<usize>::new(per);
@@ -1189,9 +1199,9 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
         for m in 0..steps {
             let d = lane + m * PREFILL_LANES;
             if d < width {
-                let mut qv = Array::<f32>::new(heads);
+                let mut qv = Array::<f32>::new(hg);
                 #[unroll]
-                for h in 0..heads {
+                for h in 0..hg {
                     qv[h] = f32::cast_from(q_sh[h * width + d]);
                 }
                 #[unroll]
@@ -1199,8 +1209,8 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
                     // Hidden positions read row 0 (always cached) and are masked below.
                     let x = f32::cast_from(kv[rows[j] + d * k2]);
                     #[unroll]
-                    for h in 0..heads {
-                        part[j * heads + h] += qv[h] * x;
+                    for h in 0..hg {
+                        part[j * hg + h] += qv[h] * x;
                     }
                 }
             }
@@ -1209,8 +1219,8 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
         for j in 0..per {
             let s = plane * per + j;
             #[unroll]
-            for h in 0..heads {
-                let total = plane_sum(part[j * heads + h]);
+            for h in 0..hg {
+                let total = plane_sum(part[j * hg + h]);
                 if lane == 0 {
                     sc[h * tile + s] = select(ok[s] == 1, total, f32::new(-1.0e30f32));
                 }
@@ -1220,7 +1230,7 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
         // Online softmax per head, one plane per head and one lane per position: new running
         // max, weights in place, rescale factor.
         let mut h = plane;
-        while h < heads {
+        while h < hg {
             let mut v = f32::new(-1.0e30f32);
             if lane < tile {
                 v = sc[h * tile + lane];
@@ -1248,7 +1258,7 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
             let c = tid + j * CUBE;
             if c < latent {
                 #[unroll]
-                for h in 0..heads {
+                for h in 0..hg {
                     acc[h * cols + j] *= corr[h];
                 }
                 #[unroll]
@@ -1256,7 +1266,7 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
                     // Hidden positions weigh zero.
                     let x = f32::cast_from(kv[row0 + usize::cast_from(at[s]) * k1 + c * k2]);
                     #[unroll]
-                    for h in 0..heads {
+                    for h in 0..hg {
                         acc[h * cols + j] += sc[h * tile + s] * x;
                     }
                 }
@@ -1270,8 +1280,8 @@ pub(crate) fn ret_prefill_attend_kernel<F: Float>(
         let c = tid + j * CUBE;
         if c < latent {
             #[unroll]
-            for h in 0..heads {
-                out[((b * t_total + t) * heads + h) * latent + c] =
+            for h in 0..hg {
+                out[((b * t_total + t) * heads + h0 + h) * latent + c] =
                     F::cast_from(acc[h * cols + j] / l_sh[h]);
             }
         }
