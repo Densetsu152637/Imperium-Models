@@ -701,12 +701,17 @@ pub fn to_cpu<const D: usize>(x: &Tensor<D>) -> Tensor<D> {
     x.clone().to_device(&cpu()).cast(FloatDType::F32)
 }
 
-/// Moves every float parameter to the CPU in f32.
+/// Moves every float parameter to the CPU in f32, and every int parameter (quantised codes)
+/// to the CPU as is.
 struct ToCpuF32;
 
 impl ModuleMapper for ToCpuF32 {
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
         Param::from_tensor(to_cpu(&param.val()))
+    }
+
+    fn map_int<const D: usize>(&mut self, param: Param<Tensor<D, Int>>) -> Param<Tensor<D, Int>> {
+        param.map(|t| t.to_device(&cpu()))
     }
 }
 
