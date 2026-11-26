@@ -18,6 +18,12 @@ pub const TOK_250M_V2_TOML: &str = include_str!("../../../configs/tok-250m-v2.to
 pub const NCM_250M_V2_TOML: &str = include_str!("../../../configs/ncm-250m-v2.toml");
 /// The 250M NCM hybrid: v2 backbone over 32-token blocks, coarse-to-fine block decoder.
 pub const NCM_250M_HYBRID_TOML: &str = include_str!("../../../configs/ncm-250m-hybrid.toml");
+/// The ~1B token baseline (Princeps at 1B).
+pub const TOK_1B_TOML: &str = include_str!("../../../configs/tok-1b.toml");
+/// The ~1B NCM (k = 4).
+pub const NCM_1B_TOML: &str = include_str!("../../../configs/ncm-1b.toml");
+/// The ~1B NCM hybrid.
+pub const NCM_HYBRID_1B_TOML: &str = include_str!("../../../configs/ncm-hybrid-1b.toml");
 
 /// Every `full_every`-th layer (1-based) attends over the whole context.
 pub fn is_full_layer(index: usize, full_every: usize) -> bool {
@@ -484,6 +490,21 @@ pub fn ncm_250m_v2() -> NcmConfig {
 /// The 250M NCM hybrid (v2 backbone of 14 layers over 32-token blocks, block decoder).
 pub fn ncm_250m_hybrid() -> NcmConfig {
     parse_ncm(NCM_250M_HYBRID_TOML)
+}
+
+/// The ~1B token baseline (v2 design).
+pub fn tok_1b() -> TokConfig {
+    parse_tok(TOK_1B_TOML)
+}
+
+/// The ~1B NCM (k = 4, v2 design).
+pub fn ncm_1b() -> NcmConfig {
+    parse_ncm(NCM_1B_TOML)
+}
+
+/// The ~1B NCM hybrid.
+pub fn ncm_hybrid_1b() -> NcmConfig {
+    parse_ncm(NCM_HYBRID_1B_TOML)
 }
 
 /// The 250M token baseline of `design`.

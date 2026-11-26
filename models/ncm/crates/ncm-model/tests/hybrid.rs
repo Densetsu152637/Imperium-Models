@@ -833,3 +833,28 @@ fn chunked_memory_and_target_logprobs_match_the_reference() {
         }
     }
 }
+
+// ----------------------------------------------------------------------------- 1B configs
+
+/// The ~1B configs (Princeps at 1B): exact counts from the layer shapes, and the hybrid within
+/// 2% of the token baseline; each file parses and round-trips.
+#[test]
+fn one_b_configs_have_their_parameter_counts() {
+    use ncm_model::config::{NCM_1B_TOML, NCM_HYBRID_1B_TOML, TOK_1B_TOML};
+    use ncm_model::{NcmLm, ncm_1b, ncm_hybrid_1b, tok_1b};
+    for text in [TOK_1B_TOML, NCM_1B_TOML, NCM_HYBRID_1B_TOML] {
+        let cfg = Config::parse(text).expect("parses");
+        assert_eq!(Config::parse(&cfg.to_toml()).expect("round trip"), cfg);
+    }
+    let device = device();
+    let tok = TokenLm::new(&tok_1b(), &device).parts().total();
+    assert_eq!(tok, 1_035_235_648);
+    let hybrid = HybridLm::new(&ncm_hybrid_1b(), &device).parts().inference();
+    assert_eq!(hybrid, 1_037_372_296);
+    let gap = hybrid as f64 / tok as f64 - 1.0;
+    assert!((0.0..=0.02).contains(&gap), "hybrid {hybrid} vs tok {tok}");
+    // The k = 4 NCM (its draft head counted by hand to the nearest layer).
+    let ncm = NcmLm::new(&ncm_1b(), &device).parts().total();
+    assert_near("ncm-1b", ncm, 1_041_473_672.0, 0.01);
+    assert!((ncm as f64 / tok as f64 - 1.0).abs() <= 0.02, "ncm {ncm} vs tok {tok}");
+}

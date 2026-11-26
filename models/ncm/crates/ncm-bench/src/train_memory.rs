@@ -21,7 +21,7 @@
 
 use clap::Parser;
 use ncm_model::hybrid::HybridLm;
-use ncm_model::{Config, HybridConfig, NcmConfig, NcmLm, TokConfig, TokenLm, V2Config};
+use ncm_model::{Config, NcmLm, TokenLm, V2Config};
 use serde_json::{Value, json};
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -44,48 +44,12 @@ pub struct TrainMemoryCli {
     /// GPU memory to compare against, GiB.
     #[arg(long, default_value_t = 16.0)]
     pub gpu_gib: f64,
+    /// Sizes to estimate: 250m, 1b or both.
+    #[arg(long, default_value = "both")]
+    pub size: String,
     /// Also write the estimate as JSON.
     #[arg(long)]
     pub json: Option<std::path::PathBuf>,
-}
-
-/// The ~1B token baseline: the v2 stack at width 2,048, 24 layers.
-pub fn tok_1b() -> TokConfig {
-    let base = ncm_model::tok_250m_v2();
-    TokConfig {
-        d_model: 2048,
-        n_layers: 24,
-        ff_dim: 5632,
-        v2: V2Config { ret_heads: 16, ..base.v2.clone() },
-        ..base
-    }
-}
-
-/// The ~1B hybrid: the backbone at width 2,048 (16 layers), local width 768.
-pub fn hybrid_1b() -> NcmConfig {
-    let base = ncm_model::ncm_250m_hybrid();
-    let h = base.hybrid.clone().expect("hybrid");
-    NcmConfig {
-        local_dim: 768,
-        enc_heads: 12,
-        enc_kv_heads: 4,
-        enc_ff_dim: 2304,
-        dec_heads: 12,
-        dec_kv_heads: 4,
-        dec_ff_dim: 2304,
-        bb_dim: 2048,
-        bb_layers: 16,
-        bb_ff_dim: 5632,
-        v2: V2Config { ret_heads: 16, ..base.v2.clone() },
-        hybrid: Some(HybridConfig {
-            gen_heads: 12,
-            gen_kv_heads: 12,
-            gen_ff_dim: 2304,
-            pool_heads: 12,
-            ..h
-        }),
-        ..base
-    }
 }
 
 /// Activation elements of one layer kept for the backward pass.
@@ -294,12 +258,18 @@ pub fn run(cli: &TrainMemoryCli) -> Value {
         cli.gpu_gib
     );
     let models = [
-        ("tok-250m", Config::Tok(ncm_model::tok_250m_v2())),
-        ("hybrid-250m", Config::Ncm(ncm_model::ncm_250m_hybrid())),
-        ("tok-1b", Config::Tok(tok_1b())),
-        ("hybrid-1b", Config::Ncm(hybrid_1b())),
+        ("250m", "tok-250m", Config::Tok(ncm_model::tok_250m_v2())),
+        ("250m", "ncm-250m", Config::Ncm(ncm_model::ncm_250m_v2())),
+        ("250m", "hybrid-250m", Config::Ncm(ncm_model::ncm_250m_hybrid())),
+        ("1b", "tok-1b", Config::Tok(ncm_model::tok_1b())),
+        ("1b", "ncm-1b", Config::Ncm(ncm_model::ncm_1b())),
+        ("1b", "hybrid-1b", Config::Ncm(ncm_model::ncm_hybrid_1b())),
     ];
-    let results: Vec<Value> = models.iter().map(|(n, c)| estimate(n, c, cli)).collect();
+    let results: Vec<Value> = models
+        .iter()
+        .filter(|(size, _, _)| cli.size == "both" || cli.size == *size)
+        .map(|(_, n, c)| estimate(n, c, cli))
+        .collect();
     json!({
         "seq": cli.seq,
         "micro_batch": cli.micro_batch,
