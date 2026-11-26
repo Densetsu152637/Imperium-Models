@@ -442,7 +442,8 @@ async fn a_panic_in_generation_fails_the_request_and_health() {
 
 /// A panic inside the real engine's worker thread (the debug-build test hook): the request
 /// fails with the panic's message, a request queued behind it fails too instead of waiting
-/// forever, and the server answers 503 from then on.
+/// forever, and the server answers 503 from then on. Debug builds only, as the hook.
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn a_panic_in_the_engine_worker_breaks_the_server() {
     let engine = Arc::new(common::engine(common::tiny_tok_config(), 256));
