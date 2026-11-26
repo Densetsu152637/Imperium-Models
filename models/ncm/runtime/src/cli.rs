@@ -120,6 +120,13 @@ pub struct Cli {
     /// captures the decode graphs).
     #[arg(long)]
     pub no_warmup: bool,
+    /// Directory of the on-disk CUDA kernel cache (default: the user cache directory's
+    /// `ncm/kernels`): a restarted server skips compiling the kernels a previous run compiled.
+    #[arg(long, value_name = "DIR")]
+    pub kernel_cache_dir: Option<PathBuf>,
+    /// Compile every kernel anew instead of keeping them on disk.
+    #[arg(long)]
+    pub no_kernel_cache: bool,
     /// Quantise the linear layers' weights at load. A quantised weight file loads as it is.
     #[arg(long, value_enum, default_value = "none")]
     pub quant: QuantArg,

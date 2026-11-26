@@ -447,13 +447,29 @@ impl Core {
         Ok(core)
     }
 
-    /// Serves two throwaway requests (greedy, then sampled) long enough for the decode graphs
-    /// to be captured (past the NCM's cross-attention ring), compiling every kernel on the way,
-    /// then forgets them. Errors are ignored: a real request would meet them again.
-    // TODO: also call ncm-model's shape warm-up (prefill chunk shapes) once it exists.
+    /// Compiles the prefill kernels for a full prefill chunk (on a throwaway cache:
+    /// [`NcmLm::warm_up`], or the token baseline's equivalent), then serves two throwaway
+    /// requests (greedy, then sampled) long enough for the decode graphs to be captured (past
+    /// the NCM's cross-attention ring), compiling every decode kernel on the way, and forgets
+    /// them. Errors are ignored: a real request would meet them again.
     fn warm_up(&self) {
         let ids = self.vocab.ids;
         let unit = self.info.unit;
+        let shapes = self.chunk.min(self.capacity.saturating_sub(2 * unit)).max(unit);
+        {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match &*state {
+                State::Ncm { model, .. } => model.warm_up(shapes, self.chunk, &self.device),
+                State::Tok { model, .. } => {
+                    // A throwaway cache: a prefill of `shapes` tokens, then one step.
+                    let mut caches = model.make_cache(shapes + 1, 1, &self.device);
+                    let prompt = self.int_tensor(&vec![ids.pad as i32; shapes]);
+                    model.prefill(prompt, &mut caches, self.chunk);
+                    let logits = model.step(self.int_tensor(&[ids.pad as i32]), &mut caches);
+                    drop(logits.into_data());
+                }
+            }
+        }
         let len = (self.capacity / 2).clamp(unit, 1024);
         let never = AtomicBool::new(false);
         for sampling in [

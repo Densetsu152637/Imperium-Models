@@ -143,6 +143,13 @@ pub struct Cli {
     /// token-baseline steps) as captured CUDA graphs.
     #[arg(long)]
     pub no_cuda_graphs: bool,
+    /// Directory of the on-disk CUDA kernel cache (default: the user cache directory's
+    /// `ncm/kernels`).
+    #[arg(long, value_name = "DIR")]
+    pub kernel_cache_dir: Option<PathBuf>,
+    /// Compile every kernel anew instead of keeping them on disk.
+    #[arg(long)]
+    pub no_kernel_cache: bool,
     /// Also decode the NCM by self-speculation (the token baseline always decodes plainly).
     #[arg(long, value_enum, default_value = "off")]
     pub speculate: Speculate,
@@ -637,6 +644,11 @@ fn rate_ratios(a: &Rates, b: &Rates) -> Vec<(usize, f64)> {
 
 /// Run the benchmark described by `cli`; prints the report and returns the JSON payload.
 pub fn run(cli: &Cli) -> Result<Value, String> {
+    // Before the device is first used: CubeCL reads its configuration once per process.
+    #[cfg(feature = "cuda")]
+    if cli.device == DeviceChoice::Cuda && !cli.no_kernel_cache {
+        ncm_model::kernels::enable_kernel_cache(cli.kernel_cache_dir.clone());
+    }
     let mut device = make_device(cli.device)?;
     let dtype = cli.dtype.unwrap_or(match cli.device {
         DeviceChoice::Cuda => DtypeChoice::Bf16,
