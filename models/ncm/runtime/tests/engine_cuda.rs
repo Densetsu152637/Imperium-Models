@@ -19,6 +19,10 @@ use ncm_server::engine::{
 use ncm_server::sampling::SamplingParams;
 
 fn engine(config: Config, speculate: bool) -> Engine {
+    engine_slots(config, speculate, 1)
+}
+
+fn engine_slots(config: Config, speculate: bool, slots: usize) -> Engine {
     let options = EngineOptions {
         config,
         ctx: 256,
@@ -32,7 +36,7 @@ fn engine(config: Config, speculate: bool) -> Engine {
         speculate,
         prefix_reuse: true,
         warmup: false,
-        slots: 1,
+        slots,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
 }
@@ -124,5 +128,36 @@ fn graphed_paths_match_eager_and_sample_by_seed() {
         if p == prompt {
             assert_eq!(spec, plain, "speculative greedy differs from plain greedy");
         }
+    }
+}
+
+/// Batched slots on CUDA: greedy replies (token baseline through the slot-set graphs, the NCM
+/// eagerly) equal the sequential engine's, and seeded sampled replies repeat across runs.
+#[test]
+fn batched_slots_match_sequential_greedy_on_cuda() {
+    use std::sync::Arc;
+    let prompts = ["the quick brown fox jumps over the lazy dog", "a different prompt", "x"];
+    for config in configs() {
+        let one = engine(config.clone(), false);
+        let want: Vec<Vec<u32>> =
+            prompts.iter().map(|p| run(&one, p, SamplingParams::GREEDY).0).collect();
+        let batched = Arc::new(engine_slots(config, false, 3));
+        let sampled =
+            |seed| SamplingParams { temperature: 0.7, top_k: 0, top_p: 0.95, seed: Some(seed) };
+        let round = |sampling: &dyn Fn(usize) -> SamplingParams| {
+            let handles: Vec<_> = prompts
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| {
+                    let (engine, s) = (batched.clone(), sampling(i));
+                    std::thread::spawn(move || run(&engine, p, s).0)
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("request")).collect::<Vec<_>>()
+        };
+        assert_eq!(round(&|_| SamplingParams::GREEDY), want);
+        let a = round(&|i| sampled(i as u64));
+        let b = round(&|i| sampled(i as u64));
+        assert_eq!(a, b, "seeded rows repeat whatever the batch");
     }
 }

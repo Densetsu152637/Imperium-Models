@@ -322,6 +322,151 @@ impl TokenLm {
     }
 }
 
+/// Token-baseline decode steps of several separate streams (slots) batched together, as one
+/// captured CUDA graph per set of slots, captured lazily and kept (up to [`SLOT_GRAPHS`]):
+/// embedding, the batched stack step ([`crate::layers::Stack::forward_slots`], each slot's
+/// layers through its own [`crate::layers::StackStep`] and cursors), the logits, and the device
+/// sampler with one settings set per row ([`crate::sample::SampleParams::rows`]; greedy rows
+/// take [`crate::sample::SampleSettings::GREEDY`]). The slots' caches keep their buffers (reset,
+/// restore and copies write into them), so a graph serves its slot set across requests.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+pub struct GraphedTokSlots {
+    graphs: Vec<SlotsEntry>,
+}
+
+/// A slot set and its graph (or why its capture failed).
+#[cfg(feature = "cuda")]
+type SlotsEntry = (Vec<usize>, Result<Box<SlotsGraph>, String>);
+
+/// Slot sets [`GraphedTokSlots`] keeps graphs for; the oldest goes first.
+#[cfg(feature = "cuda")]
+pub const SLOT_GRAPHS: usize = 16;
+
+#[cfg(feature = "cuda")]
+struct SlotsGraph {
+    graph: crate::graph::Captured,
+    /// The rows' input tokens `[B, 1]` (i32).
+    input: Tensor<2, Int>,
+    steps: Vec<crate::layers::StackStep>,
+    cursors: Vec<crate::graph::CursorSet>,
+    staging: crate::graph::Staging,
+    params: crate::sample::SampleParams,
+    /// The rows' next tokens `[B, 1]`.
+    output: Tensor<2, Int>,
+}
+
+#[cfg(feature = "cuda")]
+impl GraphedTokSlots {
+    /// The next token `[B, 1]` of each slot of `key` (in order; `caches` theirs) after feeding
+    /// `tokens` `[B, 1]`, drawn per `settings` (one per row, counters as the requests stand),
+    /// from the slot set's graph (captured now if new). None when no graph can serve: the
+    /// caller steps eagerly. The returned tensor is the graph's output buffer: read it before
+    /// the next call for the same slots.
+    pub fn step(
+        &mut self,
+        model: &TokenLm,
+        key: &[usize],
+        tokens: Tensor<2, Int>,
+        caches: &mut [&mut [LayerCache]],
+        settings: &[crate::sample::SampleSettings],
+    ) -> Option<Tensor<2, Int>> {
+        let device = tokens.device();
+        if !crate::fused::graphs_active(&device) || tokens.dims()[1] != 1 {
+            return None;
+        }
+        if !self.graphs.iter().any(|(k, _)| k == key) {
+            if self.graphs.len() >= SLOT_GRAPHS {
+                drop(self.graphs.remove(0));
+            }
+            let graph = model.capture_slots(&tokens, caches, settings).map(Box::new);
+            self.graphs.push((key.to_vec(), graph));
+        }
+        let (_, Ok(g)) = self.graphs.iter_mut().find(|(k, _)| k == key)? else {
+            return None;
+        };
+        let tokens = tokens.cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(&g.input, tokens, 0, 0);
+        g.params.set_rows(settings);
+        for ((step, set), c) in g.steps.iter().zip(g.cursors.iter_mut()).zip(caches.iter()) {
+            step.refresh(&model.stack, c, set, &mut g.staging);
+            set.refresh(&mut g.staging);
+        }
+        g.staging.upload(&device);
+        // Safety: the graph's buffers are held by `g`, the model's weights and the slots'
+        // caches, all alive across the replay (which checks its thread).
+        unsafe { crate::graph::replay(&device, &g.graph, "batched token step") };
+        for (step, c) in g.steps.iter().zip(caches.iter_mut()) {
+            step.advance(c);
+        }
+        Some(g.output.clone())
+    }
+
+    /// Why a slot set's step runs eagerly, if its capture failed.
+    pub fn failure(&self, key: &[usize]) -> Option<&str> {
+        self.graphs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, g)| g.as_ref().err())
+            .map(String::as_str)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl TokenLm {
+    /// Warms up and records one batched step of the slots `caches` over fixed input buffers,
+    /// leaving the caches as they were.
+    fn capture_slots(
+        &self,
+        tokens: &Tensor<2, Int>,
+        caches: &mut [&mut [LayerCache]],
+        settings: &[crate::sample::SampleSettings],
+    ) -> Result<SlotsGraph, String> {
+        use crate::layers::StackStep;
+        let device = tokens.device();
+        let b = caches.len();
+        let mut staging = crate::graph::Staging::default();
+        let (mut steps, mut cursors) = (Vec::new(), Vec::new());
+        for c in caches.iter() {
+            let mut set = crate::graph::CursorSet::default();
+            steps.push(StackStep::new(&self.stack, c, 1, &mut set, &mut staging)?);
+            cursors.push(set);
+        }
+        let input = Tensor::<2, Int>::zeros([b, 1], &device).cast(burn::tensor::IntDType::I32);
+        crate::kernels::assign_int_into(
+            &input,
+            tokens.clone().cast(burn::tensor::IntDType::I32),
+            0,
+            0,
+        );
+        let params = crate::sample::SampleParams::rows(&device, b);
+        params.set_rows(settings);
+        for ((step, set), c) in steps.iter().zip(cursors.iter_mut()).zip(caches.iter()) {
+            step.refresh(&self.stack, c, set, &mut staging);
+            set.refresh(&mut staging);
+        }
+        staging.upload(&device);
+        let saved: Vec<_> = steps.iter().zip(caches.iter()).map(|(s, c)| s.save(c)).collect();
+        let run = |caches: &mut [&mut [LayerCache]]| {
+            staging.scatter();
+            let kv: Vec<_> = cursors.iter().map(crate::graph::CursorSet::steps).collect();
+            let refs: Vec<&StackStep> = steps.iter().collect();
+            let x = self.emb.forward(input.clone());
+            let h = StackStep::run_slots(&self.stack, &refs, x, caches, &kv);
+            let logits = self.logits(h);
+            let v = logits.dims()[2];
+            crate::sample::sample(logits.reshape([b, v]), &params, 0)
+        };
+        let undo = |caches: &mut [&mut [LayerCache]]| {
+            for (c, s) in caches.iter_mut().zip(&saved) {
+                StackStep::restore(c, s);
+            }
+        };
+        let (graph, output) = crate::graph::record(&device, caches, 2, run, undo)?;
+        Ok(SlotsGraph { graph, input, steps, cursors, staging, params, output })
+    }
+}
+
 /// Cache bytes at `max_tokens`; indexer keys (v2) at `index_itemsize`, the rest at `itemsize`.
 pub fn tok_cache_bytes(
     cfg: &TokConfig,

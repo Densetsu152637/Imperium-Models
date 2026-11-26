@@ -18,10 +18,12 @@
 //!    [`NcmLm::append_slots`] / [`NcmLm::decode_slots`]) runs the norms, input projections and
 //!    MLPs over all rows at once and each slot's attention against its own caches.
 //!
-//! Tokens are chosen on the host per slot (each request's own sampler, seed and constraint),
-//! except greedy unconstrained NCM tokens, picked on the device. The batched steps run eagerly
-//! (the captured graphs serve one slot: TODO graphs per slot set). With one slot the engine runs
-//! [`crate::engine`]'s sequential loop instead, unchanged.
+//! Tokens are chosen per slot with each request's own settings. On CUDA with graphs on, the
+//! token baseline's unconstrained rows replay one captured graph per set of decoding slots
+//! ([`ncm_model::tok::GraphedTokSlots`]: batched step and the device sampler with one settings
+//! set and counter per row), the rest step eagerly with host samplers; the NCM steps eagerly,
+//! greedy unconstrained tokens picked on the device (TODO: NCM graphs per slot set). With one
+//! slot the engine runs [`crate::engine`]'s sequential loop instead, unchanged.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -136,6 +138,11 @@ struct Active {
     rows: usize,
     empty_concepts: usize,
     forked: bool,
+    /// The next token, already drawn on the device by a batched graph replay.
+    next: Option<u32>,
+    /// The device sampler's settings (greedy: top-k 1), counter advanced per draw.
+    #[cfg(feature = "cuda")]
+    device: ncm_model::sample::SampleSettings,
 }
 
 struct Slot {
@@ -161,6 +168,9 @@ pub(crate) struct Batcher {
     clock: u64,
     /// The next prefilling slot to serve (round robin).
     next_prefill: usize,
+    /// The token baseline's batched step graphs, per slot set.
+    #[cfg(feature = "cuda")]
+    tok_graphs: ncm_model::tok::GraphedTokSlots,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -192,7 +202,17 @@ impl Batcher {
             };
             slots.push(Slot { caches, kept: Vec::new(), last_used: 0, active: None });
         }
-        Self { core, model, slots, queue: VecDeque::new(), report, clock: 0, next_prefill: 0 }
+        Self {
+            core,
+            model,
+            slots,
+            queue: VecDeque::new(),
+            report,
+            clock: 0,
+            next_prefill: 0,
+            #[cfg(feature = "cuda")]
+            tok_graphs: Default::default(),
+        }
     }
 
     /// Serves `jobs` until the engine is dropped, or a panic (recorded in `dead`; every request
@@ -363,6 +383,12 @@ impl Batcher {
             }
         };
         let phase = if out.is_some() { Phase::Decode } else { Phase::Prefill };
+        #[cfg(feature = "cuda")]
+        let device = if request.sampling.is_greedy() {
+            ncm_model::sample::SampleSettings::GREEDY
+        } else {
+            crate::engine::device_sampling(request.sampling)
+        };
         let cached = prefilled.saturating_sub(pad);
         let history = stream.clone();
         slot.active = Some(Active {
@@ -390,6 +416,9 @@ impl Batcher {
             rows: 0,
             empty_concepts: 0,
             forked: false,
+            next: None,
+            #[cfg(feature = "cuda")]
+            device,
         });
         if phase == Phase::Decode {
             self.prompt_done(i);
@@ -542,8 +571,13 @@ impl Batcher {
         let mut feed = Vec::new();
         for &i in rows {
             let a = self.slots[i].active.as_mut().expect("decoding");
-            let logits = read_logits(a.out.as_ref().expect("logits after the prompt"));
-            let token = a.sampler.pick(&logits, a.constraint.as_deref()).unwrap_or(ids.im_end);
+            let token = match a.next.take() {
+                Some(token) => token,
+                None => {
+                    let logits = read_logits(a.out.as_ref().expect("logits after the prompt"));
+                    a.sampler.pick(&logits, a.constraint.as_deref()).unwrap_or(ids.im_end)
+                }
+            };
             if let Some(c) = &mut a.constraint {
                 c.advance(token);
             }
@@ -553,6 +587,8 @@ impl Batcher {
                 None => feed.push((i, token as i32)),
             }
         }
+        #[cfg(feature = "cuda")]
+        let feed = self.tok_graph_step(feed);
         if feed.is_empty() {
             return;
         }
@@ -568,6 +604,44 @@ impl Batcher {
             a.history.push(token);
             a.out = Some(logits.clone().narrow(0, row, 1));
         }
+    }
+
+    /// Feeds the unconstrained rows of `feed` through their slot set's graph (CUDA, graphs on),
+    /// which also draws their next tokens; returns the rows left to step eagerly.
+    #[cfg(feature = "cuda")]
+    fn tok_graph_step(&mut self, feed: Vec<(usize, i32)>) -> Vec<(usize, i32)> {
+        if !ncm_model::fused::graphs_active(self.device()) {
+            return feed;
+        }
+        let (graphed, eager): (Vec<_>, Vec<_>) = feed.into_iter().partition(|&(i, _)| {
+            self.slots[i].active.as_ref().is_some_and(|a| a.constraint.is_none())
+        });
+        if graphed.is_empty() {
+            return eager;
+        }
+        let key: Vec<usize> = graphed.iter().map(|f| f.0).collect();
+        let tokens: Vec<i32> = graphed.iter().map(|f| f.1).collect();
+        let input = self.int_tensor(&tokens, tokens.len());
+        let settings: Vec<_> =
+            key.iter().map(|&i| self.slots[i].active.as_ref().expect("decoding").device).collect();
+        let Model::Tok(model) = &self.model else { unreachable!("the token baseline") };
+        let out = {
+            let mut caches = slot_caches_tok(&mut self.slots, &graphed);
+            self.tok_graphs.step(model, &key, input, &mut caches, &settings)
+        };
+        let Some(out) = out else {
+            // No graph for this set: everything steps eagerly.
+            return graphed.into_iter().chain(eager).collect();
+        };
+        let next = read_ids(&out);
+        for (row, &(i, token)) in graphed.iter().enumerate() {
+            let a = self.slots[i].active.as_mut().expect("decoding");
+            a.history.push(token);
+            a.next = Some(next[row]);
+            a.out = None;
+            a.device.counter = a.device.counter.wrapping_add(1);
+        }
+        eager
     }
 
     /// NCM: one concept per slot from its condition (pending prompt tokens forced first), then

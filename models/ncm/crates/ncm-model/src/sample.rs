@@ -113,7 +113,8 @@ mod kernel {
 
     /// Row `CUBE_POS` of `x` `[rows, n]`: `params` `[temperature, top_p, top_k, 0]` (f32), `state`
     /// `[seed_lo, seed_hi, counter]` (i32 bits); draw `counter + offset + row`. Writes the token to
-    /// `out[row]`.
+    /// `out[row]`. With one such set per row (`params` of `4 * rows`, `state` of `3 * rows`),
+    /// row r reads set r and draws `counter_r + offset`.
     #[cube(launch_unchecked)]
     pub(crate) fn sample_kernel<F: Float>(
         x: &Tensor<F>,
@@ -127,9 +128,13 @@ mod kernel {
         let row = CUBE_POS;
         let tid = UNIT_POS as usize;
         let mut part = Shared::<[f32]>::new_slice(PLANES);
-        let temperature = params[0];
-        let top_p = params[1];
-        let top_k = u32::cast_from(params[2]);
+        // One settings set for all rows, or one per row.
+        let per_row = params.len() > 4;
+        let pb = select(per_row, row * 4, 0);
+        let sb = select(per_row, row * 3, 0);
+        let temperature = params[pb];
+        let top_p = params[pb + 1];
+        let top_k = u32::cast_from(params[pb + 2]);
         // The largest logit and the lowest.
         let mut hi = f32::new(-3.0e38f32);
         let mut lo = f32::new(3.0e38f32);
@@ -142,8 +147,8 @@ mod kernel {
         }
         let hi = cube_max(hi, &mut part);
         let lo = -cube_max(-lo, &mut part);
-        let draw = u32::reinterpret(state[2]) + offset + row as u32;
-        let (s0, s1) = (u32::reinterpret(state[0]), u32::reinterpret(state[1]));
+        let draw = u32::reinterpret(state[sb + 2]) + offset + select(per_row, 0u32, row as u32);
+        let (s0, s1) = (u32::reinterpret(state[sb]), u32::reinterpret(state[sb + 1]));
         // Fast path: gather the candidates of the top-k cut into shared memory and finish there.
         if top_k > 0 && (top_k as usize) <= CAP {
             // Logits at or above `hi - range / 2^j`, j = 0..BANDS: the narrowest band holding
@@ -445,7 +450,8 @@ pub struct SampleParams {
 }
 
 /// What a sampled request asks for. `temperature` must be above 0 (greedy decoding takes the
-/// argmax instead); `top_k` 0 and `top_p` 1 keep every token.
+/// argmax instead, or [`SampleSettings::GREEDY`] in a batch of per-row settings); `top_k` 0 and
+/// `top_p` 1 keep every token.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SampleSettings {
     pub temperature: f32,
@@ -456,11 +462,42 @@ pub struct SampleSettings {
     pub counter: u32,
 }
 
+impl SampleSettings {
+    /// The largest logit (top-k 1), as a row of a batch of per-row settings.
+    pub const GREEDY: Self = Self { temperature: 1.0, top_k: 1, top_p: 1.0, seed: 0, counter: 0 };
+}
+
 impl SampleParams {
     pub fn new(device: &burn::tensor::Device) -> Self {
         let params = Tensor::<1>::zeros([4], (device, DType::F32));
         let state = Tensor::<1, Int>::zeros([3], device).cast(IntDType::I32);
         Self { params, state }
+    }
+
+    /// Buffers for one settings set per row of `rows` (separate requests batched together):
+    /// [`sample`] then reads row r's settings and draw counter from set r ([`Self::set_rows`]).
+    pub fn rows(device: &burn::tensor::Device, rows: usize) -> Self {
+        let params = Tensor::<1>::zeros([4 * rows], (device, DType::F32));
+        let state = Tensor::<1, Int>::zeros([3 * rows], device).cast(IntDType::I32);
+        Self { params, state }
+    }
+
+    /// Copies one settings set per row into [`Self::rows`]' buffers (in place). A greedy row
+    /// takes `top_k` 1.
+    pub fn set_rows(&self, settings: &[SampleSettings]) {
+        let device = self.params.device();
+        let p: Vec<f32> =
+            settings.iter().flat_map(|s| [s.temperature, s.top_p, s.top_k as f32, 0.0]).collect();
+        let n = p.len();
+        let p = Tensor::<1>::from_data(TensorData::new(p, [n]), (&device, DType::F32));
+        crate::kernels::assign_into(&self.params, p, 0, 0);
+        let s: Vec<i32> = settings
+            .iter()
+            .flat_map(|s| [s.seed as u32 as i32, (s.seed >> 32) as u32 as i32, s.counter as i32])
+            .collect();
+        let n = s.len();
+        let s = Tensor::<1, Int>::from_data(TensorData::new(s, [n]), &device).cast(IntDType::I32);
+        crate::kernels::assign_int_into(&self.state, s, 0, 0);
     }
 
     /// Copies `settings` into the device buffers (in place: a captured graph keeps reading

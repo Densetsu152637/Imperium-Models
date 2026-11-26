@@ -1088,3 +1088,32 @@ pub fn attend_decode_matches(device: &Device, tol: f32) {
         assert_close(&what, &got, &want, &want, tol);
     }
 }
+
+/// Per-row settings ([`ncm_model::sample::SampleParams::rows`]): each row samples with its own
+/// settings and counter, a greedy row (top-k 1) takes its argmax, and a row's draws do not
+/// depend on the other rows (the same row alone, with the same counter, draws the same token).
+pub fn sampler_rows_are_independent(device: &Device) {
+    use ncm_model::sample::{SampleParams, sample};
+    let logits: Vec<f32> = vec![1.2, -0.4, 2.0, 0.3, 1.9, -2.0, 0.0, 1.1, 0.8, -1.0, 0.5, 1.95];
+    let v = logits.len();
+    let rows = 4;
+    let data: Vec<f32> = (0..rows).flat_map(|_| logits.clone()).collect();
+    let x = Tensor::<2>::from_data(TensorData::new(data, [rows, v]), device);
+    let settings = [
+        SampleSettings::GREEDY,
+        SampleSettings { temperature: 0.7, top_k: 0, top_p: 0.95, seed: 1, counter: 3 },
+        SampleSettings { temperature: 1.3, top_k: 5, top_p: 1.0, seed: 2, counter: 9 },
+        SampleSettings { temperature: 0.7, top_k: 0, top_p: 0.95, seed: 1, counter: 3 },
+    ];
+    let params = SampleParams::rows(device, rows);
+    params.set_rows(&settings);
+    let drawn = ints(sample(x.clone(), &params, 0));
+    assert_eq!(drawn[0], 2, "the greedy row takes the argmax");
+    assert_eq!(drawn[1], drawn[3], "equal settings and counters draw alike");
+    for (r, s) in settings.iter().enumerate() {
+        let one = SampleParams::rows(device, 1);
+        one.set_rows(&[*s]);
+        let alone = ints(sample(x.clone().narrow(0, r, 1), &one, 0));
+        assert_eq!(alone[0], drawn[r], "row {r} alone");
+    }
+}

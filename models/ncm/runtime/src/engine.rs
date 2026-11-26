@@ -562,7 +562,7 @@ impl Core {
 
 /// The device sampler's settings for a sampled request.
 #[cfg(feature = "cuda")]
-fn device_sampling(params: SamplingParams) -> ncm_model::sample::SampleSettings {
+pub(crate) fn device_sampling(params: SamplingParams) -> ncm_model::sample::SampleSettings {
     ncm_model::sample::SampleSettings {
         temperature: params.temperature,
         top_k: params.top_k,

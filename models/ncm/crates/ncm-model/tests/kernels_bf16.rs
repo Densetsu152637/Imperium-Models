@@ -175,3 +175,9 @@ fn fused_rope_matches_reference_bf16() {
     let (device, _lock) = setup(DTYPE);
     fused_rope_matches(&device, TOL);
 }
+
+#[test]
+fn sampler_rows_are_independent_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    sampler_rows_are_independent(&device);
+}

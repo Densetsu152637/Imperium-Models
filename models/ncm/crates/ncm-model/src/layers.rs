@@ -1360,7 +1360,6 @@ impl StackStep {
 
     /// [`Self::run`] for a batch of separate streams: row i through `steps[i]` (its own fixed
     /// tables and cursors, the latter indexing `kv[i]`, its cursor set's steps) and `caches[i]`.
-    #[allow(dead_code)] // graphs per slot set (next commit)
     pub(crate) fn run_slots(
         stack: &Stack,
         steps: &[&StackStep],
