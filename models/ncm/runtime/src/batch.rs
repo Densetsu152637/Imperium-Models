@@ -26,7 +26,9 @@
 //! token baseline's unconstrained rows replay one captured graph per set of decoding slots
 //! ([`ncm_model::tok::GraphedTokSlots`]: batched step and the device sampler with one settings
 //! set and counter per row), the rest step eagerly with host samplers; the NCM steps eagerly,
-//! greedy unconstrained tokens picked on the device (TODO: NCM graphs per slot set). With one
+//! greedy unconstrained tokens picked on the device (TODO: NCM graphs per slot set); with
+//! `--speculate` and a draft head, all-greedy slot sets write their concepts by batched
+//! self-speculation instead ([`ncm_model::speculate_slots`]). With one
 //! slot the engine runs [`crate::engine`]'s sequential loop instead, unchanged.
 //!
 //! The NCM hybrid batches at block granularity: each decoding slot has an open block
@@ -1040,6 +1042,9 @@ impl Batcher {
     /// of the slot set, [`ncm_model::ncm::GraphedNcmSlots`]); then the next concept is written
     /// from each slot's condition (pending prompt tokens forced first).
     fn ncm_step(&mut self, rows: &[usize]) {
+        if self.core.speculate && self.ncm_speculate_step(rows) {
+            return;
+        }
         #[cfg(feature = "cuda")]
         if let Some(picked) = self.ncm_graph_step(rows) {
             self.ncm_emit(rows, &picked, &vec![0; rows.len()]);
@@ -1110,6 +1115,44 @@ impl Batcher {
         let picked = read_ids(&picked);
         let skips: Vec<usize> = forced.iter().map(Vec::len).collect();
         self.ncm_emit(rows, &picked, &skips);
+    }
+
+    /// `--speculate`: when every slot of `rows` decodes greedily, unconstrained and with no
+    /// pending prompt tokens, and the model has a draft head, writes their next concepts by
+    /// batched self-speculation ([`ncm_model::speculate_slots`]: one draft pass over all the
+    /// slots, then verify passes over the slots still open, the decoder's cross-attention per
+    /// slot and everything else batched). Returns false (nothing done) otherwise.
+    fn ncm_speculate_step(&mut self, rows: &[usize]) -> bool {
+        let Model::Ncm(model) = &self.model else { return false };
+        if !model.has_draft_head() {
+            return false;
+        }
+        let plain = rows.iter().all(|&i| {
+            let a = self.slots[i].active.as_ref().expect("decoding");
+            a.sampler.is_greedy() && a.constraint.is_none() && a.pending.is_empty()
+        });
+        if !plain {
+            return false;
+        }
+        self.ncm_append_deferred(rows);
+        let Model::Ncm(model) = &self.model else { unreachable!("the NCM") };
+        let cond = Tensor::cat(
+            rows.iter()
+                .map(|&i| {
+                    self.slots[i].active.as_ref().expect("decoding").out.clone().expect("cond")
+                })
+                .collect(),
+            0,
+        );
+        let mut stats = ncm_model::SpecStats::default();
+        let picked = {
+            let (caches, _) = slot_caches_ncm(&mut self.slots, rows);
+            let caches: Vec<&NcmCache> = caches.into_iter().map(|c| &*c).collect();
+            ncm_model::speculate_slots(model, cond, &caches, &mut stats)
+        };
+        let picked: Vec<u32> = picked.into_iter().map(|t| t as u32).collect();
+        self.ncm_emit(rows, &picked, &vec![0; rows.len()]);
+        true
     }
 
     /// Appends the concepts the slots of `rows` wrote last step (those that have one) in one

@@ -86,6 +86,24 @@ impl DraftBlock {
     }
 }
 
+impl DraftBlock {
+    /// [`Self::forward`] of one concept per batch row, the rows separate streams (slots):
+    /// `x` `[B, k, d]`, row i's cross-attention over `kvs[i]` at the positions `rope_q[i]`.
+    fn forward_slots(
+        &self,
+        x: Tensor<3>,
+        rope_self: &Rope,
+        rope_q: &[Rope],
+        kvs: &[(Tensor<4>, Tensor<4>)],
+    ) -> Tensor<3> {
+        let h = crate::fused::rms_norm(&self.n1, x.clone());
+        let x = x + self.self_attn.forward_masked(h, rope_self, None);
+        let h = crate::fused::rms_norm(&self.n2, x.clone());
+        let x = x + self.cross.forward_rows(h, rope_q, kvs);
+        x.clone() + self.mlp.forward(crate::fused::rms_norm(&self.n3, x))
+    }
+}
+
 /// The parallel draft head on the local decoder: every token of a concept in one pass.
 #[derive(Module, Debug)]
 pub struct DraftHead {
@@ -121,6 +139,25 @@ impl DraftHead {
         let mut x = slots + cond;
         for (blk, (keys, values)) in self.blocks.iter().zip(kvs) {
             x = blk.forward(x, rope_self, rope_q, keys.clone(), values.clone(), mask.clone());
+        }
+        x
+    }
+
+    /// [`Self::forward`] of one concept per batch row, the rows separate streams (slots):
+    /// `cond` `[B, 1, d]`; block l's row i attends to `kvs[l][i]` (decoder layer l's ring of
+    /// slot i) at the positions `rope_q[i]`. Returns `[B, k, d]`.
+    pub(crate) fn forward_slots(
+        &self,
+        cond: Tensor<3>,
+        rope_self: &Rope,
+        rope_q: &[Rope],
+        kvs: &[Vec<(Tensor<4>, Tensor<4>)>],
+    ) -> Tensor<3> {
+        let [b, _, d] = cond.dims();
+        let k = self.slots.dims()[0];
+        let mut x = self.slots.val().reshape([1, k, d]).expand([b, k, d]) + cond;
+        for (blk, layer) in self.blocks.iter().zip(kvs) {
+            x = blk.forward_slots(x, rope_self, rope_q, layer);
         }
         x
     }
@@ -429,6 +466,63 @@ impl Speculator {
         let [b, k] = guess.dims();
         crate::fused::argmax_last(model.verify_concept(cond.clone(), cache, guess)).reshape([b, k])
     }
+}
+
+/// Greedy self-speculative decoding of one concept per slot, the slots batched: one draft pass
+/// over every slot ([`NcmLm::draft_slots`]), then verify passes ([`NcmLm::verify_slots`]) over
+/// the slots whose concept is not settled yet, each settling at least one more token per slot,
+/// with the same acceptance as [`Speculator::decode`] (a drafted token is kept while it equals
+/// the decoder's pick on its settled prefix). `cond` `[B, 1, d]`, row i decoding against
+/// `caches[i]` (only read). Returns the concepts `[B, k]` (as host ids, row-major) and adds to
+/// `stats`. Equal to [`NcmLm::decode_slots`] with argmax picks, up to rounding at near-ties.
+pub fn speculate_slots(
+    model: &NcmLm,
+    cond: Tensor<3>,
+    caches: &[&NcmCache],
+    stats: &mut SpecStats,
+) -> Vec<i64> {
+    let [b, _, _] = cond.dims();
+    let k = model.concept_size();
+    let device = cond.device();
+    let draft = crate::fused::argmax_last(model.draft_slots(cond.clone(), caches));
+    let mut guess = ints(draft.reshape([b, k]));
+    let mut settled = vec![0usize; b];
+    let mut open: Vec<usize> = (0..b).collect();
+    while !open.is_empty() {
+        let n = open.len();
+        let rows_cond = if n == b {
+            cond.clone()
+        } else {
+            Tensor::cat(open.iter().map(|&r| cond.clone().narrow(0, r, 1)).collect(), 0)
+        };
+        let rows_caches: Vec<&NcmCache> = open.iter().map(|&r| caches[r]).collect();
+        let tokens: Vec<i64> =
+            open.iter().flat_map(|&r| guess[r * k..(r + 1) * k].to_vec()).collect();
+        let tokens = upload(&tokens, [n, k], &device);
+        let logits = model.verify_slots(rows_cond, &rows_caches, tokens);
+        let picks = ints(crate::fused::argmax_last(logits).reshape([n, k]));
+        stats.verify_passes += 1;
+        for (o, &r) in open.iter().enumerate() {
+            let (g, v) = (&mut guess[r * k..(r + 1) * k], &picks[o * k..(o + 1) * k]);
+            let mut j = settled[r];
+            while j < k {
+                stats.judged += 1;
+                let keep = g[j] == v[j];
+                if !keep {
+                    g[j] = v[j];
+                }
+                stats.accepted += keep as usize;
+                j += 1;
+                if !keep {
+                    break;
+                }
+            }
+            settled[r] = j;
+        }
+        open.retain(|&r| settled[r] < k);
+    }
+    stats.concepts += b;
+    guess
 }
 
 /// Keeps drafted token `x` (None) with probability `min(1, p[x] / q[x])` (`u` uniform in

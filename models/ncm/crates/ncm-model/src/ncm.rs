@@ -97,6 +97,25 @@ impl DecoderBlock {
 }
 
 impl DecoderBlock {
+    /// [`Self::forward_train`] of one concept per batch row, the rows separate streams (slots):
+    /// `x` `[B, k, d]` teacher-forced, causal within the concept (`causal` `[k, k]`), row i's
+    /// cross-attention over `kvs[i]` at the positions `rope_q[i]`. Norms, self-attention and the
+    /// MLP run batched (no cache), the cross-attention per row.
+    fn verify_slots(
+        &self,
+        x: Tensor<3>,
+        rope_self: &Rope,
+        rope_q: &[Rope],
+        causal: Tensor<2, Bool>,
+        kvs: &[(Tensor<4>, Tensor<4>)],
+    ) -> Tensor<3> {
+        let h = rms_norm_fused(&self.n1, x.clone());
+        let x = x + self.self_attn.forward_masked(h, rope_self, Some(causal));
+        let h = rms_norm_fused(&self.n2, x.clone());
+        let x = x + self.cross.forward_rows(h, rope_q, kvs);
+        x.clone() + self.mlp.forward(rms_norm_fused(&self.n3, x))
+    }
+
     /// [`Self::step`] for a batch whose rows are separate streams (slots): row i's
     /// self-attention cache and cross-attention ring are `caches[i]`, its query positions
     /// `rope_q[i]`. Norms and the MLP run batched, the attentions once per row.
@@ -872,6 +891,48 @@ impl NcmLm {
         let rope_q = self.rope(cache.tokens, self.k, &device);
         let causal = self.causal_mask(&device);
         self.verify_with_ropes(cond, cache, tokens, &rope_self, &rope_q, causal)
+    }
+
+    /// [`Self::draft_concept`] of one concept per batch row, the rows separate streams (slots):
+    /// `cond` `[B, 1, d]`, row i against `caches[i]` (only read). Returns logits `[B, k, V]`.
+    pub fn draft_slots(&self, cond: Tensor<3>, caches: &[&NcmCache]) -> Tensor<3> {
+        let head = self.draft.as_ref().expect("speculative decoding needs a draft head");
+        let device = cond.device();
+        let rope_self = self.rope(0, self.k, &device);
+        let rope_q: Vec<Rope> =
+            caches.iter().map(|c| self.rope(c.tokens, self.k, &device)).collect();
+        let kvs: Vec<Vec<(Tensor<4>, Tensor<4>)>> = (0..self.dec_blocks.len())
+            .map(|l| caches.iter().map(|c| c.cross[l].view()).collect())
+            .collect();
+        let x = head.forward_slots(cond, &rope_self, &rope_q, &kvs);
+        head.logits(self, x)
+    }
+
+    /// [`Self::verify_concept`] of one concept per batch row, the rows separate streams
+    /// (slots): `cond` `[B, 1, d]`, `tokens` `[B, k]`, row i against `caches[i]` (only read).
+    /// Returns logits `[B, k, V]`: row i, position j is the decoder's distribution for token j
+    /// given `tokens[i, ..j]`.
+    pub fn verify_slots(
+        &self,
+        cond: Tensor<3>,
+        caches: &[&NcmCache],
+        tokens: Tensor<2, Int>,
+    ) -> Tensor<3> {
+        let (k, d) = (self.k, self.local_dim);
+        let [b, _, _] = cond.dims();
+        let device = cond.device();
+        let rope_self = self.rope(0, k, &device);
+        let rope_q: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, k, &device)).collect();
+        let causal = self.causal_mask(&device);
+        let written = self.emb.forward(tokens.narrow(1, 0, k - 1));
+        let start = self.start_emb.val().reshape([1, 1, d]).expand([b, 1, d]);
+        let mut x = Tensor::cat(vec![start, written], 1) + cond;
+        for (l, blk) in self.dec_blocks.iter().enumerate() {
+            let kvs: Vec<(Tensor<4>, Tensor<4>)> =
+                caches.iter().map(|c| c.cross[l].view()).collect();
+            x = blk.verify_slots(x, &rope_self, &rope_q, causal.clone(), &kvs);
+        }
+        self.logits(x)
     }
 
     /// [`Self::draft_concept`] with the RoPE tables given.

@@ -396,9 +396,8 @@ pub(crate) struct Core {
     /// Tokens the caches hold.
     pub(crate) capacity: usize,
     pub(crate) prefix_reuse: bool,
-    /// Read by the graphed paths (CUDA builds).
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    speculate: bool,
+    /// Read by the graphed paths and the batcher's speculative NCM step.
+    pub(crate) speculate: bool,
     pub(crate) state: Mutex<State>,
     /// The NCM hybrid and its decode session (then `state` is empty).
     hybrid: Option<Mutex<HybridState>>,

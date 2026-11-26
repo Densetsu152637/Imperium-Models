@@ -874,6 +874,30 @@ impl CrossQuery {
     ) -> Tensor<3> {
         cross_attend(&self.q, &self.o, self.heads, self.head_dim, x, rope_q, keys, values, mask)
     }
+
+    /// [`Self::forward`] for batch rows that are separate streams: row i of `x` `[B, T, d]` at
+    /// the positions of `ropes[i]` against `kvs[i]`; the projections once over every row, the
+    /// attention per row.
+    pub fn forward_rows(
+        &self,
+        x: Tensor<3>,
+        ropes: &[Rope],
+        kvs: &[(Tensor<4>, Tensor<4>)],
+    ) -> Tensor<3> {
+        let [b, t, _] = x.dims();
+        let (h, hd) = (self.heads, self.head_dim);
+        let q = self.q.forward(x).reshape([b, t, h, hd]).swap_dims(1, 2);
+        let rows: Vec<Tensor<4>> = kvs
+            .iter()
+            .enumerate()
+            .map(|(i, (keys, values))| {
+                let qi = apply_rope(q.clone().narrow(0, i, 1), &ropes[i]);
+                attend(qi, keys.clone(), values.clone(), None)
+            })
+            .collect();
+        let out = Tensor::cat(rows, 0);
+        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * hd]))
+    }
 }
 
 /// Queries `x` `[B, T, d]` through `q`, attends over `keys` and `values` `[B, KVH, S, D]` and

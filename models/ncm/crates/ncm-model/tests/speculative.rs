@@ -94,6 +94,54 @@ fn speculative_greedy_equals_plain_greedy() {
     }
 }
 
+/// Batched self-speculation over slots at different positions equals each slot's plain greedy
+/// concept, and the slot draft and verify passes equal the single-stream ones.
+#[test]
+fn slot_speculation_equals_plain_greedy() {
+    for cfg in designs() {
+        let device = device();
+        device.seed(3);
+        let model = NcmLm::new(&cfg, &device);
+        let mut caches = Vec::new();
+        let mut conds = Vec::new();
+        for (i, len) in [2 * cfg.k, 5 * cfg.k, 3 * cfg.k].into_iter().enumerate() {
+            let mut cache = model.make_cache(len + cfg.k * CONCEPTS, 1, &device);
+            conds.push(model.prefill(
+                tokens(&device, cfg.vocab_size, len, i as u64),
+                &mut cache,
+                8,
+            ));
+            caches.push(cache);
+        }
+        for step in 0..4 {
+            let want: Vec<i64> = conds
+                .iter()
+                .zip(caches.iter_mut())
+                .flat_map(|(c, cache)| ints(model.decode_concept(c.clone(), cache, None, false).0))
+                .collect();
+            let cond = Tensor::cat(conds.clone(), 0);
+            let refs: Vec<&NcmCache> = caches.iter().collect();
+            let draft = values(model.draft_slots(cond.clone(), &refs));
+            let single: Vec<f32> = conds
+                .iter()
+                .zip(&caches)
+                .flat_map(|(c, cache)| values(model.draft_concept(c.clone(), cache)))
+                .collect();
+            assert!(max_diff(&draft, &single) < 1e-4, "{} draft step {step}", cfg.attention.name());
+            let mut stats = ncm_model::SpecStats::default();
+            let got = ncm_model::speculate_slots(&model, cond, &refs, &mut stats);
+            assert_eq!(got, want, "{} step {step}", cfg.attention.name());
+            assert_eq!(stats.concepts, 3);
+            for (r, cache) in caches.iter_mut().enumerate() {
+                let next: Vec<i32> =
+                    got[r * cfg.k..(r + 1) * cfg.k].iter().map(|&t| t as i32).collect();
+                let next = Tensor::from_data(TensorData::new(next, [1, cfg.k]), &device);
+                conds[r] = model.append_tokens(next, cache);
+            }
+        }
+    }
+}
+
 /// Drafts that are right, right up to slot `good`, or wrong everywhere: the output is plain
 /// greedy decoding every time, and a concept takes one verify pass per rejected slot before
 /// the last, plus one.
