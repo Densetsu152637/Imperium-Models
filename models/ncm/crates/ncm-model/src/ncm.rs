@@ -108,24 +108,15 @@ impl DecoderBlock {
         caches: &mut [(&mut KvCache, &KvCache)],
         pending: Option<Tensor<3>>,
     ) -> (Tensor<3>, Option<Tensor<3>>) {
+        // Projections once over every slot's row, the attention per slot.
         let (x, h) = norm_after(&self.n1, x, pending);
-        let attn: Vec<Tensor<3>> = caches
-            .iter_mut()
-            .enumerate()
-            .map(|(i, (own, _))| {
-                self.self_attn.forward(h.clone().narrow(0, i, 1), rope_self, Some(&mut **own))
-            })
-            .collect();
-        let (x, h) = add_rms_norm(&self.n2, x, Tensor::cat(attn, 0));
-        let crossed: Vec<Tensor<3>> = caches
-            .iter()
-            .enumerate()
-            .map(|(i, (_, ring))| {
-                let (keys, values) = ring.view();
-                self.cross.forward(h.clone().narrow(0, i, 1), &rope_q[i], keys, values, None)
-            })
-            .collect();
-        let crossed = Tensor::cat(crossed, 0);
+        let attn = {
+            let mut own: Vec<&mut KvCache> = caches.iter_mut().map(|(own, _)| &mut **own).collect();
+            self.self_attn.forward_rows(h, rope_self, &mut own)
+        };
+        let (x, h) = add_rms_norm(&self.n2, x, attn);
+        let kvs: Vec<(Tensor<4>, Tensor<4>)> = caches.iter().map(|(_, ring)| ring.view()).collect();
+        let crossed = self.cross.forward_rows(h, rope_q, &kvs);
         if let Some(x) = self.mlp.residual_step(&self.n3, &x, Some(&crossed)) {
             return (x, None);
         }
@@ -570,12 +561,13 @@ impl NcmLm {
                 caches.iter_mut().map(|c| c.encoder.as_mut_slice()).collect();
             self.encoder.forward_slots(x, &mut enc)
         };
-        for (i, cache) in caches.iter_mut().enumerate() {
-            let rope_k = self.rope(cache.tokens, k, &device);
-            let row = states.clone().narrow(0, i, 1);
-            for (blk, ring) in self.dec_blocks.iter().zip(cache.cross.iter_mut()) {
-                let (keys, values) = blk.cross.make_kv(row.clone(), &rope_k);
-                ring.write(keys, values);
+        // The cross-attention key/value projections once over every slot's row, RoPE and the
+        // ring write per slot.
+        let ropes: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, k, &device)).collect();
+        for (l, blk) in self.dec_blocks.iter().enumerate() {
+            let kvs = blk.cross.make_kv_rows(states.clone(), &ropes);
+            for (cache, (keys, values)) in caches.iter_mut().zip(kvs) {
+                cache.cross[l].write(keys, values);
             }
         }
         let concepts = self.pool.forward(states.reshape([b, 1, k * self.local_dim]));

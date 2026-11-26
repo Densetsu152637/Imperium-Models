@@ -23,7 +23,7 @@ use burn::nn::{Linear as DenseLinear, RmsNorm};
 use burn::tensor::activation::{relu, sigmoid, softmax};
 use burn::tensor::{Bool, Device, Int, IntDType, Tensor, s};
 
-use crate::layers::{Rope, apply_rope, dense_linear, linear, rms_norm};
+use crate::layers::{MixOut, Rope, apply_rope, dense_linear, linear, rms_norm};
 use crate::quant::QLinear as Linear;
 
 /// Shape of a sparse retrieval layer.
@@ -438,7 +438,7 @@ impl SparseRetrieval {
     /// The fused one-token decode ([`crate::kernels::retrieval_decode`]): the same cache write,
     /// selection and attention as the reference, between the two projections.
     #[cfg(feature = "cuda")]
-    fn decode_fused(&self, p: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
+    fn decode_fused(&self, p: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> MixOut {
         let pos = cache.length;
         assert!(pos < cache.capacity, "cache capacity {} exceeded", cache.capacity);
         let dims = self.kernel_dims();
@@ -459,7 +459,8 @@ impl SparseRetrieval {
             dims,
         );
         cache.length += 1;
-        self.o.forward(out)
+        // The combine kernel has applied the gate.
+        MixOut { x: out, gate: None }
     }
 
     /// `x` `[B, T, d]` at absolute positions `start..start + T`; `rope` holds the tables of those
@@ -483,14 +484,30 @@ impl SparseRetrieval {
     }
 
     /// [`Self::forward`] from the input projection `p` `[B, T, W]`.
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     pub(crate) fn forward_projected(
         &self,
         p: Tensor<3>,
         start: usize,
         rope: &Rope,
-        mut cache: Option<&mut LatentCache>,
+        cache: Option<&mut LatentCache>,
     ) -> Tensor<3> {
+        self.project_out(self.core_projected(p, start, rope, cache))
+    }
+
+    /// The output projection of [`Self::core_projected`]'s result.
+    pub(crate) fn project_out(&self, out: MixOut) -> Tensor<3> {
+        out.project(&self.o)
+    }
+
+    /// [`Self::forward_projected`] up to the output projection.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    pub(crate) fn core_projected(
+        &self,
+        p: Tensor<3>,
+        start: usize,
+        rope: &Rope,
+        mut cache: Option<&mut LatentCache>,
+    ) -> MixOut {
         #[cfg(feature = "cuda")]
         if let Some(c) = cache.as_deref_mut()
             && p.dims()[1] == 1
@@ -538,7 +555,7 @@ impl SparseRetrieval {
                 #[cfg(feature = "cuda")]
                 if t > 1 && !self.dense && crate::fused::active(&q_nope.device()) {
                     let out = self.attend_prefill(q_nope, q_rope, &index, cache, start);
-                    return self.output(out, gate);
+                    return MixOut::heads(out, Some(sigmoid(gate)));
                 }
                 let (kv, keys) = cache.view();
                 if t == 1 && !self.dense {
@@ -549,13 +566,7 @@ impl SparseRetrieval {
                 }
             }
         };
-        self.output(out, gate)
-    }
-
-    /// The attention output `[B, H, T, dv]` gated by `gate` `[B, T, H dv]` and projected.
-    fn output(&self, out: Tensor<4>, gate: Tensor<3>) -> Tensor<3> {
-        let [b, h, t, dv] = out.dims();
-        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * dv]) * sigmoid(gate))
+        MixOut::heads(out, Some(sigmoid(gate)))
     }
 
     /// Sparse prefill of `T > 1` queries at positions `start..` whose entries are already in
