@@ -26,6 +26,11 @@ pub enum DeviceArg {
     Cpu,
     /// Needs a build with `--features cuda`.
     Cuda,
+    /// ONNX Runtime's CPU execution provider over an `ncm-export` directory (`--model <dir>`);
+    /// needs a build with `--features ort` and the ONNX Runtime shared library
+    /// (`--ort-lib` or `ORT_DYLIB_PATH`). The token baseline only.
+    #[value(name = "ort-cpu")]
+    OrtCpu,
 }
 
 /// Weight-only quantisation of the linear layers (see `ncm_model::quant`).
@@ -89,9 +94,16 @@ pub struct Cli {
     /// requests one at a time.
     #[arg(long, default_value_t = 1)]
     pub parallel: usize,
-    /// `cuda` when built with it and `--n-gpu-layers` is not 0, else `cpu`.
+    /// `cuda` when built with it and `--n-gpu-layers` is not 0, else `cpu`; `ort-cpu` runs an
+    /// ONNX export on ONNX Runtime (`-ngl` is ignored there).
     #[arg(long, value_enum)]
     pub device: Option<DeviceArg>,
+    /// The ONNX Runtime shared library for `--device ort-cpu` (default: `ORT_DYLIB_PATH`).
+    #[arg(long, value_name = "PATH")]
+    pub ort_lib: Option<PathBuf>,
+    /// Accept an ONNX Runtime whose version differs from the one this build is pinned to.
+    #[arg(long)]
+    pub ort_allow_version_skew: bool,
     /// `bf16` on CUDA, `f32` on CPU.
     #[arg(long, value_enum)]
     pub dtype: Option<DtypeArg>,
@@ -221,6 +233,17 @@ impl Cli {
                 notes.push(format!(
                     "{name} {kind}: quantised caches are not implemented; the cache keeps the model dtype"
                 ));
+            }
+        }
+        if self.device == Some(DeviceArg::OrtCpu) {
+            if self.n_gpu_layers.is_some() {
+                notes.push("--n-gpu-layers ignored: --device ort-cpu runs on the CPU".into());
+            }
+            if self.quant != QuantArg::None {
+                notes.push(
+                    "--quant ignored: an ONNX export carries the quantisation it was exported with"
+                        .into(),
+                );
             }
         }
         if self.mmproj.is_some() {

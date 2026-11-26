@@ -1,0 +1,32 @@
+[package]
+name = "ncm-ort"
+description = "ONNX Runtime backend of the NCM engine interface (CPU execution provider; NPU providers later), over ncm-export's graphs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The parity tests run graphs on ONNX Runtime, which needs its shared library (`ORT_DYLIB_PATH`):
+# off by default so `cargo test --workspace` works without one; CI turns it on after fetching a
+# pinned release (`scripts/check.sh`).
+ort-tests = []
+
+[[test]]
+name = "parity"
+required-features = ["ort-tests"]
+
+[dependencies]
+ncm-exec = { path = "../ncm-exec" }
+thiserror = { workspace = true }
+# ONNX Runtime bindings, MIT OR Apache-2.0; ONNX Runtime itself is MIT. `load-dynamic`: the
+# server links nothing, and loads the shared library named by `ORT_DYLIB_PATH` (or `--ort-lib`)
+# at start-up. rc.15 targets ONNX Runtime 1.31; keep this pin and `scripts/check.sh`'s in step.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+
+[dev-dependencies]
+ncm-export = { path = "../ncm-export" }
+ncm-model = { path = "../ncm-model" }
+burn = { workspace = true, features = ["flex"] }
+tempfile = "3"

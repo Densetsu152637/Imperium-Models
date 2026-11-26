@@ -98,9 +98,28 @@ aligned to 4 KiB; a weight appears once whatever number of graphs use it) and `m
 
 ## The ONNX Runtime backend (`ncm-ort`)
 
-See `crates/ncm-ort/src/lib.rs` and `runtime/README.md`: `--device ort-cpu` (build with
-`--features ort`), `ONNXRUNTIME` shared library from `ORT_DYLIB_PATH`, the version pin in
-`scripts/check.sh`.
+`OrtBackend::load(dir)` reads `manifest.json`, creates one ONNX Runtime session per graph on the
+CPU execution provider (`ort` 2.0.0-rc.15, `load-dynamic`: nothing is linked; the library comes
+from `--ort-lib`, `ORT_DYLIB_PATH` or the platform name) and refuses a library whose minor
+version is not the one `ort` targets (1.31) unless `--ort-allow-version-skew`. The pin lives in
+`crates/ncm-ort/Cargo.toml` and `scripts/check.sh`.
+
+- **State is host-owned**: attention rings are written in place at `position % ring` (so a
+  restore is a `memcpy` into the same buffers), DeltaNet states stay f32, convolution windows
+  are kept per layer. Each run copies buffers into input tensors and the new entries out of the
+  outputs; ONNX Runtime IO binding (zero-copy inputs) is the obvious next optimisation.
+- **Masks**: the additive bias of an attention layer is built on the host per call (ring slot
+  `s` holds the latest position `p < len` with `p % ring == s`; a query sees the previous
+  `ring` positions and itself), for decode steps and prefill buckets alike.
+- **Prefill** takes the largest exported bucket that fits and finishes token by token on the
+  decode graph. **Sampling and grammar** run on the host.
+- **Hybrid**: `OrtBlockRun` embeds the shared `BlockLogic`, but there are no block graphs, so
+  `begin_block` reports that. The NPU execution providers (`ep/` modules, `disable_cpu_ep_fallback`
+  sessions, partition reports, compile caches) are plan stages 4-6 and need hardware.
+- **Server**: `--device ort-cpu --model <export dir>` (needs `--features ort`); `ncm-bench
+  --device ort-cpu --onnx-dir <dir>`. `scripts/check.sh` fetches the pinned CPU release by
+  version and SHA-256 and runs the parity and e2e tests; **its `ORT_SHA256` is empty and must
+  be pinned from the official release** (until then the script skips those tests and says so).
 
 ## Verification status
 

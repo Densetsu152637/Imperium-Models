@@ -17,10 +17,14 @@ path = "src/main.rs"
 [features]
 # The CPU backend is always built; CUDA is opt-in (CI has no GPU).
 cuda = ["burn/cuda", "ncm-model/cuda"]
+# ONNX Runtime's CPU execution provider (`--device ort-cpu`, `crates/ncm-ort`). Links nothing: the
+# shared library is loaded at run time (`ORT_DYLIB_PATH`).
+ort = ["dep:ncm-ort"]
 
 [dependencies]
 ncm-model = { path = "../crates/ncm-model" }
 ncm-exec = { path = "../crates/ncm-exec" }
+ncm-ort = { path = "../crates/ncm-ort", optional = true }
 burn = { workspace = true, features = ["flex"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -33,6 +37,7 @@ tokio-stream = "0.1"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
+ncm-export = { path = "../crates/ncm-export" }
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 futures-util = { version = "0.3", default-features = false }

@@ -22,6 +22,8 @@
 //! `ncm-bench predict` the latency model's decode-speed predictions ([`predict`]).
 
 pub mod hybrid;
+#[cfg(feature = "ort")]
+pub mod ort_bench;
 pub mod predict;
 pub mod train_memory;
 
@@ -97,6 +99,10 @@ pub enum DeviceChoice {
     Cpu,
     /// Any wgpu adapter (build with `--features wgpu`).
     Wgpu,
+    /// ONNX Runtime's CPU provider over an `ncm-export` directory (`--onnx-dir`; build with
+    /// `--features ort`).
+    #[value(name = "ort-cpu")]
+    OrtCpu,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -149,6 +155,13 @@ pub struct Cli {
     pub new_tokens: usize,
     #[arg(long, value_enum, default_value = "cuda")]
     pub device: DeviceChoice,
+    /// `--device ort-cpu`: the `ncm-export` directory to measure (its own weights, not random
+    /// ones).
+    #[arg(long, value_name = "DIR")]
+    pub onnx_dir: Option<PathBuf>,
+    /// `--device ort-cpu`: the ONNX Runtime shared library (default: `ORT_DYLIB_PATH`).
+    #[arg(long, value_name = "PATH")]
+    pub ort_lib: Option<PathBuf>,
     /// Defaults to bf16 on cuda and f32 elsewhere.
     #[arg(long, value_enum)]
     pub dtype: Option<DtypeChoice>,
@@ -236,7 +249,7 @@ pub fn fallback_verdict(ratio: f64) -> &'static str {
     if ratio >= FALLBACK_FLOOR { "PASS" } else { "FAIL" }
 }
 
-fn median(values: &mut [f64]) -> f64 {
+pub(crate) fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
     if values.len() % 2 == 1 { values[mid] } else { (values[mid - 1] + values[mid]) / 2.0 }
@@ -253,6 +266,9 @@ fn make_device(choice: DeviceChoice) -> Result<Device, String> {
         DeviceChoice::Wgpu => Ok(Device::wgpu(burn::tensor::DeviceKind::DefaultDevice)),
         #[cfg(not(feature = "wgpu"))]
         DeviceChoice::Wgpu => Err("--device wgpu needs a build with `--features wgpu`".into()),
+        DeviceChoice::OrtCpu => {
+            Err("--device ort-cpu runs on ONNX Runtime, not a Burn device".into())
+        }
     }
 }
 
@@ -684,6 +700,12 @@ fn rate_ratios(a: &Rates, b: &Rates) -> Vec<(usize, f64)> {
 
 /// Run the benchmark described by `cli`; prints the report and returns the JSON payload.
 pub fn run(cli: &Cli) -> Result<Value, String> {
+    if cli.device == DeviceChoice::OrtCpu {
+        #[cfg(feature = "ort")]
+        return ort_bench::run(cli);
+        #[cfg(not(feature = "ort"))]
+        return Err("--device ort-cpu needs a build with `--features ort`".into());
+    }
     // Before the device is first used: CubeCL reads its configuration once per process.
     #[cfg(feature = "cuda")]
     if cli.device == DeviceChoice::Cuda && !cli.no_kernel_cache {

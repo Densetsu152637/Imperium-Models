@@ -48,9 +48,23 @@ Short runs on an RTX 5080 (random weights, bf16, a 2,048-byte chat prompt, 256 t
 
 ## Command line
 
-`--model/-m`, `--host`, `--port` (0 picks a free one), `--ctx-size/-c` (total, allocated at launch; each request gets `ctx / parallel`), `--parallel/-np` (slots decoding together, below), `--n-gpu-layers/-ngl` (0 means CPU), `--alias/-a`, `--temp`, `--top-k`, `--top-p` (llama-server's defaults: 0.8, 40, 0.95) are llama-server's. `--cache-type-k/-v`, `--jinja`, `--threads`, `--batch-size`, `--flash-attn`, `--mlock`, `--no-mmap` and a few more are accepted and ignored so the launch line works unchanged (`-ngl`, `-np`, `-fa`, `-ctk`, `-ctv`, `-ub`, `-tb`, `-cb` are mapped to their long forms). NCM-specific: `--arch tok|ncm`, `--random-weights` (+ `--weights-seed`), `--tokenizer`, `--config`, `--device cpu|cuda`, `--dtype bf16|f32`, `--prefill-chunk` (default 8192 for the v2 design, whose fused prefill kernels want long chunks; 512 for the fallback), `--quant none|q8|q4` (+ `--quant-group`, `--dense-head`; weight-only quantisation at load, a dense bf16 file converted as it loads, see `../docs/quantisation.md`), `--speculate` (self-speculative decoding, below). Defaults: CUDA with bf16 when built with `--features cuda` and `-ngl` is not 0, else CPU with f32.
+`--model/-m`, `--host`, `--port` (0 picks a free one), `--ctx-size/-c` (total, allocated at launch; each request gets `ctx / parallel`), `--parallel/-np` (slots decoding together, below), `--n-gpu-layers/-ngl` (0 means CPU), `--alias/-a`, `--temp`, `--top-k`, `--top-p` (llama-server's defaults: 0.8, 40, 0.95) are llama-server's. `--cache-type-k/-v`, `--jinja`, `--threads`, `--batch-size`, `--flash-attn`, `--mlock`, `--no-mmap` and a few more are accepted and ignored so the launch line works unchanged (`-ngl`, `-np`, `-fa`, `-ctk`, `-ctv`, `-ub`, `-tb`, `-cb` are mapped to their long forms). NCM-specific: `--arch tok|ncm`, `--random-weights` (+ `--weights-seed`), `--tokenizer`, `--config`, `--device cpu|cuda|ort-cpu` (below), `--dtype bf16|f32`, `--prefill-chunk` (default 8192 for the v2 design, whose fused prefill kernels want long chunks; 512 for the fallback), `--quant none|q8|q4` (+ `--quant-group`, `--dense-head`; weight-only quantisation at load, a dense bf16 file converted as it loads, see `../docs/quantisation.md`), `--speculate` (self-speculative decoding, below). Defaults: CUDA with bf16 when built with `--features cuda` and `-ngl` is not 0, else CPU with f32.
 
 The architecture and config come from `--config`, else the weight file's header, else `config.toml` beside the weights, else the 250M config of `--arch` (the fallback attention design; pass `--config configs/ncm-250m-v2.toml` or `tok-250m-v2.toml` for v2, see `../docs/attention.md`). The tokenizer is `--tokenizer`, else `tokenizer.json` beside the weights; with `--random-weights` and none, a built-in byte-level tokenizer (ids 0 to 10 are the special tokens, 11 to 15 reserved, 16 to 271 bytes) is used.
+
+## Devices and the engine interface
+
+Every request on the sequential engine runs through `ncm-exec`'s `ExecBackend`/`ExecSession` traits (see `../docs/exec.md`); only continuous batching (`--parallel` above 1, Burn only) bypasses them.
+
+| `--device` | Backend | Needs | Serves |
+|---|---|---|---|
+| `cpu` | Burn, CPU | nothing | token baseline, k = 4 NCM, hybrid |
+| `cuda` | Burn, CUDA (fused kernels, graphs) | `--features cuda` | the same, plus batching |
+| `ort-cpu` | ONNX Runtime, CPU execution provider (`ncm-ort`) | `--features ort`, the ONNX Runtime 1.31 shared library (`--ort-lib` or `ORT_DYLIB_PATH`) | the token baseline in the fallback design, from an `ncm-export` directory |
+
+`--device ort-cpu --model <export dir>`: the directory holds `manifest.json`, the graphs and `weights.bin` (`ncm-export --model weights.safetensors --out <dir> --ctx <n>`); the tokenizer is `--tokenizer` or `tokenizer.json` in it. The context is at most the export's `--ctx`. `-ngl` and `--quant` are ignored (with a note: an export carries the quantisation it was written with), `--parallel` must be 1, and `--ort-allow-version-skew` accepts an ONNX Runtime whose minor version differs from the pinned one. `/props` `ncm.device` reports the execution provider and ONNX Runtime's build info. Sampling and grammar run on the host (the backend has no device sampler); prefix reuse works as on the Burn backends. Not served: the k = 4 NCM and the hybrid (no ONNX path / no block graphs yet) and the v2 design's retrieval layers (the exporter has not written them yet).
+
+`ncm-bench --device ort-cpu --onnx-dir <export dir>` measures batch-1 prefill and greedy decode on the same export. The end-to-end tests take their device from `NCM_E2E_DEVICE` (`cpu` by default; `ort-cpu` serves the token baseline from an export of the same random weights): `NCM_E2E_DEVICE=ort-cpu cargo test -p ncm-server --features ort --test e2e`.
 
 ## Context and cache
 

@@ -265,12 +265,19 @@ pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 pub enum DeviceChoice {
     Cpu,
     Cuda,
+    /// ONNX Runtime's CPU execution provider (no Burn device).
+    OrtCpu,
 }
 
 /// The compute device, with float dtype `dtype` configured.
 pub fn make_device(choice: DeviceChoice, dtype: FloatDType) -> Result<Device, EngineError> {
     #[allow(unused_mut)]
     let mut device = match choice {
+        DeviceChoice::OrtCpu => {
+            return Err(EngineError::Device(
+                "ort-cpu runs on ONNX Runtime, not a Burn device".into(),
+            ));
+        }
         DeviceChoice::Cpu => Device::flex(),
         #[cfg(feature = "cuda")]
         DeviceChoice::Cuda => Device::cuda(0),
@@ -879,6 +886,83 @@ impl Engine {
     #[cfg(debug_assertions)]
     pub fn panic_next_request_after(&self, delay: std::time::Duration) {
         self.panic_after.store(delay.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+}
+
+/// What `--device ort-cpu` needs to start an engine over an `ncm-export` directory.
+#[cfg(feature = "ort")]
+pub struct OrtEngineOptions {
+    pub config: Config,
+    pub dir: PathBuf,
+    /// Context tokens one request may use (at most the export's).
+    pub ctx: usize,
+    pub dylib: Option<PathBuf>,
+    pub threads: Option<usize>,
+    pub allow_version_skew: bool,
+    pub prefill_chunk: usize,
+    pub prefix_reuse: bool,
+    pub warmup: bool,
+}
+
+#[cfg(feature = "ort")]
+impl Engine {
+    /// An engine over ONNX Runtime's CPU provider: the same worker, `Core` and prefix reuse as
+    /// the Burn backends, through `ncm_ort::OrtBackend`. One request at a time.
+    pub fn new_ort(options: OrtEngineOptions, vocab: Arc<Vocab>) -> Result<Self, EngineError> {
+        let worker_vocab = vocab.clone();
+        Self::spawn(1, vocab, move |_report| {
+            let Config::Tok(cfg) = &options.config else {
+                return Err(EngineError::Unsupported(
+                    "--device ort-cpu serves the token baseline only".into(),
+                ));
+            };
+            if worker_vocab.len() != options.config.vocab_size() {
+                return Err(EngineError::VocabMismatch {
+                    table: worker_vocab.len(),
+                    model: options.config.vocab_size(),
+                });
+            }
+            let backend = ncm_ort::OrtBackend::load(&ncm_ort::OrtOptions {
+                dir: options.dir.clone(),
+                dylib: options.dylib.clone(),
+                threads: options.threads,
+                allow_version_skew: options.allow_version_skew,
+            })?;
+            let capacity = options.ctx.min(backend.manifest().ctx);
+            if capacity < 2 {
+                return Err(EngineError::ContextTooSmall { ctx: capacity, min: 2 });
+            }
+            // Counted on a dense model that is never initialised.
+            let params = TokenLm::new(cfg, &Device::flex()).parts().total();
+            let footprint = backend.footprint(&ncm_exec::FootprintRequest::new(
+                capacity,
+                1,
+                Dtype::F32,
+                Quant::None,
+            ));
+            let info = ModelInfo {
+                arch: "tok",
+                params,
+                ctx: capacity,
+                cache_bytes: (footprint.budgeted_total()
+                    - footprint.part_total(ncm_exec::Part::Weights))
+                    as usize,
+                dtype: format!("f32 ({})", backend.manifest().quant),
+                device: backend.describe(),
+                vocab_size: options.config.vocab_size(),
+                unit: 1,
+            };
+            let core = Core::new(
+                backend,
+                info.clone(),
+                worker_vocab,
+                options.prefill_chunk,
+                options.prefix_reuse,
+                false,
+                options.warmup,
+            )?;
+            Ok((info, Worker::Sequential(Box::new(core))))
+        })
     }
 }
 

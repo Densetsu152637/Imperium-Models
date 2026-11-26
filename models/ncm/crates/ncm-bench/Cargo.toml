@@ -18,9 +18,13 @@ path = "src/main.rs"
 # The CPU backend is always built; CUDA and wgpu are opt-in (CI has neither).
 cuda = ["burn/cuda", "ncm-model/cuda"]
 wgpu = ["burn/wgpu"]
+# ONNX Runtime's CPU provider (`--device ort-cpu`); loads the shared library at run time.
+ort = ["dep:ncm-ort", "dep:ncm-exec"]
 
 [dependencies]
 ncm-model = { path = "../ncm-model" }
+ncm-exec = { path = "../ncm-exec", optional = true }
+ncm-ort = { path = "../ncm-ort", optional = true }
 burn = { workspace = true, features = ["flex"] }
 clap = { workspace = true }
 serde_json = { workspace = true }

@@ -13,6 +13,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::cli::{ArchArg, Cli, DeviceArg, DtypeArg};
+#[cfg(feature = "ort")]
+use crate::engine::OrtEngineOptions;
 use crate::engine::{DeviceChoice, Engine, EngineOptions, make_device};
 use crate::sampling::SamplingParams;
 use crate::server::{AppState, serve};
@@ -78,8 +80,59 @@ fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     paths.into_iter().find(|p| p.is_file())
 }
 
+/// The plan of `--device ort-cpu`: `--model` names an `ncm-export` directory, whose manifest
+/// carries the config.
+fn plan_ort(cli: &Cli) -> Result<Plan, String> {
+    if !cfg!(feature = "ort") {
+        return Err("this build has no ONNX Runtime support; rebuild with `--features ort`".into());
+    }
+    let dir = cli
+        .model
+        .clone()
+        .ok_or_else(|| "--device ort-cpu needs --model <ncm-export directory>".to_owned())?;
+    let manifest_path = dir.join(ncm_exec::manifest::FILE_NAME);
+    if !manifest_path.is_file() {
+        return Err(format!(
+            "{} has no {} (--device ort-cpu takes an `ncm-export` directory)",
+            dir.display(),
+            ncm_exec::manifest::FILE_NAME
+        ));
+    }
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let manifest = ncm_exec::manifest::Manifest::from_json(&text)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let config = Config::parse(&manifest.config_toml)
+        .map_err(|e| format!("{}: its config: {e}", manifest_path.display()))?;
+    let config = check_arch(config, cli.arch, &manifest_path.display().to_string())?;
+    if cli.parallel != 1 {
+        return Err("--device ort-cpu serves one request at a time: --parallel must be 1".into());
+    }
+    let tokenizer = cli.tokenizer.clone().or_else(|| first_existing([dir.join("tokenizer.json")]));
+    if tokenizer.is_none() {
+        return Err(
+            "no tokenizer: pass --tokenizer or put tokenizer.json in the export directory".into()
+        );
+    }
+    let alias = cli.alias.clone().unwrap_or_else(|| {
+        dir.file_name().map_or_else(|| "ncm-onnx".to_owned(), |s| s.to_string_lossy().into_owned())
+    });
+    Ok(Plan {
+        config,
+        weights: Some(dir),
+        tokenizer,
+        device: DeviceChoice::OrtCpu,
+        dtype: FloatDType::F32,
+        ctx: cli.ctx_size,
+        alias,
+    })
+}
+
 /// Turns the command line into a plan, checking the files it names.
 pub fn plan(cli: &Cli) -> Result<Plan, String> {
+    if cli.device == Some(DeviceArg::OrtCpu) {
+        return plan_ort(cli);
+    }
     if let Some(path) = cli.model.as_ref().filter(|p| !cli.random_weights && !p.is_file()) {
         return Err(format!("model file {} not found", path.display()));
     }
@@ -108,6 +161,7 @@ pub fn plan(cli: &Cli) -> Result<Plan, String> {
     let device = match cli.device {
         Some(DeviceArg::Cpu) => DeviceChoice::Cpu,
         Some(DeviceArg::Cuda) => DeviceChoice::Cuda,
+        Some(DeviceArg::OrtCpu) => unreachable!("planned by plan_ort"),
         None if cfg!(feature = "cuda") && wants_gpu => DeviceChoice::Cuda,
         None => DeviceChoice::Cpu,
     };
@@ -132,6 +186,9 @@ pub fn load_engine(plan: &Plan, cli: &Cli) -> Result<Engine, String> {
         None => Vocab::new(byte_tokenizer(), vocab_size),
     }
     .map_err(|e| e.to_string())?;
+    if plan.device == DeviceChoice::OrtCpu {
+        return load_ort(plan, cli, vocab);
+    }
     // Before the device is first used: CubeCL reads its configuration once per process.
     #[cfg(feature = "cuda")]
     if plan.device == DeviceChoice::Cuda && !cli.no_kernel_cache {
@@ -160,6 +217,29 @@ pub fn load_engine(plan: &Plan, cli: &Cli) -> Result<Engine, String> {
         slots: cli.parallel,
     };
     Engine::new(options, Arc::new(vocab)).map_err(|e| e.to_string())
+}
+
+/// The engine over ONNX Runtime's CPU provider.
+#[cfg(feature = "ort")]
+fn load_ort(plan: &Plan, cli: &Cli, vocab: Vocab) -> Result<Engine, String> {
+    let dir = plan.weights.clone().expect("an ort plan names its export directory");
+    let options = OrtEngineOptions {
+        config: plan.config.clone(),
+        dir,
+        ctx: plan.ctx,
+        dylib: cli.ort_lib.clone(),
+        threads: cli.threads,
+        allow_version_skew: cli.ort_allow_version_skew,
+        prefill_chunk: cli.prefill_chunk.unwrap_or(crate::engine::DEFAULT_PREFILL_CHUNK),
+        prefix_reuse: !cli.no_prefix_reuse,
+        warmup: !cli.no_warmup,
+    };
+    Engine::new_ort(options, Arc::new(vocab)).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "ort"))]
+fn load_ort(_plan: &Plan, _cli: &Cli, _vocab: Vocab) -> Result<Engine, String> {
+    Err("this build has no ONNX Runtime support; rebuild with `--features ort`".into())
 }
 
 /// A server that is listening; the model loads in the background.

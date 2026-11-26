@@ -61,33 +61,70 @@ fn write_tiny(dir: &Path, config: &Config) -> (String, String) {
     (config_path.display().to_string(), tokenizer.display().to_string())
 }
 
+/// The device the tests serve on: `NCM_E2E_DEVICE` (default: the Burn CPU backend). `ort-cpu`
+/// needs `--features ort` and the ONNX Runtime library (`ORT_DYLIB_PATH`); it serves the token
+/// baseline from an `ncm-export` of the same weights.
+fn on_ort() -> bool {
+    match std::env::var("NCM_E2E_DEVICE").as_deref() {
+        Ok("ort-cpu") => true,
+        Ok("") | Ok("cpu") | Err(_) => false,
+        Ok(other) => panic!("NCM_E2E_DEVICE={other}: expected cpu or ort-cpu"),
+    }
+}
+
+/// Saves `config`'s model (weights seeded `seed`, as the server seeds before it builds) in
+/// `dir` and exports it for ONNX Runtime into `dir/onnx`: the model directory to serve.
+fn export_tiny(dir: &Path, config: &Config, seed: u64) -> String {
+    let device = Device::flex();
+    device.seed(seed);
+    let weights = dir.join("export-source.safetensors");
+    match config {
+        Config::Tok(c) => save_weights(&TokenLm::new(c, &device), config, &weights).unwrap(),
+        Config::Ncm(_) => unreachable!("the k = 4 NCM has no ONNX path"),
+    }
+    let out = dir.join("onnx");
+    let opts = ncm_export::ExportOptions {
+        ctx: 512,
+        buckets: vec![8],
+        form: ncm_export::WeightForm::F32,
+        target: ncm_export::Target::Cpu,
+    };
+    let source = ncm_export::weights::Weights::open(&weights).unwrap();
+    ncm_export::export(config, &source, &out, &opts).unwrap();
+    out.display().to_string()
+}
+
 #[tokio::test]
 async fn random_weights_serve_a_chat_completion_for_both_architectures() {
     let _serial = SERIAL.lock().await;
     for config in [tiny_tok_config(), tiny_ncm_config()] {
+        if on_ort() && matches!(config, Config::Ncm(_)) {
+            continue;
+        }
         let dir = tempfile::tempdir().unwrap();
-        let (config_path, _) = write_tiny(dir.path(), &config);
-        let running = start(cli(&[
-            "--random-weights",
-            "--config",
-            &config_path,
-            "--port",
-            "0",
-            "-c",
-            "512",
-            "--parallel",
-            "2",
-        ]))
-        .await
-        .unwrap();
+        let (config_path, tokenizer) = write_tiny(dir.path(), &config);
+        // ONNX Runtime serves one request at a time; the Burn backends two slots.
+        let (slots, n_ctx) = if on_ort() { (1, 512) } else { (2, 256) };
+        let slots_arg = slots.to_string();
+        let args: Vec<String> = if on_ort() {
+            let model = export_tiny(dir.path(), &config, 0);
+            ["--device", "ort-cpu", "--model", &model, "--tokenizer", &tokenizer]
+                .map(String::from)
+                .to_vec()
+        } else {
+            ["--random-weights", "--config", &config_path].map(String::from).to_vec()
+        };
+        let mut all: Vec<&str> = args.iter().map(String::as_str).collect();
+        all.extend(["--port", "0", "-c", "512", "--parallel", &slots_arg]);
+        let running = start(cli(&all)).await.unwrap();
         // Listening at once; ready once the model has loaded.
         wait_ready(&running).await;
         let base = format!("http://{}", running.addr);
 
         let props: Value =
             reqwest::get(format!("{base}/props")).await.unwrap().json().await.unwrap();
-        assert_eq!(props["default_generation_settings"]["n_ctx"], 256, "512 split over 2 slots");
-        assert_eq!(props["total_slots"], 2);
+        assert_eq!(props["default_generation_settings"]["n_ctx"], n_ctx, "512 split over slots");
+        assert_eq!(props["total_slots"], slots);
 
         let body = chat(&running, greedy("hello")).await;
         assert_eq!(body["object"], "chat.completion");
@@ -95,7 +132,6 @@ async fn random_weights_serve_a_chat_completion_for_both_architectures() {
         assert!(body["timings"]["prompt_per_second"].as_f64().unwrap() > 0.0);
         let again = chat(&running, greedy("hello")).await;
         assert_eq!(body["choices"], again["choices"], "greedy replies repeat");
-
         running.stop().await.unwrap();
     }
 }
@@ -104,6 +140,9 @@ async fn random_weights_serve_a_chat_completion_for_both_architectures() {
 async fn saved_weights_load_and_give_the_same_replies_as_the_random_weights_they_came_from() {
     let _serial = SERIAL.lock().await;
     for config in [tiny_tok_config(), tiny_ncm_config()] {
+        if on_ort() && matches!(config, Config::Ncm(_)) {
+            continue;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (config_path, tokenizer) = write_tiny(dir.path(), &config);
         let weights = dir.path().join("tiny.safetensors");
@@ -116,19 +155,41 @@ async fn saved_weights_load_and_give_the_same_replies_as_the_random_weights_they
         }
         let weights = weights.display().to_string();
 
-        // The config comes from the weight file's header: no --config, no --arch.
-        let loaded = start(cli(&[
-            "--model",
-            &weights,
-            "--tokenizer",
-            &tokenizer,
-            "--port",
-            "0",
-            "-c",
-            "256",
-        ]))
-        .await
-        .unwrap();
+        // The config comes from the weight file's header: no --config, no --arch. On ONNX
+        // Runtime the loaded model is an export of the same weights, checked against the Burn
+        // random-weights server (the reference).
+        let loaded = if on_ort() {
+            let model = export_tiny(dir.path(), &config, 5);
+            start(cli(&[
+                "--device",
+                "ort-cpu",
+                "--model",
+                &model,
+                "--tokenizer",
+                &tokenizer,
+                "--alias",
+                "tiny",
+                "--port",
+                "0",
+                "-c",
+                "256",
+            ]))
+            .await
+            .unwrap()
+        } else {
+            start(cli(&[
+                "--model",
+                &weights,
+                "--tokenizer",
+                &tokenizer,
+                "--port",
+                "0",
+                "-c",
+                "256",
+            ]))
+            .await
+            .unwrap()
+        };
         wait_ready(&loaded).await;
         // Built one after the other: model construction seeds a process-wide generator.
         let random = start(cli(&[
@@ -159,6 +220,27 @@ async fn a_bad_weight_file_fails_the_launch() {
     let _serial = SERIAL.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (config_path, tokenizer) = write_tiny(dir.path(), &tiny_tok_config());
+    if on_ort() {
+        // A directory whose manifest is not one: refused before anything starts.
+        let model = dir.path().join("onnx");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("manifest.json"), b"not a manifest").unwrap();
+        let error = start(cli(&[
+            "--device",
+            "ort-cpu",
+            "--model",
+            &model.display().to_string(),
+            "--tokenizer",
+            &tokenizer,
+            "--port",
+            "0",
+        ]))
+        .await
+        .err()
+        .expect("a refused launch");
+        assert!(error.contains("manifest.json"), "{error}");
+        return;
+    }
     let weights = dir.path().join("bad.safetensors");
     std::fs::write(&weights, b"not a safetensors file at all").unwrap();
     let running = start(cli(&[

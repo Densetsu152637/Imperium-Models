@@ -4344,7 +4344,9 @@ version = "0.0.0"
 dependencies = [
  "burn",
  "clap",
+ "ncm-exec",
  "ncm-model",
+ "ncm-ort",
  "serde_json",
 ]
 
@@ -4409,6 +4411,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ncm-ort"
+version = "0.0.0"
+dependencies = [
+ "burn",
+ "ncm-exec",
+ "ncm-export",
+ "ncm-model",
+ "ort",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ncm-server"
 version = "0.0.0"
 dependencies = [
@@ -4417,7 +4432,9 @@ dependencies = [
  "clap",
  "futures-util",
  "ncm-exec",
+ "ncm-export",
  "ncm-model",
+ "ncm-ort",
  "reqwest",
  "serde",
  "serde_json",
