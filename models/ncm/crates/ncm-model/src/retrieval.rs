@@ -235,6 +235,21 @@ impl LatentCache {
         self.length
     }
 
+    /// Makes this cache a copy of `src` (same shape): latents, indexer keys and position, in
+    /// this cache's own buffers on CUDA.
+    pub fn copy_from(&mut self, src: &LatentCache) {
+        crate::cache::store(self.kv.as_mut().expect("cache"), src.kv.clone().expect("cache"));
+        match (self.keys.as_mut().expect("cache"), src.keys.as_ref().expect("cache")) {
+            (IndexKeys::Float(k), IndexKeys::Float(s)) => crate::cache::store(k, s.clone()),
+            (IndexKeys::Int8 { codes, scales }, IndexKeys::Int8 { codes: c, scales: sc }) => {
+                crate::cache::store_int(codes, c.clone());
+                crate::cache::store(scales, sc.clone());
+            }
+            _ => panic!("copies come from a cache of the same layout"),
+        }
+        self.length = src.length;
+    }
+
     /// Positions the cache holds at most.
     pub fn capacity(&self) -> usize {
         self.capacity

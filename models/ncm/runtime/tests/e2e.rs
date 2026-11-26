@@ -245,5 +245,6 @@ fn imperiums_llama_server_launch_line_parses() {
     assert_eq!(short.n_gpu_layers.as_deref(), Some("0"));
     assert_eq!(short.parallel, 3);
     assert!(short.warnings().iter().any(|w| w.contains("--cache-type-k q8_0")));
-    assert!(short.warnings().iter().any(|w| w.contains("--parallel 3")));
+    // --parallel is real batching now: no note.
+    assert!(!short.warnings().iter().any(|w| w.contains("--parallel")));
 }

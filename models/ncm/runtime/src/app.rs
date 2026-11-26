@@ -157,6 +157,7 @@ pub fn load_engine(plan: &Plan, cli: &Cli) -> Result<Engine, String> {
         speculate: cli.speculate,
         prefix_reuse: !cli.no_prefix_reuse,
         warmup: !cli.no_warmup,
+        slots: cli.parallel,
     };
     Engine::new(options, Arc::new(vocab)).map_err(|e| e.to_string())
 }

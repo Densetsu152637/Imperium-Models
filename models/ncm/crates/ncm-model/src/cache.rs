@@ -138,6 +138,14 @@ impl KvCache {
         self.length = len;
     }
 
+    /// Makes this cache a copy of `src` (same shape): contents and position, in this cache's
+    /// own buffers on CUDA (forking one request's state into another slot).
+    pub fn copy_from(&mut self, src: &KvCache) {
+        store(self.k.as_mut().expect("cache"), src.k.clone().expect("cache"));
+        store(self.v.as_mut().expect("cache"), src.v.clone().expect("cache"));
+        self.length = src.length;
+    }
+
     /// What [`Self::restore`] needs to return here.
     pub fn snapshot(&self) -> KvSnapshot {
         let ring = self.window.map(|_| {
@@ -302,6 +310,16 @@ pub(crate) fn copy_of<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
     t.clone()
 }
 
+/// [`store`] for int tensors.
+pub(crate) fn store_int<const D: usize>(slot: &mut Tensor<D, Int>, value: Tensor<D, Int>) {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&slot.device()) {
+        crate::inplace::write_int(slot, value, 0, 0);
+        return;
+    }
+    *slot = value;
+}
+
 /// Sets `slot` to `value`: written into `slot`'s own buffer on CUDA with the fused kernels on,
 /// so that graphs captured against the buffer keep seeing the cache, replaced elsewhere.
 pub(crate) fn store<const D: usize>(slot: &mut Tensor<D>, value: Tensor<D>) {
@@ -369,6 +387,17 @@ impl LayerCache {
             Self::Kv(c) => c.reset(),
             Self::Delta(c) => c.reset(),
             Self::Latent(c) => c.reset(),
+        }
+    }
+
+    /// Makes this cache a copy of `src`, a cache of the same layer and shape (see
+    /// [`KvCache::copy_from`]).
+    pub fn copy_from(&mut self, src: &LayerCache) {
+        match (self, src) {
+            (Self::Kv(c), Self::Kv(s)) => c.copy_from(s),
+            (Self::Delta(c), Self::Delta(s)) => c.copy_from(s),
+            (Self::Latent(c), Self::Latent(s)) => c.copy_from(s),
+            _ => panic!("copies come from a cache of the same layer"),
         }
     }
 

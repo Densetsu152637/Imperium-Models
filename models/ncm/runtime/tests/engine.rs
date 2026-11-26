@@ -144,6 +144,7 @@ fn contexts_too_small_for_the_model_are_refused() {
         speculate: false,
         prefix_reuse: true,
         warmup: false,
+        slots: 1,
         quant: None,
     };
     assert!(matches!(
@@ -291,6 +292,7 @@ fn quantised_engines_load_dense_and_quantised_weight_files() {
             speculate: false,
             prefix_reuse: true,
             warmup: false,
+            slots: 1,
             quant,
         };
         // Quantising a dense file at load and loading the quantised file give the same model.
@@ -328,6 +330,7 @@ fn engine_with_reuse(config: ncm_model::Config, reuse: bool) -> Engine {
         speculate: false,
         prefix_reuse: reuse,
         warmup: false,
+        slots: 1,
     };
     Engine::new(options, vocab()).unwrap()
 }

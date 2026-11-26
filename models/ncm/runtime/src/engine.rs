@@ -33,7 +33,7 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 512;
 /// The v2 design's default: its fused prefill kernels are fastest on long chunks.
 pub const DEFAULT_PREFILL_CHUNK_V2: usize = 8192;
 /// Concepts in a row with no output before an NCM reply is cut off.
-const MAX_EMPTY_CONCEPTS: usize = 16;
+pub(crate) const MAX_EMPTY_CONCEPTS: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -55,6 +55,8 @@ pub enum EngineError {
     QuantMismatch { file: String, asked: String },
     #[error("device: {0}")]
     Device(String),
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Why generation ended.
@@ -89,6 +91,12 @@ pub struct GenStats {
     pub capture_s: f64,
     /// How the reply was decoded ([`DecodePath`]).
     pub path: DecodePath,
+    /// Seconds the request waited for a slot (continuous batching; 0 with one slot).
+    pub queue_s: f64,
+    /// Mean rows of the batched decode steps the request took part in (1 with one slot).
+    pub mean_batch: f64,
+    /// The prompt's prefill was another slot's, copied (shared-prefix fork).
+    pub forked: bool,
 }
 
 /// The decode loop a request took.
@@ -105,6 +113,9 @@ pub enum DecodePath {
     /// Self-speculative greedy decoding (NCM with a draft head, `--speculate`): draft and
     /// verify passes, each concept appended through a graph.
     Speculative,
+    /// Continuous batching (`--parallel` above 1, [`crate::batch`]): batched eager steps over
+    /// the decoding slots.
+    Batched,
 }
 
 impl DecodePath {
@@ -114,6 +125,7 @@ impl DecodePath {
             Self::GraphedGreedy => "graphed-greedy",
             Self::GraphedSampled => "graphed-sampled",
             Self::Speculative => "speculative",
+            Self::Batched => "batched",
         }
     }
 }
@@ -168,10 +180,16 @@ pub trait Backend: Send + Sync {
     fn broken(&self) -> Option<String> {
         None
     }
+
+    /// The slots and the queue of a continuously batching backend (`--parallel` above 1), or
+    /// None.
+    fn slots(&self) -> Option<crate::batch::SlotsReport> {
+        None
+    }
 }
 
 /// A request whose listener left during the prefill: nothing generated.
-fn aborted(prompt_tokens: usize) -> GenStats {
+pub(crate) fn aborted(prompt_tokens: usize) -> GenStats {
     GenStats {
         prompt_tokens,
         completion_tokens: 0,
@@ -182,6 +200,9 @@ fn aborted(prompt_tokens: usize) -> GenStats {
         cached_tokens: 0,
         capture_s: 0.0,
         path: DecodePath::Eager,
+        queue_s: 0.0,
+        mean_batch: 0.0,
+        forked: false,
     }
 }
 
@@ -250,12 +271,27 @@ pub struct EngineOptions {
     /// them), so that the first real request does not pay for compiling the kernels and
     /// capturing the decode graphs.
     pub warmup: bool,
+    /// Requests served at once (continuous batching, [`crate::batch`]); each slot gets caches
+    /// for `ctx`. 1: one at a time.
+    pub slots: usize,
 }
 
 #[allow(clippy::large_enum_variant)]
-enum State {
-    Tok { model: TokenLm, caches: Vec<LayerCache>, kept: Vec<TokKept>, graphs: TokGraphs },
-    Ncm { model: NcmLm, cache: NcmCache, kept: Vec<NcmKept>, graphs: NcmGraphs },
+pub(crate) enum State {
+    Tok {
+        model: TokenLm,
+        caches: Vec<LayerCache>,
+        kept: Vec<TokKept>,
+        graphs: TokGraphs,
+    },
+    Ncm {
+        model: NcmLm,
+        cache: NcmCache,
+        kept: Vec<NcmKept>,
+        graphs: NcmGraphs,
+    },
+    /// Moved into the continuous batcher ([`crate::batch::Batcher`]).
+    Empty,
 }
 
 /// A cache state kept from the previous request: the tokens the cache held, a snapshot to
@@ -263,10 +299,10 @@ enum State {
 /// condition) when known. A later prompt that extends `tokens` restores the snapshot and
 /// prefills only its new tokens. The engine keeps two: right after the prompt's prefill, and
 /// at the end of the reply (whose fed-back tokens a next turn's prompt usually repeats).
-struct Kept<S, O> {
-    tokens: Vec<i32>,
-    snapshot: S,
-    out: Option<O>,
+pub(crate) struct Kept<S, O> {
+    pub(crate) tokens: Vec<i32>,
+    pub(crate) snapshot: S,
+    pub(crate) out: Option<O>,
 }
 
 type TokKept = Kept<Vec<LayerSnapshot>, Tensor<3>>;
@@ -274,7 +310,7 @@ type NcmKept = Kept<NcmSnapshot, Tensor<3>>;
 
 /// The token baseline's decode graphs, kept across requests (their caches keep their buffers).
 #[derive(Default)]
-struct TokGraphs {
+pub(crate) struct TokGraphs {
     #[cfg(feature = "cuda")]
     greedy: ncm_model::tok::GraphedTok,
     #[cfg(feature = "cuda")]
@@ -282,7 +318,7 @@ struct TokGraphs {
 }
 
 /// The NCM's decode graphs, kept across requests.
-struct NcmGraphs {
+pub(crate) struct NcmGraphs {
     #[cfg(feature = "cuda")]
     greedy: ncm_model::ncm::GraphedStep,
     #[cfg(feature = "cuda")]
@@ -311,18 +347,18 @@ impl Default for NcmGraphs {
 }
 
 /// The model and its caches, on the engine's worker thread ([`Engine`]).
-struct Core {
+pub(crate) struct Core {
     info: ModelInfo,
-    vocab: Arc<Vocab>,
-    device: Device,
-    chunk: usize,
+    pub(crate) vocab: Arc<Vocab>,
+    pub(crate) device: Device,
+    pub(crate) chunk: usize,
     /// Tokens the caches hold.
-    capacity: usize,
-    prefix_reuse: bool,
+    pub(crate) capacity: usize,
+    pub(crate) prefix_reuse: bool,
     /// Read by the graphed paths (CUDA builds).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     speculate: bool,
-    state: Mutex<State>,
+    pub(crate) state: Mutex<State>,
 }
 
 /// Burn initialises parameters when first used, drawing from the device's generator then.
@@ -385,6 +421,7 @@ impl Core {
             speculate,
             prefix_reuse,
             warmup,
+            slots,
         } = options;
         if vocab.len() != config.vocab_size() {
             return Err(EngineError::VocabMismatch {
@@ -411,6 +448,13 @@ impl Core {
                     State::Tok { model, caches, kept: Vec::new(), graphs: TokGraphs::default() };
                 (state, params, "tok")
             }
+            Config::Ncm(cfg) if cfg.hybrid.is_some() => {
+                // TODO: serve the hybrid (block decode loop, batched at block granularity);
+                // its reference loop (`ncm_model::hybrid::HybridSession`) runs at batch 1.
+                return Err(EngineError::Unsupported(
+                    "ncm-server does not serve the NCM hybrid yet ([hybrid] config)".into(),
+                ));
+            }
             Config::Ncm(cfg) => {
                 let build = || NcmLm::new(cfg, &device);
                 let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
@@ -425,7 +469,7 @@ impl Core {
             arch,
             params,
             ctx: capacity,
-            cache_bytes: cache_bytes(&config, capacity, itemsize(dtype), 1),
+            cache_bytes: slots.max(1) * cache_bytes(&config, capacity, itemsize(dtype), 1),
             dtype: format!("{dtype:?}").to_lowercase(),
             device: device_name,
             vocab_size: config.vocab_size(),
@@ -460,6 +504,7 @@ impl Core {
             let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             match &*state {
                 State::Ncm { model, .. } => model.warm_up(shapes, self.chunk, &self.device),
+                State::Empty => {}
                 State::Tok { model, .. } => {
                     // A throwaway cache: a prefill of `shapes` tokens, then one step.
                     let mut caches = model.make_cache(shapes + 1, 1, &self.device);
@@ -495,6 +540,7 @@ impl Core {
                 cache.reset();
                 kept.clear();
             }
+            State::Empty => {}
         }
     }
 
@@ -502,7 +548,7 @@ impl Core {
         Tensor::from_data(TensorData::new(ids.to_vec(), [1, ids.len()]), &self.device)
     }
 
-    fn sync(&self) {
+    pub(crate) fn sync(&self) {
         self.device.sync().ok();
     }
 
@@ -526,11 +572,11 @@ fn device_sampling(params: SamplingParams) -> ncm_model::sample::SampleSettings 
     }
 }
 
-fn read_logits(logits: &Tensor<3>) -> Vec<f32> {
+pub(crate) fn read_logits(logits: &Tensor<3>) -> Vec<f32> {
     logits.to_data_as::<f32>().try_into_vec::<f32>().expect("logits are floats")
 }
 
-fn read_ids(tokens: &Tensor<2, Int>) -> Vec<u32> {
+pub(crate) fn read_ids(tokens: &Tensor<2, Int>) -> Vec<u32> {
     tokens
         .to_data_as::<i32>()
         .try_into_vec::<i32>()
@@ -613,6 +659,11 @@ pub struct Engine {
     /// Set (with the panic's message) when a request panicked on the worker thread, which then
     /// stops: its model, caches and graphs may be inconsistent.
     dead: Arc<OnceLock<String>>,
+    /// The batcher's slots and queue (more than one slot), for `/props`.
+    report: Option<Arc<Mutex<crate::batch::SlotsReport>>>,
+    /// Events a request may have in flight: [`EVENTS_IN_FLIGHT`] with one slot; with more, the
+    /// whole reply, so that a slow listener never stalls the batch.
+    in_flight: usize,
     /// Debug builds only: the next request panics on the worker after this delay (ms; 0 off).
     #[cfg(debug_assertions)]
     panic_after: Arc<std::sync::atomic::AtomicU64>,
@@ -624,13 +675,13 @@ const EVENTS_IN_FLIGHT: usize = 8;
 
 /// A request for the worker thread, the channel its events go back on, and the flag the caller
 /// sets when its listener left.
-struct Job {
-    request: GenRequest,
-    events: mpsc::SyncSender<Event>,
-    cancel: Arc<AtomicBool>,
+pub(crate) struct Job {
+    pub(crate) request: GenRequest,
+    pub(crate) events: mpsc::SyncSender<Event>,
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
-enum Event {
+pub(crate) enum Event {
     Token(u32),
     Done(Result<GenStats, EngineError>),
 }
@@ -640,6 +691,10 @@ impl Engine {
     /// allocates the caches for `options.ctx` tokens, on a new worker thread that then serves
     /// every request.
     pub fn new(options: EngineOptions, vocab: Arc<Vocab>) -> Result<Self, EngineError> {
+        let slots = options.slots.max(1);
+        let report =
+            (slots > 1).then(|| Arc::new(Mutex::new(crate::batch::SlotsReport::default())));
+        let worker_report = report.clone();
         let (ready, built) = mpsc::channel();
         let (jobs, queue) = mpsc::channel::<Job>();
         let worker_vocab = vocab.clone();
@@ -670,6 +725,10 @@ impl Engine {
                         return;
                     }
                 };
+                if let Some(report) = worker_report {
+                    crate::batch::Batcher::new(core, slots, report).serve(queue, worker_dead);
+                    return;
+                }
                 // Ends when the engine (its sender) is dropped, or after a panic.
                 for Job { request, events, cancel } in queue {
                     let mut on_token = |token| {
@@ -710,6 +769,8 @@ impl Engine {
             vocab,
             jobs: Mutex::new(jobs),
             dead,
+            report,
+            in_flight: if slots > 1 { usize::MAX } else { EVENTS_IN_FLIGHT },
             #[cfg(debug_assertions)]
             panic_after,
         })
@@ -741,6 +802,10 @@ impl Backend for Engine {
         self.dead.get().cloned()
     }
 
+    fn slots(&self) -> Option<crate::batch::SlotsReport> {
+        self.report.as_ref().map(|r| r.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+
     fn generate(
         &self,
         request: GenRequest,
@@ -752,7 +817,9 @@ impl Backend for Engine {
                 "the engine stopped after a panic: {message}"
             )));
         }
-        let (events, received) = mpsc::sync_channel(EVENTS_IN_FLIGHT);
+        // With batching, room for the whole reply: the worker never waits on one listener.
+        let room = self.in_flight.min(request.max_tokens.saturating_add(self.info.unit + 2));
+        let (events, received) = mpsc::sync_channel(room);
         let cancel = request.cancel.clone();
         let job = Job { request, events, cancel: cancel.clone() };
         // A worker that stopped after a panic drops the queued jobs: say why.
@@ -806,6 +873,7 @@ impl Core {
             State::Ncm { model, cache, kept, graphs } => {
                 self.generate_ncm(model, cache, kept, graphs, &request.prompt, &mut run)
             }
+            State::Empty => unreachable!("the sequential loop keeps its model"),
         }
     }
 }
@@ -922,6 +990,9 @@ impl Core {
             cached_tokens: cached,
             capture_s: 0.0,
             path: DecodePath::Eager,
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
         })
     }
 
@@ -1112,6 +1183,9 @@ impl Core {
             cached_tokens: cached,
             capture_s: 0.0,
             path: DecodePath::Eager,
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
         })
     }
 
@@ -1209,6 +1283,9 @@ impl Core {
             cached_tokens: 0,
             capture_s,
             path: if sampled { DecodePath::GraphedSampled } else { DecodePath::GraphedGreedy },
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
         }
     }
 
@@ -1314,6 +1391,9 @@ impl Core {
             cached_tokens: 0,
             capture_s,
             path,
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
         }
     }
 }

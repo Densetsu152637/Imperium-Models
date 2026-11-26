@@ -84,7 +84,9 @@ pub struct Cli {
     /// With `--parallel N`, each request gets `ctx-size / N`.
     #[arg(short = 'c', long, default_value_t = 4096)]
     pub ctx_size: usize,
-    /// Slots. Requests run one at a time; this only divides the context, as in llama-server.
+    /// Slots: up to this many requests decode together (continuous batching), each with
+    /// `ctx-size / N` context tokens and caches of its own, as in llama-server. 1 serves
+    /// requests one at a time.
     #[arg(long, default_value_t = 1)]
     pub parallel: usize,
     /// `cuda` when built with it and `--n-gpu-layers` is not 0, else `cpu`.
@@ -223,13 +225,6 @@ impl Cli {
         }
         if self.mmproj.is_some() {
             notes.push("--mmproj ignored: this runtime reads text only".into());
-        }
-        if self.parallel > 1 {
-            notes.push(format!(
-                "--parallel {}: requests run one at a time; each gets {} context tokens",
-                self.parallel,
-                self.ctx_size / self.parallel
-            ));
         }
         notes
     }

@@ -42,6 +42,11 @@ pub fn vocab() -> Arc<Vocab> {
 }
 
 pub fn engine(config: Config, ctx: usize) -> Engine {
+    engine_with_slots(config, ctx, 1)
+}
+
+/// An engine serving `slots` requests at once (continuous batching), `ctx` tokens each.
+pub fn engine_with_slots(config: Config, ctx: usize, slots: usize) -> Engine {
     let options = EngineOptions {
         config,
         ctx,
@@ -54,6 +59,7 @@ pub fn engine(config: Config, ctx: usize) -> Engine {
         speculate: false,
         prefix_reuse: true,
         warmup: false,
+        slots,
         quant: None,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
@@ -138,6 +144,9 @@ impl Backend for Scripted {
             cached_tokens: 0,
             capture_s: 0.0,
             path: ncm_server::engine::DecodePath::Eager,
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
         })
     }
 }

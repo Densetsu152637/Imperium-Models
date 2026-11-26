@@ -32,6 +32,7 @@ fn engine(config: Config, speculate: bool) -> Engine {
         speculate,
         prefix_reuse: true,
         warmup: false,
+        slots: 1,
     };
     Engine::new(options, vocab()).expect("a tiny engine")
 }

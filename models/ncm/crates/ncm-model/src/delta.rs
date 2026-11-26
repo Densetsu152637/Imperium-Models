@@ -254,6 +254,12 @@ impl DeltaCache {
         crate::cache::store(&mut self.conv, conv);
     }
 
+    /// Makes this state a copy of `src` (same shape), in the existing buffers on CUDA.
+    pub fn copy_from(&mut self, src: &DeltaCache) {
+        self.set(src.state.clone(), src.conv.clone());
+        self.length = src.length;
+    }
+
     /// Back to the empty state, in the existing buffers on CUDA (see [`Self::set`]).
     pub fn reset(&mut self) {
         let device = self.state.device();

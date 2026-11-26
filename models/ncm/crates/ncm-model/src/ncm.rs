@@ -96,6 +96,44 @@ impl DecoderBlock {
     }
 }
 
+impl DecoderBlock {
+    /// [`Self::step`] for a batch whose rows are separate streams (slots): row i's
+    /// self-attention cache and cross-attention ring are `caches[i]`, its query positions
+    /// `rope_q[i]`. Norms and the MLP run batched, the attentions once per row.
+    fn step_slots(
+        &self,
+        x: Tensor<3>,
+        rope_self: &Rope,
+        rope_q: &[Rope],
+        caches: &mut [(&mut KvCache, &KvCache)],
+        pending: Option<Tensor<3>>,
+    ) -> (Tensor<3>, Option<Tensor<3>>) {
+        let (x, h) = norm_after(&self.n1, x, pending);
+        let attn: Vec<Tensor<3>> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(i, (own, _))| {
+                self.self_attn.forward(h.clone().narrow(0, i, 1), rope_self, Some(&mut **own))
+            })
+            .collect();
+        let (x, h) = add_rms_norm(&self.n2, x, Tensor::cat(attn, 0));
+        let crossed: Vec<Tensor<3>> = caches
+            .iter()
+            .enumerate()
+            .map(|(i, (_, ring))| {
+                let (keys, values) = ring.view();
+                self.cross.forward(h.clone().narrow(0, i, 1), &rope_q[i], keys, values, None)
+            })
+            .collect();
+        let crossed = Tensor::cat(crossed, 0);
+        if let Some(x) = self.mlp.residual_step(&self.n3, &x, Some(&crossed)) {
+            return (x, None);
+        }
+        let (x, h) = add_rms_norm(&self.n3, x, crossed);
+        (x, Some(self.mlp.forward(h)))
+    }
+}
+
 /// Most tokens the encoder takes in one call during prefill (see [`NcmLm::append_tokens`]).
 pub const ENCODER_CHUNK: usize = 1024;
 
@@ -148,6 +186,24 @@ impl NcmCache {
         self.backbone.iter_mut().chain(&mut self.encoder).for_each(LayerCache::reset);
         self.cross.iter_mut().chain(&mut self.dec_self).for_each(KvCache::reset);
         self.tokens = 0;
+    }
+
+    /// Makes this cache a copy of `src` (a cache of the same model and size): every stack, the
+    /// cross-attention rings and the position, in this cache's own buffers on CUDA, so graphs
+    /// captured against it stay valid (forking one request's prefilled prompt into another
+    /// slot).
+    pub fn copy_from(&mut self, src: &NcmCache) {
+        for (c, s) in self.backbone.iter_mut().zip(&src.backbone) {
+            c.copy_from(s);
+        }
+        for (c, s) in self.encoder.iter_mut().zip(&src.encoder) {
+            c.copy_from(s);
+        }
+        for (c, s) in self.cross.iter_mut().zip(&src.cross) {
+            c.copy_from(s);
+        }
+        self.dec_self.iter_mut().for_each(KvCache::reset);
+        self.tokens = src.tokens;
     }
 
     /// Tokens the cache holds, and copies of what moving on would overwrite: [`Self::restore`]
@@ -498,6 +554,82 @@ impl NcmLm {
         let cond = self.prefill(prompt, &mut cache, chunk);
         let (written, _) = self.decode_concept(cond, &mut cache, None, false);
         drop(written.into_data());
+    }
+
+    /// [`Self::append_tokens`] of one concept per batch row, the rows separate streams (slots):
+    /// `tokens` `[B, k]`, row i appended to `caches[i]` (built for batch 1). Returns each
+    /// row's next condition `[B, 1, d]`.
+    pub fn append_slots(&self, tokens: Tensor<2, Int>, caches: &mut [&mut NcmCache]) -> Tensor<3> {
+        let k = self.k;
+        let [b, t] = tokens.dims();
+        assert!(t == k && b == caches.len(), "one concept per slot");
+        let device = tokens.device();
+        let x = self.emb.forward(tokens);
+        let states = {
+            let mut enc: Vec<&mut [LayerCache]> =
+                caches.iter_mut().map(|c| c.encoder.as_mut_slice()).collect();
+            self.encoder.forward_slots(x, &mut enc)
+        };
+        for (i, cache) in caches.iter_mut().enumerate() {
+            let rope_k = self.rope(cache.tokens, k, &device);
+            let row = states.clone().narrow(0, i, 1);
+            for (blk, ring) in self.dec_blocks.iter().zip(cache.cross.iter_mut()) {
+                let (keys, values) = blk.cross.make_kv(row.clone(), &rope_k);
+                ring.write(keys, values);
+            }
+        }
+        let concepts = self.pool.forward(states.reshape([b, 1, k * self.local_dim]));
+        let h = {
+            let mut bb: Vec<&mut [LayerCache]> =
+                caches.iter_mut().map(|c| c.backbone.as_mut_slice()).collect();
+            self.backbone.forward_slots(concepts, &mut bb)
+        };
+        for cache in caches.iter_mut() {
+            cache.tokens += k;
+        }
+        self.cond_proj.forward(h)
+    }
+
+    /// [`Self::decode_concept_with`] for a batch of separate streams: `cond` `[B, 1, d]`, row i
+    /// decoded against `caches[i]`; `pick(j, logits)` chooses token j of every row from logits
+    /// `[B, 1, V]` and returns `[B, 1]`. Returns the tokens `[B, k]`.
+    pub fn decode_slots(
+        &self,
+        cond: Tensor<3>,
+        caches: &mut [&mut NcmCache],
+        pick: &mut dyn FnMut(usize, &Tensor<3>) -> Tensor<2, Int>,
+    ) -> Tensor<2, Int> {
+        let (k, d) = (self.k, self.local_dim);
+        let [b, _, _] = cond.dims();
+        let device = cond.device();
+        for cache in caches.iter_mut() {
+            cache.dec_self.iter_mut().for_each(KvCache::reset);
+        }
+        let rope_self = self.rope(0, k, &device);
+        let rope_q: Vec<Rope> = caches.iter().map(|c| self.rope(c.tokens, k, &device)).collect();
+        let mut tokens = Vec::with_capacity(k);
+        let mut inp = self.start_emb.val().reshape([1, 1, d]).expand([b, 1, d]);
+        for j in 0..k {
+            let mut x = inp + cond.clone();
+            let rs = rope_self.rows(j, 1);
+            let rq: Vec<Rope> = rope_q.iter().map(|r| r.rows(j, 1)).collect();
+            let mut pending = None;
+            for (l, blk) in self.dec_blocks.iter().enumerate() {
+                let mut layer: Vec<(&mut KvCache, &KvCache)> = caches
+                    .iter_mut()
+                    .map(|c| {
+                        let NcmCache { dec_self, cross, .. } = &mut **c;
+                        (&mut dec_self[l], &cross[l])
+                    })
+                    .collect();
+                (x, pending) = blk.step_slots(x, &rs, &rq, &mut layer, pending);
+            }
+            let logits = self.project(norm_after(&self.dec_norm, x, pending).1);
+            let next = pick(j, &logits);
+            inp = self.emb.forward(next.clone());
+            tokens.push(next);
+        }
+        Tensor::cat(tokens, 1)
     }
 
     /// Feed a prompt (length a multiple of k) in chunks; returns the next-concept condition.

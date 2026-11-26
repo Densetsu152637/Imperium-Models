@@ -114,6 +114,13 @@ impl TokenLm {
         })
     }
 
+    /// One decode step for tokens `[B, 1]` whose rows are separate streams, row i with its own
+    /// caches `caches[i]` (built for batch 1) at its own position: logits `[B, 1, V]`
+    /// ([`crate::layers::Stack::forward_slots`]).
+    pub fn step_slots(&self, token: Tensor<2, Int>, caches: &mut [&mut [LayerCache]]) -> Tensor<3> {
+        self.logits(self.stack.forward_slots(self.emb.forward(token), caches))
+    }
+
     /// One decode step for tokens `[B, 1]`; returns logits `[B, 1, V]`.
     pub fn step(&self, token: Tensor<2, Int>, caches: &mut [LayerCache]) -> Tensor<3> {
         self.forward(token, Some(caches))

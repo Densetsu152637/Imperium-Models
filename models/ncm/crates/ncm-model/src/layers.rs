@@ -626,6 +626,20 @@ enum MixInput {
     Attention(AttnIn),
 }
 
+impl MixInput {
+    /// Batch row `i` of the input (one slot's).
+    fn row(&self, i: usize) -> MixInput {
+        let pick = |t: &Tensor<3>| t.clone().narrow(0, i, 1);
+        match self {
+            Self::Normed(h) => Self::Normed(pick(h)),
+            Self::Projected(p) => Self::Projected(pick(p)),
+            Self::Attention(a) => {
+                Self::Attention(AttnIn { gate: a.gate.as_ref().map(pick), qkv: pick(&a.qkv) })
+            }
+        }
+    }
+}
+
 /// Queries from the local decoder; keys and values from local-encoder states.
 #[derive(Module, Debug)]
 pub struct CrossAttention {
@@ -864,6 +878,46 @@ impl Block {
         }
         #[cfg(not(feature = "cuda"))]
         None
+    }
+
+    /// [`Self::forward`] for a batch whose rows are separate streams (slots), each with its own
+    /// position `starts[i]`, tables `ropes[i]` and caches `caches[i][layer]` (and in a captured
+    /// graph its layer's cursor step `steps[i][layer]`): the norms, the mixer's input projections
+    /// and the MLP run over the whole batch, the mixer itself (caches, attention, its output
+    /// projection) once per row. TODO: batch the mixers' output projections too.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_slots(
+        &self,
+        x: Tensor<3>,
+        pending: Option<Tensor<3>>,
+        starts: &[usize],
+        ropes: &[&Ropes],
+        caches: &mut [&mut [LayerCache]],
+        layer: usize,
+        steps: Option<&[Vec<Option<KvStep>>]>,
+    ) -> (Tensor<3>, Option<Tensor<3>>) {
+        let fused = if pending.is_none() { self.fused_input(&x) } else { None };
+        let (x, input) = match fused {
+            Some(input) => (x, input),
+            None => {
+                let (x, h) = norm_after(&self.n1, x, pending);
+                (x, MixInput::Normed(h))
+            }
+        };
+        let rows: Vec<Tensor<3>> = caches
+            .iter_mut()
+            .enumerate()
+            .map(|(i, c)| {
+                let step = steps.and_then(|s| s[i][layer].as_ref());
+                self.mix(input.row(i), starts[i], ropes[i], Some(&mut c[layer]), step)
+            })
+            .collect();
+        let mixed = Tensor::cat(rows, 0);
+        if let Some(x) = self.mlp.residual_step(&self.n2, &x, Some(&mixed)) {
+            return (x, None);
+        }
+        let (x, h) = crate::fused::add_rms_norm(&self.n2, x, mixed);
+        (x, Some(self.mlp.forward(h)))
     }
 
     /// The block on `x` plus `pending` (the previous block's MLP output, not yet added: the add
@@ -1110,6 +1164,36 @@ impl Stack {
         norm_after(&self.norm, x, pending).1
     }
 
+    /// One step of `x` `[B, t, d]` whose batch rows are separate streams, row i with its own
+    /// caches `caches[i]` (each built for batch 1) at its own position: continuous batching of
+    /// requests. Each row's result equals [`Self::forward`] of that row alone up to rounding.
+    pub fn forward_slots(&self, x: Tensor<3>, caches: &mut [&mut [LayerCache]]) -> Tensor<3> {
+        let t = x.dims()[1];
+        assert_eq!(x.dims()[0], caches.len(), "one cache set per batch row");
+        let device = x.device();
+        let starts: Vec<usize> = caches.iter().map(|c| c[0].len()).collect();
+        let ropes: Vec<Ropes> = starts.iter().map(|&s| self.ropes(s, t, &device)).collect();
+        let ropes: Vec<&Ropes> = ropes.iter().collect();
+        self.forward_slots_with(x, &starts, &ropes, caches, None)
+    }
+
+    /// [`Self::forward_slots`] with the tables given, and in a captured graph each row's layer
+    /// steps.
+    fn forward_slots_with(
+        &self,
+        x: Tensor<3>,
+        starts: &[usize],
+        ropes: &[&Ropes],
+        caches: &mut [&mut [LayerCache]],
+        steps: Option<&[Vec<Option<KvStep>>]>,
+    ) -> Tensor<3> {
+        let (mut x, mut pending) = (x, None);
+        for (i, block) in self.blocks.iter().enumerate() {
+            (x, pending) = block.forward_slots(x, pending, starts, ropes, caches, i, steps);
+        }
+        norm_after(&self.norm, x, pending).1
+    }
+
     /// One cache per layer for runs of up to `max_positions`.
     pub fn make_caches(
         &self,
@@ -1272,6 +1356,26 @@ impl StackStep {
             self.cursors.iter().map(|c| c.map(|i| steps[i].clone())).collect();
         let start = caches[0].len();
         stack.forward_with(x, start, &self.ropes, Some(caches), Some(&layer_steps))
+    }
+
+    /// [`Self::run`] for a batch of separate streams: row i through `steps[i]` (its own fixed
+    /// tables and cursors, the latter indexing `kv[i]`, its cursor set's steps) and `caches[i]`.
+    #[allow(dead_code)] // graphs per slot set (next commit)
+    pub(crate) fn run_slots(
+        stack: &Stack,
+        steps: &[&StackStep],
+        x: Tensor<3>,
+        caches: &mut [&mut [LayerCache]],
+        kv: &[Vec<KvStep>],
+    ) -> Tensor<3> {
+        let layer_steps: Vec<Vec<Option<KvStep>>> = steps
+            .iter()
+            .zip(kv)
+            .map(|(s, kv)| s.cursors.iter().map(|c| c.map(|i| kv[i].clone())).collect())
+            .collect();
+        let starts: Vec<usize> = caches.iter().map(|c| c[0].len()).collect();
+        let ropes: Vec<&Ropes> = steps.iter().map(|s| &s.ropes).collect();
+        stack.forward_slots_with(x, &starts, &ropes, caches, Some(&layer_steps))
     }
 
     /// What a warm-up run changes, to put back with [`Self::restore`].
