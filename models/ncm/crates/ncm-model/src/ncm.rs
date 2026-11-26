@@ -625,6 +625,54 @@ impl NcmLm {
         self.cond_proj.forward(if n == 1 { h } else { h.narrow(1, n - 1, 1) })
     }
 
+    /// [`Self::append_slots`] for chunks of different lengths, packed into one batch row
+    /// (varlen): `tokens` `[1, sum of lens]`, slot i's `lens[i]` tokens (each a positive
+    /// multiple of k, at most [`ENCODER_CHUNK`]) after the earlier slots', appended to
+    /// `caches[i]` at its own position ([`crate::layers::Stack::forward_packed`]: projections and
+    /// MLPs once over every position, mixers per segment, nothing padded). Returns each slot's
+    /// next condition `[slots, 1, d]`.
+    pub fn append_packed(
+        &self,
+        tokens: Tensor<2, Int>,
+        lens: &[usize],
+        caches: &mut [&mut NcmCache],
+    ) -> Tensor<3> {
+        let k = self.k;
+        let [b, t] = tokens.dims();
+        assert!(b == 1 && lens.len() == caches.len(), "one packed row, one segment per slot");
+        assert!(lens.iter().all(|&l| l > 0 && l % k == 0), "whole concepts for every slot");
+        assert_eq!(lens.iter().sum::<usize>(), t, "the segments cover the row");
+        let device = tokens.device();
+        let x = self.emb.forward(tokens);
+        let states = {
+            let mut enc: Vec<&mut [LayerCache]> =
+                caches.iter_mut().map(|c| c.encoder.as_mut_slice()).collect();
+            self.encoder.forward_packed(x, lens, &mut enc)
+        };
+        let ropes: Vec<Rope> =
+            caches.iter().zip(lens).map(|(c, &l)| self.rope(c.tokens, l, &device)).collect();
+        for (l, blk) in self.dec_blocks.iter().enumerate() {
+            let kvs = blk.cross.make_kv_packed(states.clone(), &ropes, lens);
+            for (cache, (keys, values)) in caches.iter_mut().zip(kvs) {
+                cache.cross[l].write(keys, values);
+            }
+        }
+        let concepts = self.pool.forward(states.reshape([1, t / k, k * self.local_dim]));
+        let concept_lens: Vec<usize> = lens.iter().map(|&l| l / k).collect();
+        let h = {
+            let mut bb: Vec<&mut [LayerCache]> =
+                caches.iter_mut().map(|c| c.backbone.as_mut_slice()).collect();
+            self.backbone.forward_packed(concepts, &concept_lens, &mut bb)
+        };
+        for (cache, &len) in caches.iter_mut().zip(lens) {
+            cache.tokens += len;
+        }
+        let last = crate::layers::segment_ends(&concept_lens, &device);
+        let slots = lens.len();
+        let d = h.dims()[2];
+        self.cond_proj.forward(h.select(1, last).reshape([slots, 1, d]))
+    }
+
     /// [`Self::prefill`] of one prompt piece per batch row, the rows separate streams (slots)
     /// each at its own position: `tokens` `[B, n]` (`n` a multiple of k), row i into
     /// `caches[i]`, in chunks of `chunk` tokens (at most [`ENCODER_CHUNK`]) through

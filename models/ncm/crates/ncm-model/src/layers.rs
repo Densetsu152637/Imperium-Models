@@ -629,6 +629,12 @@ impl MixOut {
 
     /// Batch rows of several results stacked (gates kept apart only when every row has one).
     pub(crate) fn cat(rows: Vec<MixOut>) -> Self {
+        Self::cat_on(rows, 0)
+    }
+
+    /// Several results joined along `dim` (0: batch rows, 1: packed segments), gates as for
+    /// [`Self::cat`].
+    pub(crate) fn cat_on(rows: Vec<MixOut>, dim: usize) -> Self {
         let gated = rows.iter().all(|r| r.gate.is_some());
         let (mut xs, mut gates) = (Vec::with_capacity(rows.len()), Vec::new());
         for row in rows {
@@ -641,8 +647,8 @@ impl MixOut {
                 (_, None) => xs.push(row.x),
             }
         }
-        let gate = gated.then(|| Tensor::cat(gates, 0));
-        Self { x: Tensor::cat(xs, 0), gate }
+        let gate = gated.then(|| Tensor::cat(gates, dim));
+        Self { x: Tensor::cat(xs, dim), gate }
     }
 
     /// `(x * gate) W` through `o`, the gate's product in the GEMV's prologue on CUDA for
@@ -675,6 +681,12 @@ impl AttnIn {
         let pick = |t: &Tensor<3>| t.clone().narrow(0, i, 1);
         AttnIn { gate: self.gate.as_ref().map(pick), qkv: pick(&self.qkv) }
     }
+
+    /// Positions `start .. start + len` (one packed segment's).
+    fn span(&self, start: usize, len: usize) -> AttnIn {
+        let pick = |t: &Tensor<3>| t.clone().narrow(1, start, len);
+        AttnIn { gate: self.gate.as_ref().map(pick), qkv: pick(&self.qkv) }
+    }
 }
 
 /// An attention layer's input projections: the sigmoid output gate (v2) and the joint QKV
@@ -704,6 +716,16 @@ impl MixInput {
             Self::Normed(h) => Self::Normed(pick(h)),
             Self::Projected(p) => Self::Projected(pick(p)),
             Self::Attention(a) => Self::Attention(a.row(i)),
+        }
+    }
+
+    /// Positions `start .. start + len` of the input (one packed segment's).
+    fn span(&self, start: usize, len: usize) -> MixInput {
+        let pick = |t: &Tensor<3>| t.clone().narrow(1, start, len);
+        match self {
+            Self::Normed(h) => Self::Normed(pick(h)),
+            Self::Projected(p) => Self::Projected(pick(p)),
+            Self::Attention(a) => Self::Attention(a.span(start, len)),
         }
     }
 }
@@ -751,6 +773,28 @@ impl CrossAttention {
             .iter()
             .enumerate()
             .map(|(i, rope)| self.kv_from(kv.clone().narrow(0, i, 1), rope))
+            .collect()
+    }
+
+    /// [`Self::make_kv`] for packed segments of one batch row (`states` `[1, sum of lens, d]`),
+    /// segment i of `lens[i]` positions at those of `ropes[i]`: the projection once over the
+    /// row, RoPE per segment.
+    pub fn make_kv_packed(
+        &self,
+        states: Tensor<3>,
+        ropes: &[Rope],
+        lens: &[usize],
+    ) -> Vec<(Tensor<4>, Tensor<4>)> {
+        let kv = self.kv.forward(states);
+        let mut at = 0;
+        ropes
+            .iter()
+            .zip(lens)
+            .map(|(rope, &len)| {
+                let piece = kv.clone().narrow(1, at, len);
+                at += len;
+                self.kv_from(piece, rope)
+            })
             .collect()
     }
 
@@ -1061,7 +1105,9 @@ impl Block {
     /// position `starts[i]`, tables `ropes[i]` and caches `caches[i][layer]` (and in a captured
     /// graph its layer's cursor step `steps[i][layer]`): the norms, the mixer's input projections
     /// and the MLP run over the whole batch, the mixer itself (caches, attention, its output
-    /// projection) once per row. TODO: batch the mixers' output projections too.
+    /// projection) once per row. With `packed` lengths the slots are instead consecutive
+    /// segments of one batch row (`x` `[1, sum of lengths, d]`), slot i's segment of
+    /// `packed[i]` positions: varlen batching of chunks of different lengths, nothing padded.
     #[allow(clippy::too_many_arguments)]
     fn forward_slots(
         &self,
@@ -1072,6 +1118,7 @@ impl Block {
         caches: &mut [&mut [LayerCache]],
         layer: usize,
         steps: Option<&[Vec<Option<KvStep>>]>,
+        packed: Option<&[usize]>,
     ) -> (Tensor<3>, Option<Tensor<3>>) {
         let fused = if pending.is_none() { self.fused_input(&x) } else { None };
         let (x, input) = match fused {
@@ -1085,9 +1132,28 @@ impl Block {
         // Each slot's mixer core on its own caches (retrieval decode of pooled slots in one set
         // of launches), then the output projection once over all rows: one weight read per
         // layer instead of one per slot.
-        let core = match self.pooled_retrieval(&input, ropes, caches, layer) {
-            Some(core) => core,
-            None => {
+        let pooled = if packed.is_none() {
+            self.pooled_retrieval(&input, ropes, caches, layer)
+        } else {
+            None
+        };
+        let core = match (pooled, packed) {
+            (Some(core), _) => core,
+            (None, Some(lens)) => {
+                let mut at = 0;
+                let segments: Vec<MixOut> = caches
+                    .iter_mut()
+                    .zip(lens)
+                    .enumerate()
+                    .map(|(i, (c, &len))| {
+                        let input = input.span(at, len);
+                        at += len;
+                        self.mix_core(input, starts[i], ropes[i], Some(&mut c[layer]), None)
+                    })
+                    .collect();
+                MixOut::cat_on(segments, 1)
+            }
+            (None, None) => {
                 let rows: Vec<MixOut> = caches
                     .iter_mut()
                     .enumerate()
@@ -1159,6 +1225,20 @@ pub enum LayerKind {
     },
     DeltaNet,
     Retrieval,
+}
+
+/// The index of each packed segment's last position (`lens` consecutive segments of one row).
+pub(crate) fn segment_ends(lens: &[usize], device: &Device) -> Tensor<1, burn::tensor::Int> {
+    let mut at = 0i64;
+    let ends: Vec<i64> = lens
+        .iter()
+        .map(|&l| {
+            at += l as i64;
+            at - 1
+        })
+        .collect();
+    let n = ends.len();
+    Tensor::from_data(burn::tensor::TensorData::new(ends, [n]), device)
 }
 
 /// The fallback layer pattern: sliding-window layers with every `full_every`-th layer full.
@@ -1364,6 +1444,35 @@ impl Stack {
         self.forward_slots_with(x, &starts, &ropes, caches, None)
     }
 
+    /// [`Self::forward_slots`] for slots with chunks of different lengths, packed into one
+    /// batch row: `x` `[1, sum of lens, d]`, slot i's `lens[i]` positions (each > 0) after the
+    /// earlier slots', continuing `caches[i]` at its own position. The norms, projections and
+    /// MLPs run once over every position, each mixer per segment; no padding is computed or
+    /// written to any cache. Each segment's result equals [`Self::forward`] of that chunk alone
+    /// up to rounding.
+    pub fn forward_packed(
+        &self,
+        x: Tensor<3>,
+        lens: &[usize],
+        caches: &mut [&mut [LayerCache]],
+    ) -> Tensor<3> {
+        let [b, t, _] = x.dims();
+        assert!(b == 1 && lens.len() == caches.len(), "one packed row, one segment per slot");
+        assert_eq!(lens.iter().sum::<usize>(), t, "the segments cover the row");
+        assert!(lens.iter().all(|&l| l > 0), "no empty segment");
+        let device = x.device();
+        let starts: Vec<usize> = caches.iter().map(|c| c[0].len()).collect();
+        let ropes: Vec<Ropes> =
+            starts.iter().zip(lens).map(|(&s, &l)| self.ropes(s, l, &device)).collect();
+        let ropes: Vec<&Ropes> = ropes.iter().collect();
+        let (mut x, mut pending) = (x, None);
+        for (i, block) in self.blocks.iter().enumerate() {
+            (x, pending) =
+                block.forward_slots(x, pending, &starts, &ropes, caches, i, None, Some(lens));
+        }
+        norm_after(&self.norm, x, pending).1
+    }
+
     /// [`Self::forward_slots`] with the tables given, and in a captured graph each row's layer
     /// steps.
     fn forward_slots_with(
@@ -1376,7 +1485,7 @@ impl Stack {
     ) -> Tensor<3> {
         let (mut x, mut pending) = (x, None);
         for (i, block) in self.blocks.iter().enumerate() {
-            (x, pending) = block.forward_slots(x, pending, starts, ropes, caches, i, steps);
+            (x, pending) = block.forward_slots(x, pending, starts, ropes, caches, i, steps, None);
         }
         norm_after(&self.norm, x, pending).1
     }
