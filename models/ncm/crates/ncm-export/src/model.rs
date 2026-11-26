@@ -15,7 +15,7 @@ use ncm_model::{Config, TokConfig};
 
 use crate::ExportError;
 use crate::graph::{Graph, Val, WeightPool};
-use crate::layers::{AttnDims, AttnExtras, Cx, DeltaDims, DeltaWeights};
+use crate::layers::{AttnDims, AttnExtras, Cx, DeltaDims, DeltaWeights, RetDims, RetWeights};
 use crate::onnx::DType;
 use crate::quant::WeightForm;
 use crate::weights::{F32Tensor, Weights};
@@ -82,16 +82,13 @@ pub struct PhasePlan {
 
 fn kinds_support(cfg: &TokConfig) -> Support {
     let spec = tok_spec(cfg);
-    for (i, kind) in spec.kinds.iter().enumerate() {
+    for kind in spec.kinds.iter() {
         match kind {
             LayerKind::DeltaNet => {}
             LayerKind::Attention { .. } => {}
-            LayerKind::Retrieval => {
-                return Support::Unsupported(format!(
-                    "layer {i} is a sparse-retrieval layer: the absorbed-MLA attention and the \
-                     indexer are not exported yet"
-                ));
-            }
+            // Dense attention over the whole latent cache: exact while the sparse selection
+            // would pick every block; the split top-k path beyond that is not written yet.
+            LayerKind::Retrieval => {}
         }
     }
     Support::Supported
@@ -214,6 +211,7 @@ struct Plan<'a> {
     names: Names<'a>,
     kinds: Vec<LayerKind>,
     layers: Vec<LayerSpec>,
+    spec: ncm_model::layers::StackSpec,
     rope: Vec<RopeSpec>,
     /// The rope table index of each attention layer.
     rope_of: Vec<Option<usize>>,
@@ -367,6 +365,58 @@ impl Plan<'_> {
                     outputs.push(io(&nv, DType::F32, &new_shape, Role::NewV, Some(i)));
                     out.y
                 }
+                (LayerKind::Retrieval, LayerSpec::Retrieval { cache, rope, .. }) => {
+                    let rs = self.spec.retrieval();
+                    let dm = RetDims {
+                        d: rs.d,
+                        heads: rs.heads,
+                        nope_dim: rs.nope_dim,
+                        rope_dim: rs.rope_dim,
+                        v_dim: rs.v_dim,
+                        latent: rs.latent,
+                        index_heads: rs.index_heads,
+                        index_dim: rs.index_dim,
+                        eps: rs.eps,
+                    };
+                    let rw = RetWeights {
+                        proj: self.names.mixer(i, "Retrieval", "proj.weight")?,
+                        q_norm: self.names.mixer(i, "Retrieval", "q_norm.gamma")?,
+                        kv_norm: self.names.mixer(i, "Retrieval", "kv_norm.gamma")?,
+                        rope_norm: self.names.mixer(i, "Retrieval", "rope_norm.gamma")?,
+                        index_norm: self.names.mixer(i, "Retrieval", "index_norm.gamma")?,
+                        uk: self.names.mixer(i, "Retrieval", "uk.weight")?,
+                        uv: self.names.mixer(i, "Retrieval", "uv.weight")?,
+                        o: self.names.mixer(i, "Retrieval", "o.weight")?,
+                    };
+                    expect_shape(&rw.proj, &[dm.d, dm.proj_width()], "retrieval proj")?;
+                    let w = dm.entry_width() as i64;
+                    let cache_shape = [1, *cache as i64, w];
+                    let bias_shape = [ti, (*cache + t) as i64];
+                    let (ln, bn) = (format!("l{i}.latent"), format!("l{i}.bias"));
+                    let lat = cx.g.input(&ln, DType::F32, &cache_shape);
+                    let bias = cx.g.input(&bn, DType::F32, &bias_shape);
+                    inputs.push(io(&ln, DType::F32, &cache_shape, Role::Latent, Some(i)));
+                    inputs.push(io(&bn, DType::F32, &bias_shape, Role::Bias, Some(i)));
+                    let (cos, sin) = tables[*rope].clone().expect("the layer rope table");
+                    let out = cx.retrieval_dense(
+                        &Names::key(i, "retrieval"),
+                        &dm,
+                        &rw,
+                        &normed,
+                        &cos,
+                        &sin,
+                        &lat,
+                        &bias,
+                        t,
+                    )?;
+                    let (en, kn) = (format!("l{i}.new_latent"), format!("l{i}.new_index_key"));
+                    let (es, ks) = ([1, ti, w], [1, ti, dm.index_dim as i64]);
+                    cx.g.output(&en, &out.entry, DType::F32, &es);
+                    cx.g.output(&kn, &out.index_key, DType::F32, &ks);
+                    outputs.push(io(&en, DType::F32, &es, Role::NewLatent, Some(i)));
+                    outputs.push(io(&kn, DType::F32, &ks, Role::NewIndexKey, Some(i)));
+                    out.y
+                }
                 (kind, _) => {
                     return Err(ExportError::Unsupported(format!("layer {i} ({kind:?})")));
                 }
@@ -430,11 +480,23 @@ pub fn export(
     let mut rope: Vec<RopeSpec> = Vec::new();
     let mut rope_of = Vec::new();
     let mut layers = Vec::new();
-    let find_or_add = |rope: &mut Vec<RopeSpec>, name: &str, base: f64, scale: f64| {
+    let find_or_add = |rope: &mut Vec<RopeSpec>,
+                       name: &str,
+                       dim: usize,
+                       base: f64,
+                       scale: f64,
+                       yarn: (f64, usize)| {
         if let Some(i) = rope.iter().position(|r| r.name == name) {
             return i;
         }
-        rope.push(RopeSpec { name: name.into(), dim: cfg.head_dim, base, scale });
+        rope.push(RopeSpec {
+            name: name.into(),
+            dim,
+            base,
+            scale,
+            yarn_factor: yarn.0,
+            yarn_original: yarn.1,
+        });
         rope.len() - 1
     };
     for kind in &spec.kinds {
@@ -452,7 +514,7 @@ pub fn export(
                     Some(_) => ("local", cfg.rope_base, cfg.rope_scale),
                     None => ("full", cfg.rope_base_full, cfg.rope_scale_full),
                 };
-                let r = find_or_add(&mut rope, name, base, scale);
+                let r = find_or_add(&mut rope, name, cfg.head_dim, base, scale, (1.0, 1));
                 rope_of.push(Some(r));
                 // The window counts the position itself: the ring holds the previous ones.
                 let ring = window.map_or(opts.ctx - 1, |w| (w - 1).min(opts.ctx - 1));
@@ -464,13 +526,46 @@ pub fn export(
                     rope: r,
                 });
             }
-            LayerKind::Retrieval => unreachable!("rejected above"),
+            LayerKind::Retrieval => {
+                let rs = spec.retrieval();
+                // The retrieval layers decoupled key: the full-attention base, with YaRN.
+                let r = find_or_add(
+                    &mut rope,
+                    "retrieval",
+                    rs.rope_dim,
+                    cfg.rope_base_full,
+                    cfg.rope_scale_full,
+                    (cfg.v2.ret_yarn_factor, cfg.v2.ret_yarn_original),
+                );
+                rope_of.push(Some(r));
+                layers.push(LayerSpec::Retrieval {
+                    heads: rs.heads,
+                    nope_dim: rs.nope_dim,
+                    rope_dim: rs.rope_dim,
+                    v_dim: rs.v_dim,
+                    latent: rs.latent,
+                    index_heads: rs.index_heads,
+                    index_dim: rs.index_dim,
+                    block: rs.block,
+                    topk: rs.topk,
+                    local: rs.local,
+                    cache: (opts.ctx - 1).max(1),
+                    rope: r,
+                    // Dense equals sparse while every candidate block is selected.
+                    dense_exact_until: if rs.dense {
+                        usize::MAX
+                    } else {
+                        rs.local + rs.topk * rs.block
+                    },
+                });
+            }
         }
     }
     let plan = Plan {
         cfg,
         names: Names { w: weights },
         kinds: spec.kinds.clone(),
+        spec: spec.clone(),
         layers: layers.clone(),
         rope: rope.clone(),
         rope_of,
@@ -655,16 +750,16 @@ mod tests {
     }
 
     #[test]
-    fn the_v2_design_names_the_retrieval_layer_it_cannot_export_yet() {
+    fn the_v2_design_describes_as_exportable_and_needs_its_weights() {
         let cfg = TokConfig { vocab_size: 272, ..tiny_tok_v2(tiny_v2(4, 2, 8)) };
         let plans = describe(&Config::Tok(cfg.clone()), &[8]);
-        assert!(matches!(&plans[0].support, Support::Unsupported(w) if w.contains("retrieval")));
+        assert!(plans.iter().all(|p| p.support == Support::Supported), "{plans:?}");
         let weights = Weights::from_bytes(safetensors_bytes(&[], &[]), "empty").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let opts =
             ExportOptions { ctx: 16, buckets: vec![], form: WeightForm::F32, target: Target::Cpu };
         let err = export(&Config::Tok(cfg), &weights, dir.path(), &opts).unwrap_err();
-        assert!(err.to_string().contains("sparse-retrieval"), "{err}");
+        assert!(err.to_string().contains("emb.weight"), "{err}");
     }
 
     #[test]

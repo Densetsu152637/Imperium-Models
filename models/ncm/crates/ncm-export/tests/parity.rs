@@ -349,3 +349,98 @@ fn gated_qk_norm_attention_matches_the_burn_layer() {
     let diff = max_diff(&got["y"], &host(want));
     assert!(diff <= 1e-4, "gated attention max |dy| = {diff}");
 }
+
+/// One retrieval layer in dense form against the Burn layer's forward, over a prefill chunk
+/// short enough that no block is a retrieval candidate (so the reference attends causally to
+/// everything, as the dense graph does). UNVERIFIED: written without a run.
+#[test]
+fn dense_retrieval_matches_the_burn_layer() {
+    use ncm_export::layers::{RetDims, RetWeights};
+    use ncm_model::layers::{Rope, Yarn};
+    use ncm_model::retrieval::{RetrievalSpec, SparseRetrieval};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let device = Device::flex();
+    device.seed(31);
+    let spec = RetrievalSpec {
+        d: 32,
+        heads: 2,
+        nope_dim: 8,
+        rope_dim: 4,
+        v_dim: 8,
+        latent: 16,
+        index_heads: 2,
+        index_dim: 8,
+        block: 2,
+        topk: 1,
+        local: 16,
+        dense: false,
+        index_8bit: true,
+        eps: 1e-6,
+    };
+    let net = SparseRetrieval::new(&spec, &device);
+    let path = dir.path().join("ret.safetensors");
+    save_weights(&net, &Config::Tok(tiny_tok(8)), &path).unwrap();
+    let w = Weights::open(&path).unwrap();
+    let get = |n: &str| w.get(n).unwrap_or_else(|e| panic!("{n}: {e}"));
+    let rw = RetWeights {
+        proj: get("proj.weight"),
+        q_norm: get("q_norm.gamma"),
+        kv_norm: get("kv_norm.gamma"),
+        rope_norm: get("rope_norm.gamma"),
+        index_norm: get("index_norm.gamma"),
+        uk: get("uk.weight"),
+        uv: get("uv.weight"),
+        o: get("o.weight"),
+    };
+    let dm = RetDims {
+        d: 32,
+        heads: 2,
+        nope_dim: 8,
+        rope_dim: 4,
+        v_dim: 8,
+        latent: 16,
+        index_heads: 2,
+        index_dim: 8,
+        eps: 1e-6,
+    };
+    let (t, cache, width) = (4usize, 1usize, dm.entry_width());
+    let ti = t as i64;
+    let mut pool = WeightPool::default();
+    let mut g = Graph::new("ret");
+    let x = g.input("x", DType::F32, &[1, ti, 32]);
+    let cos = g.input("cos", DType::F32, &[1, 1, ti, 4]);
+    let sin = g.input("sin", DType::F32, &[1, 1, ti, 4]);
+    let lat = g.input("lat", DType::F32, &[1, cache as i64, width as i64]);
+    let bias = g.input("bias", DType::F32, &[ti, (cache + t) as i64]);
+    let out = Cx { g: &mut g, pool: &mut pool, form: WeightForm::F32 }
+        .retrieval_dense("r", &dm, &rw, &x, &cos, &sin, &lat, &bias, t)
+        .unwrap();
+    g.output("y", &out.y, DType::F32, &[1, ti, 32]);
+    let mut s = session(&write_graph(dir.path(), "ret", &g, &pool));
+    let mut seed = 5u64;
+    let xs = pseudo(&mut seed, t * 32);
+    let rope = Rope::with_yarn(0, t, 4, 10_000.0, 1.0, Yarn::OFF, &device);
+    let (c, sn) = rope.to_vecs();
+    let mut b = vec![f32::NEG_INFINITY; t * (cache + t)];
+    for i in 0..t {
+        for j in 0..=i {
+            b[i * (cache + t) + cache + j] = 0.0;
+        }
+    }
+    let zeros = vec![0f32; cache * width];
+    let got = run(
+        &mut s,
+        &[
+            ("x", &[1, t, 32], &xs),
+            ("cos", &[1, 1, t, 4], &c),
+            ("sin", &[1, 1, t, 4], &sn),
+            ("lat", &[1, cache, width], &zeros),
+            ("bias", &[t, cache + t], &b),
+        ],
+    );
+    let want =
+        net.forward(Tensor::from_data(TensorData::new(xs, [1, t, 32]), &device), 0, &rope, None);
+    let diff = max_diff(&got["y"], &host(want));
+    assert!(diff <= 1e-4, "dense retrieval max |dy| = {diff}");
+}

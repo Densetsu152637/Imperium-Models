@@ -31,6 +31,12 @@ pub enum Role {
     /// An attention layer's ring of keys / values `[1, KVH, S, D]`.
     RingK,
     RingV,
+    /// A retrieval layer's latent cache `[1, S, latent + rope_dim]` (input) and the entries of
+    /// the positions just processed `[1, T, latent + rope_dim]` (output), and the normed
+    /// indexer keys of those positions `[1, T, index_dim]` (output).
+    Latent,
+    NewLatent,
+    NewIndexKey,
     /// The new keys / values of the positions just processed `[1, KVH, T, D]`, for the host to
     /// write into the ring.
     NewK,
@@ -92,6 +98,15 @@ pub struct RopeSpec {
     pub dim: usize,
     pub base: f64,
     pub scale: f64,
+    /// YaRN (the retrieval key's table); a factor of 1 is plain RoPE.
+    #[serde(default = "one")]
+    pub yarn_factor: f64,
+    #[serde(default)]
+    pub yarn_original: usize,
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 /// One layer of the stack.
@@ -112,6 +127,25 @@ pub enum LayerSpec {
         ring: usize,
         /// The layer's rope table, an index into [`Manifest::rope`].
         rope: usize,
+    },
+    /// A sparse-retrieval layer exported as dense attention over its whole latent cache
+    /// (UNVERIFIED): exact while the sparse selection would pick every block, i.e. for
+    /// positions below `dense_exact_until`.
+    Retrieval {
+        heads: usize,
+        nope_dim: usize,
+        rope_dim: usize,
+        v_dim: usize,
+        latent: usize,
+        index_heads: usize,
+        index_dim: usize,
+        block: usize,
+        topk: usize,
+        local: usize,
+        /// Positions the latent cache holds before the new ones.
+        cache: usize,
+        rope: usize,
+        dense_exact_until: usize,
     },
 }
 
@@ -193,6 +227,12 @@ impl Manifest {
                         (Role::StateIn, true),
                         (Role::ConvOut, false),
                         (Role::StateOut, false),
+                    ],
+                    LayerSpec::Retrieval { .. } => &[
+                        (Role::Latent, true),
+                        (Role::Bias, true),
+                        (Role::NewLatent, false),
+                        (Role::NewIndexKey, false),
                     ],
                     LayerSpec::Attention { .. } => &[
                         (Role::RingK, true),

@@ -492,6 +492,166 @@ impl Cx<'_> {
     }
 }
 
+// ---------------------------------------------------------------------- sparse retrieval (dense form)
+
+/// A sparse-retrieval layer's shape (`ncm_model::retrieval::RetrievalSpec`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetDims {
+    pub d: usize,
+    pub heads: usize,
+    pub nope_dim: usize,
+    pub rope_dim: usize,
+    pub v_dim: usize,
+    pub latent: usize,
+    pub index_heads: usize,
+    pub index_dim: usize,
+    pub eps: f64,
+}
+
+impl RetDims {
+    /// Width of the layer input projection: `[q | latent, RoPE key | gate | indexer q |
+    /// indexer k | indexer weights]`.
+    pub fn proj_width(&self) -> usize {
+        self.heads * (self.nope_dim + self.rope_dim)
+            + self.latent
+            + self.rope_dim
+            + self.heads * self.v_dim
+            + self.index_heads * self.index_dim
+            + self.index_dim
+            + self.index_heads
+    }
+
+    /// Width of a latent cache entry: the latent and the RoPE key.
+    pub fn entry_width(&self) -> usize {
+        self.latent + self.rope_dim
+    }
+}
+
+/// A retrieval layer's weights: `proj`, `o` (quantisable), `uk` `[l, H*dn]` and `uv`
+/// `[l, H*dv]` (dense), and the four norms' gammas.
+pub struct RetWeights {
+    pub proj: F32Tensor,
+    pub q_norm: F32Tensor,
+    pub kv_norm: F32Tensor,
+    pub rope_norm: F32Tensor,
+    pub index_norm: F32Tensor,
+    pub uk: F32Tensor,
+    pub uv: F32Tensor,
+    pub o: F32Tensor,
+}
+
+/// What a retrieval layer returns.
+pub struct RetOut {
+    pub y: Val,
+    /// The new latent-cache entries `[1, T, latent + rope_dim]` for the host to store.
+    pub entry: Val,
+    /// The new positions' normed indexer keys `[1, T, index_dim]` (the host keeps them, 8-bit
+    /// if it likes, for the split sparse path).
+    pub index_key: Val,
+    /// The indexer queries `[1, T, index_heads * index_dim]` and head weights
+    /// `[1, T, index_heads]`, for the split sparse path.
+    pub index_q: Val,
+    pub index_w: Val,
+}
+
+impl Cx<'_> {
+    /// One retrieval layer as **dense** attention over its whole latent cache (absorbed MLA:
+    /// the key up-projection folded into the queries, the value up-projection after the
+    /// weighted sum), mirroring `SparseRetrieval::core_projected` and `attend_latent`.
+    /// `cache` is `[1, S, latent + rope_dim]` (the previous positions), `bias` `[T, S + T]`
+    /// additive; `cos`/`sin` `[1, 1, T, rope_dim]` are the layer's YaRN table.
+    ///
+    /// Exact against the Burn layer while its sparse selection would pick every block
+    /// (`positions < local + topk * block`) or when the config is `dense`; beyond that it
+    /// attends to more than the reference does. UNVERIFIED: written from the Burn code
+    /// without a run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retrieval_dense(
+        &mut self,
+        key: &str,
+        dm: &RetDims,
+        w: &RetWeights,
+        x: &Val,
+        cos: &Val,
+        sin: &Val,
+        cache: &Val,
+        bias: &Val,
+        t: usize,
+    ) -> Result<RetOut, ExportError> {
+        let (h, dn, dr, dv, l) = (
+            dm.heads as i64,
+            dm.nope_dim as i64,
+            dm.rope_dim as i64,
+            dm.v_dim as i64,
+            dm.latent as i64,
+        );
+        let (hi, di) = (dm.index_heads as i64, dm.index_dim as i64);
+        let ti = t as i64;
+        let qd = dn + dr;
+        let p = self.linear(&format!("{key}.proj.weight"), x, &w.proj)?;
+        let mut offset = 0i64;
+        let mut take = |cx: &mut Self, n: i64| {
+            let part = cx.g.slice(&p, 2, offset, offset + n);
+            offset += n;
+            part
+        };
+        let q = take(self, h * qd);
+        let ckv = take(self, l + dr);
+        let gate = take(self, h * dv);
+        let index_q = take(self, hi * di);
+        let index_k = take(self, di);
+        let index_w = take(self, hi);
+        // Queries: per-head RMS norm over (nope | rope), the rope part rotated.
+        let q = self.g.reshape(&q, &[1, ti, h, qd]);
+        let q = self.rms_norm(&format!("{key}.q_norm.gamma"), &q, &w.q_norm, dm.eps);
+        let q = self.g.transpose(&q, &[0, 2, 1, 3]);
+        let q_nope = self.g.slice(&q, 3, 0, dn);
+        let q_rope = self.g.slice(&q, 3, dn, qd);
+        let q_rope = self.rope(&q_rope, cos, sin, dm.rope_dim);
+        // The cache entry: normed latent and the normed, rotated RoPE key.
+        let latent = self.g.slice(&ckv, 2, 0, l);
+        let latent = self.rms_norm(&format!("{key}.kv_norm.gamma"), &latent, &w.kv_norm, dm.eps);
+        let rope_key = self.g.slice(&ckv, 2, l, l + dr);
+        let rope_key =
+            self.rms_norm(&format!("{key}.rope_norm.gamma"), &rope_key, &w.rope_norm, dm.eps);
+        let rope_key = self.g.reshape(&rope_key, &[1, 1, ti, dr]);
+        let rope_key = self.rope(&rope_key, cos, sin, dm.rope_dim);
+        let rope_key = self.g.reshape(&rope_key, &[1, ti, dr]);
+        let entry = self.g.concat(&[&latent, &rope_key], 2);
+        let index_key =
+            self.rms_norm(&format!("{key}.index_norm.gamma"), &index_k, &w.index_norm, dm.eps);
+        // Absorbed attention over [cache | entry].
+        let uk = self.f32_weight(&format!("{key}.uk.weight"), &w.uk);
+        let uk = self.g.reshape(&uk, &[l, h, dn]);
+        let uk = self.g.transpose(&uk, &[1, 2, 0]);
+        let uk = self.g.reshape(&uk, &[1, h, dn, l]);
+        let q_lat = self.g.matmul(&q_nope, &uk);
+        let q_all = self.g.concat(&[&q_lat, &q_rope], 3);
+        let kv = self.g.concat(&[cache, &entry], 1);
+        let width = (dm.latent + dm.rope_dim) as i64;
+        let kv = self.g.reshape(&kv, &[1, 1, -1, width]);
+        let kvt = self.g.transpose(&kv, &[0, 1, 3, 2]);
+        let scores = self.g.matmul(&q_all, &kvt);
+        let scale = 1.0 / ((dm.nope_dim + dm.rope_dim) as f32).sqrt();
+        let scores = self.g.mul_scalar(&scores, scale);
+        let scores = self.g.add(&scores, bias);
+        let probs = self.g.softmax(&scores, 3);
+        let kv_latent = self.g.slice(&kv, 3, 0, l);
+        let mixed = self.g.matmul(&probs, &kv_latent);
+        let uv = self.f32_weight(&format!("{key}.uv.weight"), &w.uv);
+        let uv = self.g.reshape(&uv, &[l, h, dv]);
+        let uv = self.g.transpose(&uv, &[1, 0, 2]);
+        let uv = self.g.reshape(&uv, &[1, h, l, dv]);
+        let out = self.g.matmul(&mixed, &uv);
+        let merged = self.g.transpose(&out, &[0, 2, 1, 3]);
+        let merged = self.g.reshape(&merged, &[1, ti, h * dv]);
+        let gate = self.g.sigmoid(&gate);
+        let gated = self.g.mul(&merged, &gate);
+        let y = self.linear(&format!("{key}.o.weight"), &gated, &w.o)?;
+        Ok(RetOut { y, entry, index_key, index_q, index_w })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,5 +829,47 @@ mod tests {
         g.output("k_new", &out.k_new, DType::F32, &[1, 2, 1, 8]);
         g.validate().unwrap();
         assert!(g.op_types().any(|o| o == "Tile"), "two query heads per group tile the bias");
+    }
+
+    #[test]
+    fn a_dense_retrieval_graph_is_well_formed() {
+        let dm = RetDims {
+            d: 32,
+            heads: 2,
+            nope_dim: 8,
+            rope_dim: 4,
+            v_dim: 8,
+            latent: 16,
+            index_heads: 2,
+            index_dim: 8,
+            eps: 1e-6,
+        };
+        let ones = |n: usize| F32Tensor { shape: vec![n], data: vec![1.0; n] };
+        let w = RetWeights {
+            proj: tensor(&[32, dm.proj_width()], 1),
+            q_norm: ones(12),
+            kv_norm: ones(16),
+            rope_norm: ones(4),
+            index_norm: ones(8),
+            uk: tensor(&[16, 16], 2),
+            uv: tensor(&[16, 16], 3),
+            o: tensor(&[16, 32], 4),
+        };
+        let mut pool = WeightPool::default();
+        let mut g = Graph::new("ret");
+        let x = g.input("x", DType::F32, &[1, 2, 32]);
+        let cos = g.input("cos", DType::F32, &[1, 1, 2, 4]);
+        let sin = g.input("sin", DType::F32, &[1, 1, 2, 4]);
+        let cache = g.input("cache", DType::F32, &[1, 6, 20]);
+        let bias = g.input("bias", DType::F32, &[2, 8]);
+        let out = Cx { g: &mut g, pool: &mut pool, form: WeightForm::F32 }
+            .retrieval_dense("r", &dm, &w, &x, &cos, &sin, &cache, &bias, 2)
+            .unwrap();
+        g.output("y", &out.y, DType::F32, &[1, 2, 32]);
+        g.output("entry", &out.entry, DType::F32, &[1, 2, 20]);
+        g.output("index_key", &out.index_key, DType::F32, &[1, 2, 8]);
+        g.validate().unwrap();
+        assert_eq!(dm.entry_width(), 20);
+        assert!(pool.tensor("r.uk.weight").is_some());
     }
 }

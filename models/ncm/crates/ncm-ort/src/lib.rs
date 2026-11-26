@@ -23,7 +23,7 @@ use ncm_exec::hybrid::{BlockLogic, BlockOut, BlockPhase, DecodeOptions, Hooks, P
 use ncm_exec::manifest::{
     FILE_NAME, GraphSpec, IoSpec, LayerSpec, Manifest, Phase, Role, RopeSpec,
 };
-use ncm_exec::rope::rope_rows;
+use ncm_exec::rope::{Yarn, rope_rows};
 use ncm_exec::{
     Capabilities, Dtype, ExecBackend, ExecError, ExecSession, Footprint, FootprintRequest,
     HostChoice, ModelKind, Part, PendingOutput, PickMode, PickSpec, PrefillOut, SnapshotInfo,
@@ -222,10 +222,18 @@ impl ExecBackend for OrtBackend {
                         (2 * 4 * kv_heads * head_dim * ring) as u64,
                     );
                 }
+                LayerSpec::Retrieval { cache, latent, rope_dim, .. } => {
+                    let cache = (*cache).min(req.ctx.saturating_sub(1)).max(1);
+                    f.add(
+                        Tier::SystemRam,
+                        Part::LatentCache,
+                        (4 * cache * (latent + rope_dim)) as u64,
+                    );
+                }
             }
         }
         let slots = req.slots.max(1) as u64;
-        for part in [Part::Rings, Part::DeltaNetState] {
+        for part in [Part::Rings, Part::DeltaNetState, Part::LatentCache] {
             let one = f.get(Tier::SystemRam, part);
             f.add(Tier::SystemRam, part, one * (slots - 1));
         }
@@ -252,8 +260,18 @@ impl ExecBackend for OrtBackend {
 /// One layer's host-owned state.
 #[derive(Clone, Debug, PartialEq)]
 enum LayerState {
-    Delta { conv: Vec<f32>, state: Vec<f32> },
-    Attn { k: Vec<f32>, v: Vec<f32> },
+    Delta {
+        conv: Vec<f32>,
+        state: Vec<f32>,
+    },
+    Attn {
+        k: Vec<f32>,
+        v: Vec<f32>,
+    },
+    /// A retrieval layer's latent cache `[cache, latent + rope_dim]`.
+    Latent {
+        kv: Vec<f32>,
+    },
 }
 
 /// A point of a session ([`ExecSession::snapshot`]): copies in system RAM.
@@ -301,6 +319,9 @@ impl OrtSession {
                     k: vec![0.0; kv_heads * ring * head_dim],
                     v: vec![0.0; kv_heads * ring * head_dim],
                 },
+                LayerSpec::Retrieval { cache, latent, rope_dim, .. } => {
+                    LayerState::Latent { kv: vec![0.0; cache * (latent + rope_dim)] }
+                }
             })
             .collect();
         Self { manifest, graphs, layers, len: 0, ctx, pending: None, failure: None }
@@ -369,7 +390,14 @@ impl OrtSession {
                 }
                 (Role::RopeCos | Role::RopeSin, _, Some(r)) => {
                     let spec = self.rope(r);
-                    let (cos, sin) = rope_rows(self.len, t, spec.dim, spec.base, spec.scale);
+                    let (cos, sin) = rope_rows(
+                        self.len,
+                        t,
+                        spec.dim,
+                        spec.base,
+                        spec.scale,
+                        Yarn { factor: spec.yarn_factor, original: spec.yarn_original },
+                    );
                     tensor_f32(&io.shape, if io.role == Role::RopeCos { cos } else { sin })?
                 }
                 (Role::Bias, Some(l), _) => {
@@ -378,19 +406,23 @@ impl OrtSession {
                 }
                 (Role::RingK, Some(l), _) => match &self.layers[l] {
                     LayerState::Attn { k, .. } => tensor_f32(&io.shape, k.clone())?,
-                    LayerState::Delta { .. } => return Err(self.mismatch(io)),
+                    _ => return Err(self.mismatch(io)),
                 },
                 (Role::RingV, Some(l), _) => match &self.layers[l] {
                     LayerState::Attn { v, .. } => tensor_f32(&io.shape, v.clone())?,
-                    LayerState::Delta { .. } => return Err(self.mismatch(io)),
+                    _ => return Err(self.mismatch(io)),
+                },
+                (Role::Latent, Some(l), _) => match &self.layers[l] {
+                    LayerState::Latent { kv } => tensor_f32(&io.shape, kv.clone())?,
+                    _ => return Err(self.mismatch(io)),
                 },
                 (Role::ConvIn, Some(l), _) => match &self.layers[l] {
                     LayerState::Delta { conv, .. } => tensor_f32(&io.shape, conv.clone())?,
-                    LayerState::Attn { .. } => return Err(self.mismatch(io)),
+                    _ => return Err(self.mismatch(io)),
                 },
                 (Role::StateIn, Some(l), _) => match &self.layers[l] {
                     LayerState::Delta { state, .. } => tensor_f32(&io.shape, state.clone())?,
-                    LayerState::Attn { .. } => return Err(self.mismatch(io)),
+                    _ => return Err(self.mismatch(io)),
                 },
                 _ => return Err(self.mismatch(io)),
             };
@@ -412,6 +444,17 @@ impl OrtSession {
                         conv.copy_from_slice(data);
                     }
                 }
+                (Role::NewLatent, Some(l)) => {
+                    // `data` is [1, t, w]: position start + j goes to row (start + j) % cache.
+                    let w = self.latent_width(l);
+                    let cache = self.ring_of(l);
+                    if let LayerState::Latent { kv } = &mut self.layers[l] {
+                        for j in 0..t {
+                            let row = (start + j) % cache;
+                            kv[row * w..(row + 1) * w].copy_from_slice(&data[j * w..(j + 1) * w]);
+                        }
+                    }
+                }
                 (Role::StateOut, Some(l)) => {
                     if let LayerState::Delta { state, .. } = &mut self.layers[l] {
                         state.copy_from_slice(data);
@@ -427,7 +470,7 @@ impl OrtSession {
                                 v
                             }
                         }
-                        LayerState::Delta { .. } => continue,
+                        _ => continue,
                     };
                     // `data` is [1, kvh, t, hd]: position start + j goes to slot (start + j) % ring.
                     for h in 0..kvh {
@@ -459,14 +502,22 @@ impl OrtSession {
     fn ring_of(&self, layer: usize) -> usize {
         match &self.manifest.layers[layer] {
             LayerSpec::Attention { ring, .. } => *ring,
+            LayerSpec::Retrieval { cache, .. } => *cache,
             LayerSpec::DeltaNet { .. } => 1,
+        }
+    }
+
+    fn latent_width(&self, layer: usize) -> usize {
+        match &self.manifest.layers[layer] {
+            LayerSpec::Retrieval { latent, rope_dim, .. } => latent + rope_dim,
+            _ => 0,
         }
     }
 
     fn attn_dims(&self, layer: usize) -> (usize, usize, usize) {
         match &self.manifest.layers[layer] {
             LayerSpec::Attention { kv_heads, head_dim, ring, .. } => (*kv_heads, *head_dim, *ring),
-            LayerSpec::DeltaNet { .. } => (0, 0, 1),
+            _ => (0, 0, 1),
         }
     }
 
@@ -515,6 +566,7 @@ impl ExecSession for OrtSession {
                     k.fill(0.0);
                     v.fill(0.0);
                 }
+                LayerState::Latent { kv } => kv.fill(0.0),
             }
         }
         self.len = 0;
@@ -537,6 +589,7 @@ impl ExecSession for OrtSession {
                     k.copy_from_slice(ks);
                     v.copy_from_slice(vs);
                 }
+                (LayerState::Latent { kv }, LayerState::Latent { kv: s }) => kv.copy_from_slice(s),
                 _ => panic!("a snapshot of another model"),
             }
         }
