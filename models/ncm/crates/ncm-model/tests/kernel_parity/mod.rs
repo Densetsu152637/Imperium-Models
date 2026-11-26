@@ -1242,3 +1242,32 @@ pub fn graphed_ncm_slots_match_eager(device: &Device) {
         written = want.iter().map(|&t| t as i32).collect();
     }
 }
+
+/// The fused RoPE with per-batch-row tables (the hybrid's batched slots) against the plain
+/// tensor ops of [`ncm_model::hybrid::RopeTables::apply`] with the fused kernels off.
+pub fn rope_tables_match(device: &Device, tol: f32) {
+    use ncm_model::hybrid::RopeTables;
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (b, h, t, d) in [(3, 8, 1, 64), (2, 4, 5, 64), (4, 2, 3, 16)] {
+        device.seed(9);
+        let x = Tensor::<4>::random([b, h, t, d], normal, device);
+        let rows: Vec<RopeTables> = (0..b)
+            .map(|r| {
+                RopeTables::at(
+                    &(0..t).map(|i| 100 * r + i).collect::<Vec<_>>(),
+                    d,
+                    10_000.0,
+                    device,
+                )
+            })
+            .collect();
+        let refs: Vec<&RopeTables> = rows.iter().collect();
+        let tables = RopeTables::stack(&refs);
+        let got =
+            ncm_model::rope_fused::rope_tables(x.clone(), tables.cos.clone(), tables.sin.clone())
+                .expect("these widths");
+        let want = reference(|| tables.apply(x.clone()));
+        let what = format!("per-row rope {b}x{h}x{t}x{d}");
+        assert_close(&what, &values(got), &values(want.clone()), &values(want), tol);
+    }
+}

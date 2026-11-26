@@ -199,3 +199,9 @@ fn graphed_ncm_slots_match_eager_bf16() {
     let (device, _lock) = setup(DTYPE);
     graphed_ncm_slots_match_eager(&device);
 }
+
+#[test]
+fn rope_tables_match_reference_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    rope_tables_match(&device, TOL);
+}

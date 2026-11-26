@@ -67,8 +67,16 @@ impl RopeTables {
         }
     }
 
-    /// `x` `[B, H, T, D]` rotated: `x cos + [-x2, x1] sin`.
+    /// `x` `[B, H, T, D]` rotated: `x cos + [-x2, x1] sin`; one launch on CUDA with the fused
+    /// kernels on ([`crate::rope_fused::rope_tables`]).
     pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(&x.device())
+            && let Some(y) =
+                crate::rope_fused::rope_tables(x.clone(), self.cos.clone(), self.sin.clone())
+        {
+            return y;
+        }
         let d = x.dims()[3];
         let h = d / 2;
         let rot =

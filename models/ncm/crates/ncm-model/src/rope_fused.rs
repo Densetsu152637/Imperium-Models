@@ -27,7 +27,8 @@ mod kernel {
     pub(super) const MAX_D: usize = 256;
 
     /// Row `CUBE_POS` of `x` `[B, H, T, D]` (any strides) into the contiguous `out`: RMS-normed
-    /// by `gamma` `[D]` with `norm`, then rotated by the tables `cos`, `sin` `[1, 1, T, D]`.
+    /// by `gamma` `[D]` with `norm`, then rotated by the tables `cos`, `sin` `[1, 1, T, D]` (or
+    /// `[B, 1, T, D]`: per batch row).
     #[cube(launch_unchecked)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn rope_kernel<F: Float>(
@@ -77,8 +78,11 @@ mod kernel {
         }
         sync_cube();
         let half = d / 2;
-        let (c0, c1) = (ti * cos.stride(2), cos.stride(3));
-        let (s0, s1) = (ti * sin.stride(2), sin.stride(3));
+        // Tables `[1 or B, 1, T, D]`: one set for every batch row, or one per row.
+        let cb = select(cos.shape(0) > 1, bi, 0);
+        let sb = select(sin.shape(0) > 1, bi, 0);
+        let (c0, c1) = (cb * cos.stride(0) + ti * cos.stride(2), cos.stride(3));
+        let (s0, s1) = (sb * sin.stride(0) + ti * sin.stride(2), sin.stride(3));
         let mut i = tid;
         while i < d {
             // The partner in the other half (indices stay inside the row either way).
@@ -175,6 +179,27 @@ pub fn rope(x: Tensor<4>, rope: &Rope, norm: Option<(Tensor<1>, f64)>) -> Option
         sin.into_dispatch(),
         eps,
         on,
+    );
+    Some(Tensor::from_dispatch(out))
+}
+
+/// `x` `[B, H, T, D]` rotated by per-row (and optionally per-batch-row) tables `cos`, `sin`
+/// `[1 or B, 1, T, D]` in one launch (the hybrid's batched slots, whose positions differ per
+/// row). None for heads wider than the kernel stages.
+pub fn rope_tables(x: Tensor<4>, cos: Tensor<4>, sin: Tensor<4>) -> Option<Tensor<4>> {
+    let [b, _, t, d] = x.dims();
+    let [tb, _, tt, td] = cos.dims();
+    if d > kernel::MAX_D || !d.is_multiple_of(2) || td != d || tt != t || (tb != 1 && tb != b) {
+        return None;
+    }
+    let gamma = cos.clone().reshape([cos.dims().iter().product::<usize>()]);
+    let out = <Dispatch as NcmRope>::ncm_rope(
+        x.into_dispatch(),
+        gamma.into_dispatch(),
+        cos.into_dispatch(),
+        sin.into_dispatch(),
+        0.0,
+        false,
     );
     Some(Tensor::from_dispatch(out))
 }
