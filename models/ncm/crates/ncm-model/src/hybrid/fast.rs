@@ -608,7 +608,10 @@ fn block_pass(
     let score = reject.int() * c.rank.clone().expand([b, l]);
     let first = score.clone().argmax(1).reshape([b, 1]);
     let any = score.max_dim(1).reshape([b, 1]);
-    Tensor::cat(vec![first, any, ids, draft], 1)
+    // One int dtype for the cat: argmax and the device picks may differ by backend (i64 on
+    // the CPU's flex backend, i32 from the fused kernels).
+    let i32 = |t: Tensor<2, Int>| t.cast(burn::tensor::IntDType::I32);
+    Tensor::cat(vec![i32(first), i32(any), i32(ids), i32(draft)], 1)
 }
 
 /// The autoregressive pass over `ar_tokens` for a batch: tokens `[B, L]` and log-probabilities.
