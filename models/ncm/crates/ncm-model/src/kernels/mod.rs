@@ -57,6 +57,8 @@ pub struct RetrievalDims {
     pub topk: usize,
     pub local: usize,
     pub dense: bool,
+    /// Indexer keys as 8-bit codes and one scale per position.
+    pub index_8bit: bool,
     pub eps: f64,
 }
 
@@ -142,6 +144,45 @@ pub trait NcmKernels: Backend {
         eps: f64,
     ) -> FloatTensor<Self>;
 
+    /// See [`delta_scan`]: returns `[out, new_state]` concatenated along the rows (`[BH, N C +
+    /// dk, dv]`).
+    #[allow(clippy::too_many_arguments)]
+    fn ncm_delta_scan(
+        values: FloatTensor<Self>,
+        w: FloatTensor<Self>,
+        qk: FloatTensor<Self>,
+        qg: FloatTensor<Self>,
+        k_out: FloatTensor<Self>,
+        carry: FloatTensor<Self>,
+        state: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
+
+    /// A new contiguous, uninitialised i32 tensor of `shape` on `like`'s device.
+    fn ncm_scratch_i32(like: FloatTensor<Self>, shape: Vec<usize>) -> IntTensor<Self>;
+
+    /// See [`retrieval_select`]; writes `picked` and `count` in place and returns `picked`.
+    #[allow(clippy::too_many_arguments)]
+    fn ncm_retrieval_select(
+        raw: FloatTensor<Self>,
+        w: FloatTensor<Self>,
+        scales: FloatTensor<Self>,
+        picked: IntTensor<Self>,
+        count: IntTensor<Self>,
+        start: usize,
+        t0: usize,
+        dims: RetrievalDims,
+    ) -> IntTensor<Self>;
+
+    /// See [`retrieval_prefill_attend`].
+    fn ncm_retrieval_prefill_attend(
+        q: FloatTensor<Self>,
+        kv: FloatTensor<Self>,
+        picked: IntTensor<Self>,
+        count: IntTensor<Self>,
+        start: usize,
+        dims: RetrievalDims,
+    ) -> FloatTensor<Self>;
+
     /// See [`retrieval_decode`].
     #[allow(clippy::too_many_arguments)]
     fn ncm_retrieval_decode(
@@ -156,6 +197,8 @@ pub trait NcmKernels: Backend {
         wuv: FloatTensor<Self>,
         kv: FloatTensor<Self>,
         keys: FloatTensor<Self>,
+        codes: IntTensor<Self>,
+        scales: FloatTensor<Self>,
         position: IntTensor<Self>,
         dims: RetrievalDims,
     ) -> FloatTensor<Self>;
@@ -392,6 +435,140 @@ impl NcmKernels for CubeBackend {
         out
     }
 
+    fn ncm_delta_scan(
+        values: CubeTensor,
+        w: CubeTensor,
+        qk: CubeTensor,
+        qg: CubeTensor,
+        k_out: CubeTensor,
+        carry: CubeTensor,
+        state: CubeTensor,
+    ) -> CubeTensor {
+        use delta::{SCAN_COLUMNS, SCAN_CUBE};
+        let [bh, rows, dv] = values.meta.shape().dims::<3>();
+        let dk = w.meta.shape().dims::<3>()[2];
+        let c = qk.meta.shape().dims::<3>()[2];
+        let chunks = rows / c;
+        let g = dv.min(SCAN_COLUMNS);
+        assert!(dv.is_multiple_of(g) && SCAN_CUBE.is_multiple_of(g), "value width {dv}");
+        let out = empty_like(&values, vec![bh, rows + dk, dv]);
+        let dtype = elem(values.dtype);
+        let client = values.client.clone();
+        unsafe {
+            delta::delta_scan_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static((bh * dv / g) as u32, 1, 1),
+                CubeDim::new_1d(SCAN_CUBE as u32),
+                values.into_tensor_arg(),
+                w.into_tensor_arg(),
+                qk.into_tensor_arg(),
+                qg.into_tensor_arg(),
+                k_out.into_tensor_arg(),
+                carry.into_tensor_arg(),
+                state.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                chunks,
+                dv / g,
+                dk,
+                dv,
+                c,
+                g,
+                dtype,
+            );
+        }
+        out
+    }
+
+    fn ncm_scratch_i32(like: CubeTensor, shape: Vec<usize>) -> CubeTensor {
+        scratch(&like, shape, DType::I32)
+    }
+
+    fn ncm_retrieval_select(
+        raw: CubeTensor,
+        w: CubeTensor,
+        scales: CubeTensor,
+        picked: CubeTensor,
+        count: CubeTensor,
+        start: usize,
+        t0: usize,
+        dims: RetrievalDims,
+    ) -> CubeTensor {
+        use retrieval::CUBE;
+        let [b, _, q, prefix] = raw.meta.shape().dims::<4>();
+        let t_total = count.meta.shape().dims::<2>()[1];
+        let nb = prefix.div_ceil(dims.block).max(1);
+        let blocks = scratch(&raw, vec![b, q, nb], DType::F32);
+        let dtype = elem(raw.dtype);
+        let client = raw.client.clone();
+        unsafe {
+            retrieval::ret_select_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static((b * q) as u32, 1, 1),
+                CubeDim::new_1d(CUBE as u32),
+                raw.into_tensor_arg(),
+                w.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                blocks.into_tensor_arg(),
+                picked.clone().into_tensor_arg(),
+                count.into_tensor_arg(),
+                start,
+                t0,
+                q,
+                t_total,
+                nb,
+                dims.topk,
+                1.0 / ((dims.index_heads * dims.index_dim) as f32).sqrt(),
+                dims.index_heads,
+                dims.block,
+                dims.local,
+                dims.index_8bit,
+                dtype,
+            );
+        }
+        picked
+    }
+
+    fn ncm_retrieval_prefill_attend(
+        q: CubeTensor,
+        kv: CubeTensor,
+        picked: CubeTensor,
+        count: CubeTensor,
+        start: usize,
+        dims: RetrievalDims,
+    ) -> CubeTensor {
+        use retrieval::CUBE;
+        let [b, h, t, _] = q.meta.shape().dims::<4>();
+        let out = empty_like(&q, vec![b, t, h, dims.latent]);
+        let dtype = elem(q.dtype);
+        let client = q.client.clone();
+        let plane = client.properties().hardware.plane_size_max as usize;
+        assert_eq!(plane, retrieval::PREFILL_LANES, "the prefill kernel takes 32-lane planes");
+        let tile = retrieval::prefill_tile(q.dtype.size());
+        unsafe {
+            retrieval::ret_prefill_attend_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static((b * t) as u32, 1, 1),
+                CubeDim::new_1d(CUBE as u32),
+                q.into_tensor_arg(),
+                kv.into_tensor_arg(),
+                picked.into_tensor_arg(),
+                count.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                start,
+                t,
+                dims.topk,
+                h,
+                dims.latent,
+                dims.rope_dim,
+                dims.block,
+                dims.local,
+                tile,
+                dtype,
+            );
+        }
+        out
+    }
+
     fn ncm_retrieval_decode(
         proj: CubeTensor,
         q_gamma: CubeTensor,
@@ -404,6 +581,8 @@ impl NcmKernels for CubeBackend {
         wuv: CubeTensor,
         kv: CubeTensor,
         keys: CubeTensor,
+        codes: CubeTensor,
+        scales: CubeTensor,
         position: CubeTensor,
         dims: RetrievalDims,
     ) -> CubeTensor {
@@ -436,6 +615,8 @@ impl NcmKernels for CubeBackend {
                 q_rope.clone().into_tensor_arg(),
                 kv.clone().into_tensor_arg(),
                 keys.clone().into_tensor_arg(),
+                codes.clone().into_tensor_arg(),
+                scales.clone().into_tensor_arg(),
                 position.clone().into_tensor_arg(),
                 b,
                 scale,
@@ -450,6 +631,7 @@ impl NcmKernels for CubeBackend {
                 l,
                 d.index_dim,
                 index_k,
+                d.index_8bit,
                 dtype,
             );
         }
@@ -463,6 +645,8 @@ impl NcmKernels for CubeBackend {
                     CubeDim::new_1d(INDEX_CUBE as u32),
                     proj.clone().into_tensor_arg(),
                     keys.into_tensor_arg(),
+                    codes.into_tensor_arg(),
+                    scales.into_tensor_arg(),
                     scores.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
                     blocks,
@@ -472,6 +656,7 @@ impl NcmKernels for CubeBackend {
                     index_q,
                     d.block,
                     d.local,
+                    d.index_8bit,
                     dtype,
                 );
                 retrieval::ret_topk_kernel::launch_unchecked(
@@ -567,9 +752,96 @@ pub fn delta_step(
     Tensor::from_dispatch(out)
 }
 
+/// The sequential part of the chunked gated delta rule in one kernel (see
+/// `crate::delta::delta_rule_chunked`): `values` `[BH, N C, dv]`, `w`, `qg`, `k_out`
+/// `[BH, N C, dk]`, `qk` `[BH, N C, C]`, `carry` `[BH, N]` and the initial `state`
+/// `[BH, dk, dv]`. Returns the outputs `[BH, N C, dv]` and the final state `[BH, dk, dv]`.
+pub fn delta_scan(
+    values: Tensor<3>,
+    w: Tensor<3>,
+    qk: Tensor<3>,
+    qg: Tensor<3>,
+    k_out: Tensor<3>,
+    carry: Tensor<2>,
+    state: Tensor<3>,
+) -> (Tensor<3>, Tensor<3>) {
+    let rows = values.dims()[1];
+    let dk = w.dims()[2];
+    let both = <Dispatch as NcmKernels>::ncm_delta_scan(
+        values.into_dispatch(),
+        w.into_dispatch(),
+        qk.into_dispatch(),
+        qg.into_dispatch(),
+        k_out.into_dispatch(),
+        carry.into_dispatch(),
+        state.into_dispatch(),
+    );
+    let both = Tensor::<3>::from_dispatch(both);
+    (both.clone().narrow(1, 0, rows), both.narrow(1, rows, dk))
+}
+
+/// A new contiguous i32 tensor `[d0, d1, ..]` on `like`'s device, uninitialised (Burn's own
+/// constructors may pitch rows, and the prefill kernels index these buffers as packed).
+pub fn scratch_i32<const D: usize>(like: &Tensor<3>, shape: [usize; D]) -> Tensor<D, Int> {
+    let t = <Dispatch as NcmKernels>::ncm_scratch_i32(like.clone().into_dispatch(), shape.to_vec());
+    Tensor::from_dispatch(t)
+}
+
+/// Block selection of prefill queries `t0 .. t0 + q` of a chunk whose first query sits at
+/// absolute position `start`, on the device: `raw` `[B, hi, q, S']` are the indexer dot products
+/// over the candidate prefix (against the codes for 8-bit keys, whose per-position `scales`
+/// `[B, S, 1]` apply after the ReLU; any float tensor otherwise), `w` `[B, T, hi]` the indexer
+/// head weights of the whole chunk. Writes each query's picked blocks into `picked` `[B, T, topk]`
+/// and their number into `count` `[B, T]` (both i32) in place.
+#[allow(clippy::too_many_arguments)]
+pub fn retrieval_select(
+    raw: Tensor<4>,
+    w: Tensor<3>,
+    scales: Tensor<3>,
+    picked: &Tensor<3, Int>,
+    count: &Tensor<2, Int>,
+    start: usize,
+    t0: usize,
+    dims: RetrievalDims,
+) {
+    drop(<Dispatch as NcmKernels>::ncm_retrieval_select(
+        raw.into_dispatch(),
+        w.into_dispatch(),
+        scales.into_dispatch(),
+        picked.clone().into_dispatch(),
+        count.clone().into_dispatch(),
+        start,
+        t0,
+        dims,
+    ));
+}
+
+/// Sparse prefill attention of the queries `q` `[B, H, T, l + dr]` (absorbed, scale folded in)
+/// at absolute positions `start ..` over the cache `kv` `[B, S, l + dr]`: each attends to its
+/// `count` `picked` blocks (from [`retrieval_select`]) and its local window. Returns the
+/// normalised latent sums `[B, T, H, l]` before the value up-projection.
+pub fn retrieval_prefill_attend(
+    q: Tensor<4>,
+    kv: &Tensor<3>,
+    picked: Tensor<3, Int>,
+    count: Tensor<2, Int>,
+    start: usize,
+    dims: RetrievalDims,
+) -> Tensor<4> {
+    let out = <Dispatch as NcmKernels>::ncm_retrieval_prefill_attend(
+        q.into_dispatch(),
+        kv.clone().into_dispatch(),
+        picked.into_dispatch(),
+        count.into_dispatch(),
+        start,
+        dims,
+    );
+    Tensor::from_dispatch(out)
+}
+
 /// One-token sparse retrieval decode at the position held by the device tensor `position`
 /// (`[1]`, i32) from the layer's input projection `proj` `[B, 1, W]`: writes the position's entry
-/// into the cache in place (`kv` `[B, S, l + dr]`, `keys` `[B, S, di]`, whoever else holds them),
+/// into the cache in place (`kv` `[B, S, l + dr]` and the indexer `keys`, whoever else holds them),
 /// selects blocks with the indexer on the device and attends over them and the local window (or
 /// the whole context when it has no more candidates than `topk`, or in dense mode). Returns the
 /// gated attention output `[B, 1, h dv]` before the output projection. `norms` are the q,
@@ -584,11 +856,18 @@ pub fn retrieval_decode(
     wuk: Tensor<2>,
     wuv: Tensor<2>,
     kv: &Tensor<3>,
-    keys: &Tensor<3>,
+    keys: &crate::retrieval::IndexKeys,
     position: &Tensor<1, Int>,
     dims: RetrievalDims,
 ) -> Tensor<3> {
+    use crate::retrieval::IndexKeys;
     let [q, latent, rope_key, index] = norms;
+    // The kernels read only the tensors of the cache's key format; the other arguments are
+    // stand-ins of the right kind.
+    let (keys, codes, scales) = match keys {
+        IndexKeys::Float(k) => (k.clone(), position.clone().reshape([1, 1, 1]), k.clone()),
+        IndexKeys::Int8 { codes, scales } => (scales.clone(), codes.clone(), scales.clone()),
+    };
     let out = <Dispatch as NcmKernels>::ncm_retrieval_decode(
         proj.into_dispatch(),
         q.into_dispatch(),
@@ -600,7 +879,9 @@ pub fn retrieval_decode(
         wuk.into_dispatch(),
         wuv.into_dispatch(),
         kv.clone().into_dispatch(),
-        keys.clone().into_dispatch(),
+        keys.into_dispatch(),
+        codes.into_dispatch(),
+        scales.into_dispatch(),
         position.clone().into_dispatch(),
         dims,
     );

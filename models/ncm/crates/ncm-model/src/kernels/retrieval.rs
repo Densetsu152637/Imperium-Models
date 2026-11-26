@@ -3,7 +3,7 @@
 //!
 //! 1. [`ret_prep_kernel`]: QK-norms, partial RoPE, the absorbed query `q_nope W_uk^T` (with the
 //!    softmax scale folded in), and the new position's cache entry (latent, RoPE key, indexer
-//!    key) written in place.
+//!    key at the run dtype or as 8-bit codes and a scale) written in place.
 //! 2. [`ret_index_kernel`] and [`ret_topk_kernel`]: indexer scores and block maxima of every
 //!    candidate block, then the top-k blocks, on the device (both do nothing on dense steps).
 //! 3. [`ret_attend_kernel`]: split attention over chunks of the visible positions (the selected
@@ -94,6 +94,26 @@ fn sum_squares<F: Float>(
     ss
 }
 
+/// The indexer key element `i` of position `at` (row offset of `keys`, or of `codes` and the
+/// position's slot `scale_at` in `scales` for 8-bit keys) as f32.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn index_key<F: Float>(
+    keys: &Tensor<F>,
+    codes: &Tensor<i8>,
+    scales: &Tensor<F>,
+    at: usize,
+    scale_at: usize,
+    i: usize,
+    #[comptime] int8: bool,
+) -> f32 {
+    if int8 {
+        f32::cast_from(codes[at + i * codes.stride(2)]) * f32::cast_from(scales[scale_at])
+    } else {
+        f32::cast_from(keys[at + i * keys.stride(2)])
+    }
+}
+
 /// Rotate-half RoPE of element `x` with partner `other` (element `(i + dr / 2) % dr`).
 #[cube]
 fn rope_value<F: Float>(
@@ -126,6 +146,8 @@ pub(crate) fn ret_prep_kernel<F: Float>(
     q_rope: &mut Tensor<f32>,
     kv: &mut Tensor<F>,
     keys: &mut Tensor<F>,
+    codes: &mut Tensor<i8>,
+    scales: &mut Tensor<F>,
     position: &Tensor<i32>,
     batch: usize,
     scale: f32,
@@ -140,6 +162,7 @@ pub(crate) fn ret_prep_kernel<F: Float>(
     #[comptime] latent: usize,
     #[comptime] index_dim: usize,
     #[comptime] index_offset: usize,
+    #[comptime] int8: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let cube_id = CUBE_POS;
@@ -226,20 +249,55 @@ pub(crate) fn ret_prep_kernel<F: Float>(
                 F::cast_from(rope_value::<F>(rot[i], rot[(i + dr / 2) % dr], i, dr, cos, sin));
             i += CUBE;
         }
-        // Indexer key: RMSNorm.
+        // Indexer key: RMSNorm, then stored as is or as 8-bit codes with the scale
+        // max |k| / 127 (at the run dtype, as the reference stores it).
         let ik = row + index_offset * ps;
         let r = 1.0
             / (cube_sum(&mut red, sum_squares::<F>(p, ik, ps, index_dim, CUBE)) * inv_index + eps)
                 .sqrt();
-        let kat = b * keys.stride(0) + pos * keys.stride(1);
-        let ks2 = keys.stride(2);
-        let mut i = tid;
-        while i < index_dim {
-            let x = f32::cast_from(p[ik + i * ps])
-                * r
-                * f32::cast_from(index_gamma[i * index_gamma.stride(0)]);
-            keys[kat + i * ks2] = F::cast_from(x);
-            i += CUBE;
+        if int8 {
+            let mut top = 0.0f32;
+            let mut i = tid;
+            while i < index_dim {
+                let x = f32::cast_from(p[ik + i * ps])
+                    * r
+                    * f32::cast_from(index_gamma[i * index_gamma.stride(0)]);
+                let x = f32::cast_from(F::cast_from(x));
+                top = select(x.abs() > top, x.abs(), top);
+                i += CUBE;
+            }
+            let top = cube_max(&mut red, top);
+            let step = f32::cast_from(F::cast_from(top / 127.0f32));
+            let step = select(step > 1.0e-30f32, step, 1.0e-30f32);
+            let cat = b * codes.stride(0) + pos * codes.stride(1);
+            let cs2 = codes.stride(2);
+            let mut i = tid;
+            while i < index_dim {
+                let x = f32::cast_from(p[ik + i * ps])
+                    * r
+                    * f32::cast_from(index_gamma[i * index_gamma.stride(0)]);
+                // Rounded to the run dtype at each step, as the reference's tensor ops are.
+                let x = f32::cast_from(F::cast_from(x));
+                let code =
+                    f32::cast_from(F::cast_from(x / step)).round().clamp(-127.0f32, 127.0f32);
+                codes[cat + i * cs2] = i8::cast_from(code);
+                i += CUBE;
+            }
+            let sat = b * scales.stride(0) + pos * scales.stride(1);
+            if tid == 0 {
+                scales[sat] = F::cast_from(step);
+            }
+        } else {
+            let kat = b * keys.stride(0) + pos * keys.stride(1);
+            let ks2 = keys.stride(2);
+            let mut i = tid;
+            while i < index_dim {
+                let x = f32::cast_from(p[ik + i * ps])
+                    * r
+                    * f32::cast_from(index_gamma[i * index_gamma.stride(0)]);
+                keys[kat + i * ks2] = F::cast_from(x);
+                i += CUBE;
+            }
         }
     }
 }
@@ -251,6 +309,8 @@ pub(crate) fn ret_prep_kernel<F: Float>(
 pub(crate) fn ret_index_kernel<F: Float>(
     p: &Tensor<F>,
     keys: &Tensor<F>,
+    codes: &Tensor<i8>,
+    scales: &Tensor<F>,
     scores: &mut Tensor<f32>,
     position: &Tensor<i32>,
     blocks: usize,
@@ -260,6 +320,7 @@ pub(crate) fn ret_index_kernel<F: Float>(
     #[comptime] q_offset: usize,
     #[comptime] block: usize,
     #[comptime] local: usize,
+    #[comptime] int8: bool,
     #[define(F)] _dtype: ElemType,
 ) {
     let b = CUBE_POS / blocks;
@@ -285,16 +346,22 @@ pub(crate) fn ret_index_kernel<F: Float>(
                 * w_scale;
     }
     sync_cube();
-    let (s0, s1, s2) = (keys.stride(0), keys.stride(1), keys.stride(2));
     let mut best = f32::new(-1.0e30f32);
     let mut s = tid;
     while s < block {
-        let at = b * s0 + (blk * block + s) * s1;
+        let position = blk * block + s;
+        let at = select(
+            int8,
+            b * codes.stride(0) + position * codes.stride(1),
+            b * keys.stride(0) + position * keys.stride(1),
+        );
+        let scale_at = b * scales.stride(0) + position * scales.stride(1);
         let mut score = 0.0f32;
         for j in 0..index_heads {
             let mut dot = 0.0f32;
             for d in 0..index_dim {
-                dot += q[j * index_dim + d] * f32::cast_from(keys[at + d * s2]);
+                dot += q[j * index_dim + d]
+                    * index_key::<F>(keys, codes, scales, at, scale_at, d, int8);
             }
             score += w[j] * select(dot > 0.0f32, dot, 0.0f32);
         }
@@ -531,5 +598,354 @@ pub(crate) fn ret_combine_kernel<F: Float>(
         let gate = f32::cast_from(p[b * p.stride(0) + (gate_offset + hh * dv + v) * ps]);
         out[b * heads * dv + hh * dv + v] = F::cast_from(acc / (1.0 + (-gate).exp()));
         v += CUBE;
+    }
+}
+
+/// Lanes per plane the prefill attention kernel is written for (NVIDIA warps).
+pub(crate) const PREFILL_LANES: usize = 32;
+/// Planes per cube of [`ret_prefill_attend_kernel`].
+pub(crate) const PREFILL_PLANES: usize = CUBE / PREFILL_LANES;
+
+/// Positions per tile of [`ret_prefill_attend_kernel`] for a run dtype of `itemsize` bytes: as
+/// many as keep the staged rows and the query within 48 KiB of shared memory, at most a plane.
+pub(crate) fn prefill_tile(itemsize: usize) -> usize {
+    if itemsize <= 2 { PREFILL_LANES } else { PREFILL_PLANES }
+}
+
+/// Prefill selection for a group of `q` queries (chunk rows `t0 ..`, absolute positions
+/// `start + t0 ..`), one cube per (batch row, query). `raw` `[B, hi, q, S']` holds the indexer
+/// dot products `q_j . k_s` over the candidate prefix (for 8-bit keys against the codes, the
+/// position's scale in `scales` `[B, S, 1]` applied after the ReLU), `w` `[B, T, hi]` the head
+/// weights. A query's block scores go to its row of the scratch `blocks` `[B, q, nb]`; then
+/// `picked[b, t, ..]` gets its top `k` candidate blocks (ties to the lower block) or, with at
+/// most `k` candidates, all of them, and `count[b, t]` how many.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ret_select_kernel<F: Float>(
+    raw: &Tensor<F>,
+    w: &Tensor<F>,
+    scales: &Tensor<F>,
+    blocks: &mut Tensor<f32>,
+    picked: &mut Tensor<i32>,
+    count: &mut Tensor<i32>,
+    start: usize,
+    t0: usize,
+    q: usize,
+    t_total: usize,
+    nb: usize,
+    k: usize,
+    w_scale: f32,
+    #[comptime] index_heads: usize,
+    #[comptime] block: usize,
+    #[comptime] local: usize,
+    #[comptime] int8: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let b = CUBE_POS / q;
+    let i = CUBE_POS % q;
+    let t = t0 + i;
+    let pos = start + t;
+    let n = candidate_blocks(pos, block, local);
+    let tid = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let width = PLANE_DIM as usize;
+    let planes = CUBE / width;
+    let plane = tid / width;
+    let mut wts = Shared::<[f32]>::new_slice(index_heads);
+    let mut red_v = Shared::<[f32]>::new_slice(CUBE);
+    let mut red_i = Shared::<[u32]>::new_slice(CUBE);
+    if tid < index_heads {
+        wts[tid] =
+            f32::cast_from(w[b * w.stride(0) + t * w.stride(1) + tid * w.stride(2)]) * w_scale;
+    }
+    sync_cube();
+    let (r0, r1, r2, r3) = (raw.stride(0), raw.stride(1), raw.stride(2), raw.stride(3));
+    let row = (b * q + i) * nb;
+    // Block maxima, one plane per block.
+    let mut blk = plane;
+    while blk < n {
+        let mut best = f32::new(-1.0e30f32);
+        let mut s = lane;
+        while s < block {
+            let position = blk * block + s;
+            let at = b * r0 + i * r2 + position * r3;
+            let mut score = 0.0f32;
+            for j in 0..index_heads {
+                let dot = f32::cast_from(raw[at + j * r1]);
+                score += wts[j] * select(dot > 0.0f32, dot, 0.0f32);
+            }
+            if int8 {
+                score *= f32::cast_from(scales[b * scales.stride(0) + position * scales.stride(1)]);
+            }
+            best = select(score > best, score, best);
+            s += width;
+        }
+        let top = plane_max(best);
+        if lane == 0 {
+            blocks[row + blk] = top;
+        }
+        blk += planes;
+    }
+    sync_cube();
+    let out = (b * t_total + t) * k;
+    if n <= k {
+        let mut r = tid;
+        while r < n {
+            picked[out + r] = i32::cast_from(r);
+            r += CUBE;
+        }
+        if tid == 0 {
+            count[b * t_total + t] = i32::cast_from(n);
+        }
+    } else {
+        for r in 0..k {
+            // The best block left: highest score, then lowest index.
+            let mut v = f32::new(-3.0e38f32);
+            let mut e_best = u32::cast_from(n);
+            let mut e = tid;
+            while e < n {
+                let x = blocks[row + e];
+                if x > v {
+                    v = x;
+                    e_best = u32::cast_from(e);
+                }
+                e += CUBE;
+            }
+            red_v[tid] = v;
+            red_i[tid] = e_best;
+            sync_cube();
+            let mut half = CUBE_DIM / 2;
+            while half > 0 {
+                if UNIT_POS < half {
+                    let ov = red_v[tid + half as usize];
+                    let oi = red_i[tid + half as usize];
+                    if ov > red_v[tid] || (ov == red_v[tid] && oi < red_i[tid]) {
+                        red_v[tid] = ov;
+                        red_i[tid] = oi;
+                    }
+                }
+                sync_cube();
+                half /= 2;
+            }
+            if tid == 0 {
+                let e = usize::cast_from(red_i[0]);
+                picked[out + r] = i32::cast_from(e);
+                blocks[row + e] = f32::new(-3.0e38f32);
+            }
+            sync_cube();
+        }
+        if tid == 0 {
+            count[b * t_total + t] = i32::cast_from(k);
+        }
+    }
+}
+
+/// Sparse prefill attention on the cached latents, one cube per (batch row, query of the chunk
+/// at absolute position `start + t`): the query's `count` picked blocks (their positions at
+/// least `local` before it) and its local window (the last `min(local, pos + 1)` positions),
+/// with an online softmax over tiles of `tile` positions. `q` `[B, H, T, l + dr]` is the
+/// absorbed query with the softmax scale folded in, `kv` `[B, S, l + dr]` the cache (both read
+/// through their strides). Writes the normalised latent sums `out` `[B, T, H, l]`
+/// (contiguous), before the value up-projection.
+///
+/// Each tile of cache rows is staged in shared memory once (independent coalesced loads), then
+/// read twice: for the scores, where each plane takes `tile / 8` positions and its lanes split
+/// the row width, every lane keeping the partial dot products of those positions and all heads
+/// in registers (one query and one cached value feed many products); and for the weighted sums,
+/// where each unit owns latent columns of every head. The tile is at most a plane wide, so the
+/// softmax update is one lane per position.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ret_prefill_attend_kernel<F: Float>(
+    q: &Tensor<F>,
+    kv: &Tensor<F>,
+    picked: &Tensor<i32>,
+    count: &Tensor<i32>,
+    out: &mut Tensor<F>,
+    start: usize,
+    t_total: usize,
+    k: usize,
+    #[comptime] heads: usize,
+    #[comptime] latent: usize,
+    #[comptime] dr: usize,
+    #[comptime] block: usize,
+    #[comptime] local: usize,
+    #[comptime] tile: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let b = CUBE_POS / t_total;
+    let t = CUBE_POS % t_total;
+    let pos = start + t;
+    let width = comptime!(latent + dr);
+    let cols = comptime!(latent.div_ceil(CUBE));
+    let per = comptime!(tile / PREFILL_PLANES);
+    let steps = comptime!(width.div_ceil(PREFILL_LANES));
+    let copies = comptime!((tile * width).div_ceil(CUBE));
+    let tid = UNIT_POS as usize;
+    let lane = UNIT_POS_PLANE as usize;
+    let plane = tid / PREFILL_LANES;
+    let mut q_sh = Shared::<[F]>::new_slice(heads * width);
+    let mut kv_sh = Shared::<[F]>::new_slice(tile * width);
+    let mut sc = Shared::<[f32]>::new_slice(heads * tile);
+    let mut at = Shared::<[u32]>::new_slice(tile);
+    let mut ok = Shared::<[u32]>::new_slice(tile);
+    let mut m_sh = Shared::<[f32]>::new_slice(heads);
+    let mut l_sh = Shared::<[f32]>::new_slice(heads);
+    let mut corr = Shared::<[f32]>::new_slice(heads);
+    let (q0, q1, q2, q3) = (q.stride(0), q.stride(1), q.stride(2), q.stride(3));
+    let mut idx = tid;
+    while idx < heads * width {
+        let h = idx / width;
+        let d = idx % width;
+        q_sh[idx] = q[b * q0 + h * q1 + t * q2 + d * q3];
+        idx += CUBE;
+    }
+    if tid < heads {
+        m_sh[tid] = f32::new(-1.0e30f32);
+        l_sh[tid] = 0.0f32;
+    }
+    let mut acc = Array::<f32>::new(comptime!(heads * cols));
+    #[unroll]
+    for a in 0..heads * cols {
+        acc[a] = 0.0f32;
+    }
+    let n_sel = usize::cast_from(count[b * t_total + t]);
+    let window = select(pos + 1 < local, pos + 1, local);
+    let sel_slots = n_sel * block;
+    let slots = sel_slots + window;
+    let win_start = pos + 1 - window;
+    let pick_row = (b * t_total + t) * k;
+    let (k0, k1, k2) = (kv.stride(0), kv.stride(1), kv.stride(2));
+    let row0 = b * k0;
+    sync_cube();
+    let mut base = 0usize;
+    while base < slots {
+        if tid < tile {
+            let u = base + tid;
+            let mut position = 0usize;
+            let mut visible = u < slots;
+            if visible {
+                if u < sel_slots {
+                    let blk = usize::cast_from(picked[pick_row + u / block]);
+                    position = blk * block + u % block;
+                    visible = position + local <= pos;
+                } else {
+                    position = win_start + (u - sel_slots);
+                }
+            }
+            at[tid] = u32::cast_from(position);
+            ok[tid] = select(visible, 1u32, 0u32);
+        }
+        sync_cube();
+        // Stage the tile's rows (hidden positions as zeros).
+        #[unroll]
+        for r in 0..copies {
+            let e = tid + r * CUBE;
+            if e < tile * width {
+                let s = e / width;
+                let d = e % width;
+                let mut x = F::cast_from(0.0f32);
+                if ok[s] == 1 {
+                    x = kv[row0 + usize::cast_from(at[s]) * k1 + d * k2];
+                }
+                kv_sh[e] = x;
+            }
+        }
+        sync_cube();
+        // Scores: plane `plane` takes positions `plane * per ..`, its lanes splitting the width.
+        let mut part = Array::<f32>::new(comptime!(per * heads));
+        #[unroll]
+        for a in 0..per * heads {
+            part[a] = 0.0f32;
+        }
+        #[unroll]
+        for m in 0..steps {
+            let d = lane + m * PREFILL_LANES;
+            if d < width {
+                let mut qv = Array::<f32>::new(heads);
+                #[unroll]
+                for h in 0..heads {
+                    qv[h] = f32::cast_from(q_sh[h * width + d]);
+                }
+                #[unroll]
+                for j in 0..per {
+                    let x = f32::cast_from(kv_sh[(plane * per + j) * width + d]);
+                    #[unroll]
+                    for h in 0..heads {
+                        part[j * heads + h] += qv[h] * x;
+                    }
+                }
+            }
+        }
+        #[unroll]
+        for j in 0..per {
+            let s = plane * per + j;
+            #[unroll]
+            for h in 0..heads {
+                let total = plane_sum(part[j * heads + h]);
+                if lane == 0 {
+                    sc[h * tile + s] = select(ok[s] == 1, total, f32::new(-1.0e30f32));
+                }
+            }
+        }
+        sync_cube();
+        // Online softmax per head, one plane per head and one lane per position: new running
+        // max, weights in place, rescale factor.
+        let mut h = plane;
+        while h < heads {
+            let mut v = f32::new(-1.0e30f32);
+            if lane < tile {
+                v = sc[h * tile + lane];
+            }
+            let old = m_sh[h];
+            let tile_top = plane_max(v);
+            let top = select(tile_top > old, tile_top, old);
+            let e = select(v > -1.0e29f32, (v - top).exp(), 0.0f32);
+            if lane < tile {
+                sc[h * tile + lane] = e;
+            }
+            let total = plane_sum(e);
+            if lane == 0 {
+                let factor = (old - top).exp();
+                l_sh[h] = l_sh[h] * factor + total;
+                m_sh[h] = top;
+                corr[h] = factor;
+            }
+            h += PREFILL_PLANES;
+        }
+        sync_cube();
+        // Weighted latent sums, each unit owning `cols` latent columns of every head.
+        #[unroll]
+        for j in 0..cols {
+            let c = tid + j * CUBE;
+            if c < latent {
+                #[unroll]
+                for h in 0..heads {
+                    acc[h * cols + j] *= corr[h];
+                }
+                for s in 0..tile {
+                    if ok[s] == 1 {
+                        let x = f32::cast_from(kv_sh[s * width + c]);
+                        #[unroll]
+                        for h in 0..heads {
+                            acc[h * cols + j] += sc[h * tile + s] * x;
+                        }
+                    }
+                }
+            }
+        }
+        sync_cube();
+        base += tile;
+    }
+    #[unroll]
+    for j in 0..cols {
+        let c = tid + j * CUBE;
+        if c < latent {
+            #[unroll]
+            for h in 0..heads {
+                out[((b * t_total + t) * heads + h) * latent + c] =
+                    F::cast_from(acc[h * cols + j] / l_sh[h]);
+            }
+        }
     }
 }

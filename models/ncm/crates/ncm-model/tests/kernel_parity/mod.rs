@@ -15,7 +15,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, Distribution, FloatDType, Int, Tensor, TensorData};
-use ncm_model::delta::{DeltaCache, DeltaSpec, GatedDeltaNet};
+use ncm_model::delta::{
+    DeltaCache, DeltaSpec, GatedDeltaNet, delta_rule_chunked, delta_rule_recurrent,
+};
 use ncm_model::fused::{active, argmax_last, set_cuda_graphs, set_fused_kernels};
 use ncm_model::layers::Rope;
 use ncm_model::ncm::GraphedDecoder;
@@ -271,9 +273,107 @@ pub fn assert_close(what: &str, got: &[f32], reference: &[f32], want: &[f32], to
     );
 }
 
+/// Like [`assert_close`] for paths whose algorithm has its own rounding error on the device
+/// (the chunked delta rule inverts a triangular matrix by repeated squaring): `got` may be off
+/// the f32 CPU result by `tol` or by 1.5 times the CUDA reference's own error, whichever is
+/// larger, so the fused kernel adds no error of its own.
+pub fn assert_no_worse(what: &str, got: &[f32], reference: &[f32], want: &[f32], tol: f32) {
+    assert_eq!(got.len(), want.len(), "{what}: length mismatch");
+    assert!(got.iter().all(|g| g.is_finite()), "{what}: non-finite output");
+    let (err, err_reference) = (rel_error(got, want), rel_error(reference, want));
+    assert!(
+        err <= tol.max(1.5 * err_reference),
+        "{what}: error over scale {err:.2e}, the CUDA reference's {err_reference:.2e}"
+    );
+    eprintln!("{what}: error over scale: fused {err:.2e}, cuda reference {err_reference:.2e}");
+}
+
 fn delta_layer(head_dim: usize, heads: usize, device: &Device) -> GatedDeltaNet {
     let spec = DeltaSpec { d: heads * head_dim, head_dim, conv: 4, chunk: 64, eps: 1e-6 };
     GatedDeltaNet::new(&spec, device)
+}
+
+/// Random inputs of the gated delta rule over `t` positions: L2-normalised queries and keys,
+/// values, log decays in (-0.5, 0), write strengths in (0, 1) and a starting state.
+fn delta_inputs(
+    b: usize,
+    h: usize,
+    t: usize,
+    dk: usize,
+    dv: usize,
+    device: &Device,
+) -> [Tensor<4>; 4] {
+    let normal = Distribution::Normal(0.0, 1.0);
+    let unit = |x: Tensor<4>| {
+        let norm = x.clone().square().sum_dim(3).sqrt();
+        x / norm
+    };
+    let q = unit(Tensor::random([b, h, t, dk], normal, device));
+    let k = unit(Tensor::random([b, h, t, dk], normal, device));
+    let v = Tensor::random([b, h, t, dv], normal, device);
+    let state = Tensor::random([b, h, dk, dv], normal, device).mul_scalar(0.1);
+    [q, k, v, state]
+}
+
+/// The chunked delta rule with the fused chunk scan, against the same chunked form on the
+/// reference path and the token-by-token recurrence on the CPU in f32: outputs and final state,
+/// for lengths that pad the last chunk, fill whole chunks, and fit in one.
+pub fn delta_chunked_matches(device: &Device, tol: f32) {
+    for (dk, dv, chunk) in [(128, 128, 64), (16, 16, 4), (32, 32, 64)] {
+        for t in [200, 128, 37] {
+            device.seed(t as u64);
+            let (b, h) = (2, 3);
+            let [q, k, v, state] = delta_inputs(b, h, t, dk, dv, device);
+            let uniform = |lo: f64, hi: f64| {
+                Tensor::<3>::random([b, h, t], Distribution::Uniform(lo, hi), device)
+            };
+            let (g, beta) = (uniform(-0.5, 0.0), uniform(0.0, 1.0));
+            let args = (q, k, v, g, beta, state);
+            let run = |a: &(Tensor<4>, Tensor<4>, Tensor<4>, Tensor<3>, Tensor<3>, Tensor<4>)| {
+                let (q, k, v, g, beta, s) = a.clone();
+                delta_rule_chunked(q, k, v, g, beta, s, chunk)
+            };
+            let (got, got_state) = run(&args);
+            let (base, base_state) = reference(|| run(&args));
+            let (q, k, v, g, beta, s) = args;
+            let (want, want_state) = delta_rule_recurrent(
+                to_cpu(&q),
+                to_cpu(&k),
+                to_cpu(&v),
+                to_cpu(&g),
+                to_cpu(&beta),
+                to_cpu(&s),
+            );
+            let what = format!("delta chunked dk {dk} chunk {chunk} t {t}");
+            assert_no_worse(&what, &values(got), &values(base), &values(want), tol);
+            let what = format!("{what} state");
+            let (got, base, want) = (values(got_state), values(base_state), values(want_state));
+            assert_no_worse(&what, &got, &base, &want, tol);
+        }
+    }
+}
+
+/// A gated DeltaNet layer prefilled through the fused chunk scan (more than a chunk per call,
+/// so not the step kernel), then stepped: outputs against the f32 CPU layer.
+pub fn delta_prefill_matches(device: &Device, tol: f32) {
+    for (head_dim, heads) in [(128, 2), (16, 2)] {
+        device.seed(17);
+        let layer = delta_layer(head_dim, heads, device);
+        let exact = cpu_copy(&layer);
+        let d = heads * head_dim;
+        let normal = Distribution::Normal(0.0, 1.0);
+        let mut fused: DeltaCache = layer.make_cache(2, device);
+        let mut cuda: DeltaCache = layer.make_cache(2, device);
+        let mut want: DeltaCache = exact.make_cache(2, &cpu());
+        for (step, t) in [150, 70, 1, 4, 300].into_iter().enumerate() {
+            let x = Tensor::<3>::random([2, t, d], normal, device).mul_scalar(20.0);
+            let got = values(layer.forward(x.clone(), Some(&mut fused)));
+            let base = values(reference(|| layer.forward(x.clone(), Some(&mut cuda))));
+            let exp = values(exact.forward(to_cpu(&x), Some(&mut want)));
+            let what = format!("delta prefill hd {head_dim} call {step} (t {t})");
+            assert_no_worse(&what, &got, &base, &exp, tol);
+        }
+    }
 }
 
 /// The fused DeltaNet step: one-token steps and 3- and 4-token runs (the NCM encoder's
@@ -309,6 +409,7 @@ pub fn delta_matches(device: &Device, tol: f32) {
 }
 
 /// One retrieval check: layer shape, positions prefilled, positions decoded after them.
+#[derive(Clone)]
 pub struct RetrievalCase {
     pub name: &'static str,
     pub spec: RetrievalSpec,
@@ -343,15 +444,32 @@ fn retrieval_spec(
         topk,
         local,
         dense,
+        index_8bit: false,
         eps: 1e-6,
     }
 }
 
+/// `case` with its indexer keys cached as 8-bit codes. The fused kernel normalises the key in
+/// f32 and the reference in bf16 tensor ops, so in bf16 a few codes differ by one between the
+/// paths, which moves near ties of the block scores often enough that these cases run in f32
+/// only (the kernels are the same code at both dtypes).
+fn int8(case: RetrievalCase) -> RetrievalCase {
+    let name = match case.name {
+        "model heads, block 8 top 4 local 16" => "model heads, block 8 top 4 local 16, 8-bit keys",
+        "tiny heads, block 2 top 2 local 4" => "tiny heads, block 2 top 2 local 4, 8-bit keys",
+        "model heads, 250M selection" => "model heads, 250M selection, 8-bit keys",
+        other => other,
+    };
+    let spec = RetrievalSpec { index_8bit: true, ..case.spec };
+    RetrievalCase { name, spec, bf16_stable: false, ..case }
+}
+
 /// The cases: the models' head shapes with small blocks (dense, then sparse, crossing block and
 /// window boundaries), the tiny configs' shapes, dense mode, and the 250M selection settings
-/// (blocks of 64, top 32, window 1,024) past the point where selection starts.
+/// (blocks of 64, top 32, window 1,024) past the point where selection starts; the sparse ones
+/// again with 8-bit indexer keys.
 pub fn retrieval_cases() -> Vec<RetrievalCase> {
-    vec![
+    let cases = vec![
         RetrievalCase {
             name: "model heads, block 8 top 4 local 16",
             spec: retrieval_spec(true, 8, 4, 16, false),
@@ -380,7 +498,9 @@ pub fn retrieval_cases() -> Vec<RetrievalCase> {
             steps: 40,
             bf16_stable: false,
         },
-    ]
+    ];
+    let quantised: Vec<_> = cases.iter().filter(|c| !c.spec.dense).cloned().map(int8).collect();
+    cases.into_iter().chain(quantised).collect()
 }
 
 /// Decodes `case.steps` positions one at a time after a chunked reference prefill, batch 2, and
@@ -444,5 +564,64 @@ pub fn retrieval_matches(device: &Device, case: &RetrievalCase, tol: f32) {
         "{}: {} steps, worst error over scale: fused {worst:.2e}, cuda reference \
          {worst_reference:.2e}; {flips} near-tie steps matched the CUDA reference instead",
         case.name, case.steps
+    );
+}
+
+/// The fused sparse prefill (indexer selection and attention on the device) against the
+/// reference's masked attention over the whole context, on CUDA at the same dtype, and the f32
+/// CPU reference: the case's positions plus its decode steps fed in uneven chunks (37, 300 and
+/// 512 positions), batch 2. An output row passes when it is within `tol` of the CPU result or of
+/// the CUDA reference; rows matching neither (a near tie of block scores picked differently) may
+/// be at most 2% of all.
+pub fn retrieval_prefill_matches(device: &Device, case: &RetrievalCase, tol: f32) {
+    let spec = &case.spec;
+    device.seed(7);
+    let layer = SparseRetrieval::new(spec, device);
+    let exact = cpu_copy(&layer);
+    let capacity = case.prefill + case.steps;
+    let mut fused: LatentCache = layer.make_cache(capacity, 2, device);
+    let mut cuda: LatentCache = layer.make_cache(capacity, 2, device);
+    let mut want: LatentCache = exact.make_cache(capacity, 2, &cpu());
+    let normal = Distribution::Normal(0.0, 1.0);
+    let rope = |start: usize, len: usize, device: &Device| {
+        Rope::new(start, len, spec.rope_dim, 1e6, 1.0, device)
+    };
+    let (mut start, mut call) = (0, 0);
+    let (mut rows, mut flips, mut worst, mut worst_reference) = (0, 0, 0f32, 0f32);
+    while start < capacity {
+        let len = [37, 300, 512][call % 3].min(capacity - start).max(2);
+        let len = len.min(capacity - start);
+        let x = Tensor::<3>::random([2, len, spec.d], normal, device).mul_scalar(3.0);
+        let got =
+            values(layer.forward(x.clone(), start, &rope(start, len, device), Some(&mut fused)));
+        let base = values(reference(|| {
+            layer.forward(x.clone(), start, &rope(start, len, device), Some(&mut cuda))
+        }));
+        let exp =
+            values(exact.forward(to_cpu(&x), start, &rope(start, len, &cpu()), Some(&mut want)));
+        assert!(got.iter().all(|g| g.is_finite()), "{} at {start}: non-finite output", case.name);
+        let scale = exp.iter().fold(0f32, |m, w| m.max(w.abs())).max(1e-6);
+        for ((g, b), e) in got.chunks(spec.d).zip(base.chunks(spec.d)).zip(exp.chunks(spec.d)) {
+            let diff = |a: &[f32], z: &[f32]| {
+                a.iter().zip(z).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max) / scale
+            };
+            let (err, err_base, err_reference) = (diff(g, e), diff(g, b), diff(b, e));
+            rows += 1;
+            if err <= tol {
+                worst = worst.max(err);
+                worst_reference = worst_reference.max(err_reference);
+            } else if err_base > tol {
+                flips += 1;
+            }
+        }
+        start += len;
+        call += 1;
+    }
+    assert_eq!(fused.len(), capacity);
+    assert!(flips * 50 <= rows, "{}: {flips} of {rows} prefill rows match neither", case.name);
+    eprintln!(
+        "{} prefill: {rows} rows, worst error over scale: fused {worst:.2e}, cuda reference \
+         {worst_reference:.2e}; {flips} rows matched neither",
+        case.name
     );
 }

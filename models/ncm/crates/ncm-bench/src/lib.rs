@@ -15,6 +15,7 @@
 //! output.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
@@ -33,7 +34,8 @@ pub const PASS_RATIO: f64 = 1.5;
 pub const WEAK_RATIO: f64 = 1.2;
 /// The v2 NCM may be at most 25% slower than the fallback NCM (plan, local test plan step 2).
 pub const FALLBACK_FLOOR: f64 = 0.75;
-const PREFILL_CHUNK: usize = 512;
+/// Prompt tokens per prefill call (`--prefill-chunk`).
+static PREFILL_CHUNK: AtomicUsize = AtomicUsize::new(512);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ModelChoice {
@@ -156,6 +158,9 @@ pub struct Cli {
     /// Keep the tied output head dense when quantising.
     #[arg(long)]
     pub dense_head: bool,
+    /// Prompt tokens per prefill call.
+    #[arg(long, default_value_t = 512)]
+    pub prefill_chunk: usize,
 }
 
 impl Cli {
@@ -265,7 +270,8 @@ fn run_once(
             let mut cache = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let mut cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK);
+            let mut cond =
+                m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK.load(Ordering::Relaxed));
             sync(device);
             let prefilled = Instant::now();
             let concepts = new_tokens / m.concept_size();
@@ -312,7 +318,11 @@ fn run_once(
             let mut caches = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let _ = m.prefill(prompt.clone().narrow(1, 0, context - 1), &mut caches, PREFILL_CHUNK);
+            let _ = m.prefill(
+                prompt.clone().narrow(1, 0, context - 1),
+                &mut caches,
+                PREFILL_CHUNK.load(Ordering::Relaxed),
+            );
             sync(device);
             let prefilled = Instant::now();
             let mut token = prompt.clone().narrow(1, context - 1, 1);
@@ -573,6 +583,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         return Err(format!("--assume-accept {rate} is not between 0 and 1"));
     }
     set_fused_attention(cli.fused_attention);
+    PREFILL_CHUNK.store(cli.prefill_chunk.max(1), Ordering::Relaxed);
     set_fused_kernels(!cli.reference_kernels);
     set_cuda_graphs(!cli.no_cuda_graphs);
     let spec = cli.quant_spec()?;

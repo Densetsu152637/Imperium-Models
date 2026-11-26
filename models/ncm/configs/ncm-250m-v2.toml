@@ -44,3 +44,8 @@ ret_block = 64       # concepts per block
 ret_topk = 32        # blocks per query (2,048 concepts)
 ret_local = 1024     # most recent concepts, always visible
 ret_dense = false    # true for the dense training warm-up
+idx_8bit = true      # indexer keys as 8-bit codes + one scale per position; false: run dtype
+# YaRN on the retrieval layers' decoupled RoPE key: off (1.0) for pretraining at 4k tokens; the
+# 1M long-context stage sets ret_yarn_factor = 256.0 (1M / 4k).
+ret_yarn_factor = 1.0
+ret_yarn_original = 1024  # concepts (4,096 tokens) seen in pretraining

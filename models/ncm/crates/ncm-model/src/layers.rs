@@ -84,6 +84,53 @@ pub struct Rope {
     rot: Tensor<4>,
 }
 
+/// YaRN (Peng et al., 2023) context extension of a RoPE table. A frequency whose wavelength fits
+/// at least `BETA` times into the `original` context keeps its rate, one whose wavelength is
+/// longer than that context (fewer than `ALPHA` turns) is slowed by `factor` (position
+/// interpolation), with a linear ramp in between; both tables are scaled by the attention
+/// temperature `0.1 ln(factor) + 1`, so a dot product of two rotated vectors grows by its square.
+/// A `factor` of 1 is plain RoPE.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Yarn {
+    pub factor: f64,
+    /// Positions seen in training before the extension.
+    pub original: usize,
+}
+
+impl Yarn {
+    /// Wavelengths fitting fewer turns into the original context than this are interpolated.
+    const ALPHA: f64 = 1.0;
+    /// Wavelengths fitting more turns than this keep their rate.
+    const BETA: f64 = 32.0;
+
+    /// Plain RoPE.
+    pub const OFF: Self = Self { factor: 1.0, original: 1 };
+
+    /// The retrieval key's settings of a v2 config.
+    pub fn of(v2: &V2Config) -> Self {
+        Self { factor: v2.ret_yarn_factor, original: v2.ret_yarn_original }
+    }
+
+    fn on(&self) -> bool {
+        self.factor > 1.0
+    }
+
+    /// The rate of frequency `theta` (radians per position) after the extension.
+    fn rate(&self, theta: f64) -> f64 {
+        if !self.on() {
+            return theta;
+        }
+        let turns = self.original as f64 * theta / std::f64::consts::TAU;
+        let keep = ((turns - Self::ALPHA) / (Self::BETA - Self::ALPHA)).clamp(0.0, 1.0);
+        keep * theta + (1.0 - keep) * theta / self.factor
+    }
+
+    /// The factor on both tables.
+    fn temperature(&self) -> f64 {
+        if self.on() { 0.1 * self.factor.ln() + 1.0 } else { 1.0 }
+    }
+}
+
 impl Rope {
     /// Tables for absolute positions `start..start + len`; `scale` divides the positions
     /// (a linear scaling hook).
@@ -95,17 +142,32 @@ impl Rope {
         scale: f64,
         device: &Device,
     ) -> Self {
+        Self::with_yarn(start, len, head_dim, base, scale, Yarn::OFF, device)
+    }
+
+    /// [`Self::new`] with the frequencies and temperature of `yarn`.
+    pub fn with_yarn(
+        start: usize,
+        len: usize,
+        head_dim: usize,
+        base: f64,
+        scale: f64,
+        yarn: Yarn,
+        device: &Device,
+    ) -> Self {
         let half = head_dim / 2;
-        let inv: Vec<f64> =
-            (0..half).map(|i| 1.0 / base.powf((2 * i) as f64 / head_dim as f64)).collect();
+        let inv: Vec<f64> = (0..half)
+            .map(|i| yarn.rate(1.0 / base.powf((2 * i) as f64 / head_dim as f64)))
+            .collect();
+        let temperature = yarn.temperature();
         let mut cos = Vec::with_capacity(len * head_dim);
         let mut sin = Vec::with_capacity(len * head_dim);
         for pos in start..start + len {
             for _ in 0..2 {
                 for f in &inv {
                     let angle = pos as f64 / scale * f;
-                    cos.push(angle.cos() as f32);
-                    sin.push(angle.sin() as f32);
+                    cos.push((angle.cos() * temperature) as f32);
+                    sin.push((angle.sin() * temperature) as f32);
                 }
             }
         }
@@ -115,6 +177,14 @@ impl Rope {
             sin: Tensor::from_data(TensorData::new(sin, shape), device),
             rot: rotation(head_dim, device),
         }
+    }
+
+    /// The tables `(cos, sin)` as host values, `len * head_dim` each (for tests).
+    pub fn to_vecs(&self) -> (Vec<f32>, Vec<f32>) {
+        let read = |t: &Tensor<4>| {
+            t.clone().into_data().convert::<f32>().try_to_vec::<f32>().expect("float table")
+        };
+        (read(&self.cos), read(&self.sin))
     }
 
     /// The `cos` and `sin` tables `[1, 1, T, head_dim]`.
@@ -600,6 +670,7 @@ impl StackSpec {
             topk: v2.ret_topk,
             local: v2.ret_local,
             dense: v2.ret_dense,
+            index_8bit: v2.idx_8bit,
             eps: self.eps,
         }
     }
@@ -644,6 +715,9 @@ pub struct Stack {
     rope_base_full: f64,
     rope_scale: f64,
     rope_scale_full: f64,
+    /// YaRN on the retrieval layers' decoupled key.
+    #[module(skip)]
+    retrieval_yarn: Yarn,
 }
 
 impl Stack {
@@ -657,7 +731,15 @@ impl Stack {
             rope_base_full: spec.rope_base_full,
             rope_scale: spec.rope_scale,
             rope_scale_full: spec.rope_scale_full,
+            retrieval_yarn: Yarn::of(&spec.v2),
         }
+    }
+
+    /// The retrieval layers' RoPE tables for positions `start..start + len`.
+    fn retrieval_table(&self, start: usize, len: usize, device: &Device) -> Rope {
+        let (dim, base, scale) =
+            (self.retrieval_rope_dim, self.rope_base_full, self.rope_scale_full);
+        Rope::with_yarn(start, len, dim, base, scale, self.retrieval_yarn, device)
     }
 
     fn ropes(&self, start: usize, t: usize, device: &Device) -> Ropes {
@@ -676,12 +758,7 @@ impl Stack {
         Ropes {
             local: table(local, self.head_dim, self.rope_base, self.rope_scale),
             full: table(full, self.head_dim, self.rope_base_full, self.rope_scale_full),
-            retrieval: table(
-                retrieval,
-                self.retrieval_rope_dim,
-                self.rope_base_full,
-                self.rope_scale_full,
-            ),
+            retrieval: retrieval.then(|| self.retrieval_table(start, t, device)),
         }
     }
 
@@ -817,8 +894,7 @@ impl Stack {
 
     /// The retrieval layers' RoPE tables for the one position `start`.
     fn retrieval_rope(&self, start: usize, device: &Device) -> Rope {
-        let (base, scale) = (self.rope_base_full, self.rope_scale_full);
-        Rope::new(start, 1, self.retrieval_rope_dim, base, scale, device)
+        self.retrieval_table(start, 1, device)
     }
 
     /// Warms up and records one step over fixed input buffers, leaving the caches as they were.

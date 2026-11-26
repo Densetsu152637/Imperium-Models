@@ -75,6 +75,15 @@ pub struct V2Config {
     pub ret_local: usize,
     /// Dense attention over the whole causal context (top-k = all): the training warm-up.
     pub ret_dense: bool,
+    /// Indexer keys cached as 8-bit codes with one scale per position (the design, as in
+    /// DeepSeek-V3.2); `false` keeps them at the run dtype (the parity option).
+    pub idx_8bit: bool,
+    /// YaRN context extension of the retrieval layers' decoupled RoPE key: positions are
+    /// stretched by this factor (1 = plain RoPE, the default for training at 4k tokens).
+    pub ret_yarn_factor: f64,
+    /// Positions (of the stack: concepts in the NCM backbone, tokens in the baseline) the model
+    /// was trained at before YaRN; only read when `ret_yarn_factor` is above 1.
+    pub ret_yarn_original: usize,
 }
 
 impl Default for V2Config {
@@ -94,6 +103,9 @@ impl Default for V2Config {
             ret_topk: 32,
             ret_local: 1024,
             ret_dense: false,
+            idx_8bit: true,
+            ret_yarn_factor: 1.0,
+            ret_yarn_original: 4096,
         }
     }
 }
@@ -405,7 +417,7 @@ pub fn tiny_v2(block: usize, topk: usize, local: usize) -> V2Config {
         ret_block: block,
         ret_topk: topk,
         ret_local: local,
-        ret_dense: false,
+        ..V2Config::default()
     }
 }
 

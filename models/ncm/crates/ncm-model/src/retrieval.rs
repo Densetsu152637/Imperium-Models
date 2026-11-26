@@ -21,7 +21,7 @@
 use burn::module::Module;
 use burn::nn::{Linear as DenseLinear, RmsNorm};
 use burn::tensor::activation::{relu, sigmoid, softmax};
-use burn::tensor::{Bool, Device, Int, Tensor, s};
+use burn::tensor::{Bool, Device, Int, IntDType, Tensor, s};
 
 use crate::layers::{Rope, apply_rope, dense_linear, linear, rms_norm};
 use crate::quant::QLinear as Linear;
@@ -41,12 +41,15 @@ pub struct RetrievalSpec {
     pub topk: usize,
     pub local: usize,
     pub dense: bool,
+    /// Indexer keys cached as 8-bit codes and one scale per position.
+    pub index_8bit: bool,
     pub eps: f64,
 }
 
 impl RetrievalSpec {
     /// Bytes of one layer's cache for `max_positions`: the latent and RoPE key at `itemsize`,
-    /// the indexer key at `index_itemsize`.
+    /// the indexer key at `index_itemsize` per value; keys narrower than `itemsize` (8-bit) add
+    /// one scale per position at `itemsize`.
     pub fn cache_bytes(
         &self,
         max_positions: usize,
@@ -54,9 +57,119 @@ impl RetrievalSpec {
         index_itemsize: usize,
         batch: usize,
     ) -> usize {
+        let scale = if index_itemsize < itemsize { itemsize } else { 0 };
         batch
             * max_positions
-            * ((self.latent + self.rope_dim) * itemsize + self.index_dim * index_itemsize)
+            * ((self.latent + self.rope_dim) * itemsize + self.index_dim * index_itemsize + scale)
+    }
+}
+
+/// Largest 8-bit code of an indexer key (symmetric, so -127..=127).
+const KEY_CODE_MAX: f64 = 127.0;
+
+/// Indexer keys `[B, T, di]` as 8-bit codes (i8) and one scale per position `[B, T, 1]` at the
+/// run dtype: `scale = max |k| / 127`, `code = round(k / scale)`.
+pub fn quantize_keys(keys: Tensor<3>) -> (Tensor<3, Int>, Tensor<3>) {
+    let scale = keys.clone().abs().max_dim(2).div_scalar(KEY_CODE_MAX).clamp_min(1e-30);
+    let codes = (keys / scale.clone()).round().clamp(-KEY_CODE_MAX, KEY_CODE_MAX);
+    (codes.int().cast(IntDType::I8), scale)
+}
+
+/// The keys 8-bit `codes` and their `scales` stand for.
+pub fn dequantize_keys(codes: Tensor<3, Int>, scales: Tensor<3>) -> Tensor<3> {
+    codes.float() * scales
+}
+
+/// Indexer keys as the scores read them: `keys` `[B, S, di]`, or for 8-bit keys their codes (as
+/// floats, exact) with the per-position `scales` `[B, S, 1]` applied after the dot products
+/// (`relu(s q.c) = s relu(q.c)` for a positive scale), so the codes are never rounded back to
+/// the run dtype.
+struct ScoreKeys {
+    keys: Tensor<3>,
+    scales: Option<Tensor<3>>,
+}
+
+impl ScoreKeys {
+    /// Keys computed in this pass, rounded to 8 bits as a cache would store them when `int8`.
+    /// Under autodiff (training) the rounding is straight-through instead.
+    fn fresh(keys: Tensor<3>, int8: bool) -> Self {
+        if !int8 {
+            return Self { keys, scales: None };
+        }
+        let (codes, scales) = quantize_keys(keys.clone());
+        if keys.is_require_grad() {
+            let rounded = dequantize_keys(codes, scales);
+            return Self { keys: keys.clone() + (rounded - keys).detach(), scales: None };
+        }
+        Self { keys: codes.float(), scales: Some(scales) }
+    }
+
+    fn positions(&self) -> usize {
+        self.keys.dims()[1]
+    }
+
+    /// The first `n` positions.
+    fn narrow(self, n: usize) -> Self {
+        Self { keys: self.keys.narrow(1, 0, n), scales: self.scales.map(|s| s.narrow(1, 0, n)) }
+    }
+}
+
+/// A retrieval cache's indexer keys.
+// One per retrieval layer: the size gap between the variants is not worth boxing for.
+#[allow(clippy::large_enum_variant)]
+pub enum IndexKeys {
+    /// At the run dtype, `[B, S, di]`.
+    Float(Tensor<3>),
+    /// 8-bit codes `[B, S, di]` (i8) and one scale per position `[B, S, 1]` (run dtype).
+    Int8 { codes: Tensor<3, Int>, scales: Tensor<3> },
+}
+
+impl IndexKeys {
+    fn new(batch: usize, capacity: usize, index_dim: usize, int8: bool, device: &Device) -> Self {
+        if int8 {
+            let codes = Tensor::<3, Int>::zeros([batch, capacity, index_dim], device);
+            let scales = Tensor::<3>::zeros([batch, capacity, 1], device);
+            Self::Int8 { codes: codes.cast(IntDType::I8), scales }
+        } else {
+            Self::Float(Tensor::zeros([batch, capacity, index_dim], device))
+        }
+    }
+
+    fn nbytes(&self) -> usize {
+        let bytes = |dims: [usize; 3], size: usize| dims.iter().product::<usize>() * size;
+        match self {
+            Self::Float(k) => bytes(k.dims(), k.dtype().size()),
+            Self::Int8 { codes, scales } => {
+                bytes(codes.dims(), codes.dtype().size())
+                    + bytes(scales.dims(), scales.dtype().size())
+            }
+        }
+    }
+
+    /// Writes `keys` `[B, T, di]` (run dtype) at positions `start..start + T`.
+    fn write(self, start: usize, keys: Tensor<3>) -> Self {
+        let t = keys.dims()[1];
+        match self {
+            Self::Float(k) => Self::Float(k.slice_assign(s![.., start..start + t], keys)),
+            Self::Int8 { codes, scales } => {
+                let (new_codes, new_scales) = quantize_keys(keys);
+                Self::Int8 {
+                    codes: codes.slice_assign(s![.., start..start + t], new_codes),
+                    scales: scales.slice_assign(s![.., start..start + t], new_scales),
+                }
+            }
+        }
+    }
+
+    /// The first `n` positions' keys for scoring.
+    fn view(&self, n: usize) -> ScoreKeys {
+        match self {
+            Self::Float(k) => ScoreKeys { keys: k.clone().narrow(1, 0, n), scales: None },
+            Self::Int8 { codes, scales } => ScoreKeys {
+                keys: codes.clone().narrow(1, 0, n).float(),
+                scales: Some(scales.clone().narrow(1, 0, n)),
+            },
+        }
     }
 }
 
@@ -64,7 +177,7 @@ impl RetrievalSpec {
 /// grows into a preallocated capacity; nothing is ever evicted.
 pub struct LatentCache {
     kv: Option<Tensor<3>>,
-    keys: Option<Tensor<3>>,
+    keys: Option<IndexKeys>,
     /// The next position on the device (`[1]`, i32), read by the fused decode kernels.
     #[cfg(feature = "cuda")]
     position: Tensor<1, Int>,
@@ -74,10 +187,17 @@ pub struct LatentCache {
 }
 
 impl LatentCache {
-    fn new(batch: usize, width: usize, index_dim: usize, capacity: usize, device: &Device) -> Self {
+    fn new(
+        batch: usize,
+        width: usize,
+        index_dim: usize,
+        int8: bool,
+        capacity: usize,
+        device: &Device,
+    ) -> Self {
         let kv = Tensor::<3>::zeros([batch, capacity, width], device);
         let itemsize = kv.dtype().size();
-        let keys = Tensor::<3>::zeros([batch, capacity, index_dim], device);
+        let keys = IndexKeys::new(batch, capacity, index_dim, int8, device);
         Self {
             kv: Some(kv),
             keys: Some(keys),
@@ -123,29 +243,28 @@ impl LatentCache {
         self.length = 0;
     }
 
-    /// Bytes allocated. The reference keeps indexer keys at the run dtype; the design stores
-    /// them in 8 bits ([`crate::INDEX_KEY_BYTES`]).
+    /// Bytes allocated: the latent and RoPE key at the run dtype, the indexer keys at the run
+    /// dtype or as 8-bit codes with one scale per position.
     pub fn nbytes(&self) -> usize {
-        let dims =
-            |t: &Option<Tensor<3>>| t.as_ref().expect("cache").dims().iter().product::<usize>();
-        (dims(&self.kv) + dims(&self.keys)) * self.itemsize
+        let kv = self.kv.as_ref().expect("cache").dims().iter().product::<usize>();
+        kv * self.itemsize + self.keys.as_ref().expect("cache").nbytes()
     }
 
     fn write(&mut self, kv: Tensor<3>, keys: Tensor<3>) {
         let (start, t) = (self.length, kv.dims()[1]);
         assert!(start + t <= self.capacity, "cache capacity {} exceeded", self.capacity);
         let old_kv = self.kv.take().expect("cache");
-        let old_keys = self.keys.take().expect("cache");
         self.kv = Some(old_kv.slice_assign(s![.., start..start + t], kv));
-        self.keys = Some(old_keys.slice_assign(s![.., start..start + t], keys));
+        self.keys = Some(self.keys.take().expect("cache").write(start, keys));
         self.length += t;
     }
 
-    fn view(&self) -> (Tensor<3>, Tensor<3>) {
+    /// The cached latents and the indexer keys of every position so far.
+    fn view(&self) -> (Tensor<3>, ScoreKeys) {
         let n = self.length;
         let kv = self.kv.clone().expect("cache");
-        let keys = self.keys.clone().expect("cache");
-        if n == self.capacity { (kv, keys) } else { (kv.narrow(1, 0, n), keys.narrow(1, 0, n)) }
+        let kv = if n == self.capacity { kv } else { kv.narrow(1, 0, n) };
+        (kv, self.keys.as_ref().expect("cache").view(n))
     }
 }
 
@@ -177,6 +296,7 @@ pub struct SparseRetrieval {
     topk: usize,
     local: usize,
     dense: bool,
+    index_8bit: bool,
 }
 
 impl SparseRetrieval {
@@ -211,24 +331,24 @@ impl SparseRetrieval {
             topk: spec.topk,
             local: spec.local,
             dense: spec.dense,
+            index_8bit: spec.index_8bit,
         }
     }
 
     pub fn make_cache(&self, max_positions: usize, batch: usize, device: &Device) -> LatentCache {
-        LatentCache::new(batch, self.latent + self.rope_dim, self.index_dim, max_positions, device)
+        let width = self.latent + self.rope_dim;
+        let int8 = self.index_8bit;
+        LatentCache::new(batch, width, self.index_dim, int8, max_positions, device)
     }
 
     fn scale(&self) -> f64 {
         1.0 / ((self.nope_dim + self.rope_dim) as f64).sqrt()
     }
 
-    /// The fused one-token decode ([`crate::kernels::retrieval_decode`]): the same cache write,
-    /// selection and attention as the reference, between the two projections.
+    /// The layer's shape and selection settings for the fused kernels.
     #[cfg(feature = "cuda")]
-    fn decode_fused(&self, x: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
-        let pos = cache.length;
-        assert!(pos < cache.capacity, "cache capacity {} exceeded", cache.capacity);
-        let dims = crate::kernels::RetrievalDims {
+    fn kernel_dims(&self) -> crate::kernels::RetrievalDims {
+        crate::kernels::RetrievalDims {
             heads: self.heads,
             nope_dim: self.nope_dim,
             rope_dim: self.rope_dim,
@@ -240,8 +360,18 @@ impl SparseRetrieval {
             topk: self.topk,
             local: self.local,
             dense: self.dense,
+            index_8bit: self.index_8bit,
             eps: self.q_norm.epsilon,
-        };
+        }
+    }
+
+    /// The fused one-token decode ([`crate::kernels::retrieval_decode`]): the same cache write,
+    /// selection and attention as the reference, between the two projections.
+    #[cfg(feature = "cuda")]
+    fn decode_fused(&self, x: Tensor<3>, rope: &Rope, cache: &mut LatentCache) -> Tensor<3> {
+        let pos = cache.length;
+        assert!(pos < cache.capacity, "cache capacity {} exceeded", cache.capacity);
+        let dims = self.kernel_dims();
         let norms =
             [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
         if !crate::fused::capturing() {
@@ -311,11 +441,19 @@ impl SparseRetrieval {
 
         let out = match cache {
             None => {
-                let hidden = self.hidden_mask(&index, index_k, start, t);
+                // The keys rounded as an 8-bit cache would store them, so a forward pass and
+                // cached decoding select alike.
+                let keys = ScoreKeys::fresh(index_k, self.index_8bit);
+                let hidden = self.hidden_mask(&index, keys, start, t);
                 self.attend_expanded(q_nope, q_rope, entry, hidden)
             }
             Some(cache) => {
                 cache.write(entry, index_k);
+                #[cfg(feature = "cuda")]
+                if t > 1 && !self.dense && crate::fused::active(&q_nope.device()) {
+                    let out = self.attend_prefill(q_nope, q_rope, &index, cache, start);
+                    return self.output(out, gate);
+                }
                 let (kv, keys) = cache.view();
                 if t == 1 && !self.dense {
                     self.attend_selected(q_nope, q_rope, kv, &index, keys, start)
@@ -325,28 +463,110 @@ impl SparseRetrieval {
                 }
             }
         };
-        let out = out.swap_dims(1, 2).reshape([b, t, h * dv]) * sigmoid(gate);
-        self.o.forward(out)
+        self.output(out, gate)
     }
 
-    /// Indexer scores `[B, T, S]` of queries against cached indexer keys `[B, S, di]`.
-    fn index_scores(&self, index: &Indexer, keys: Tensor<3>) -> Tensor<3> {
+    /// The attention output `[B, H, T, dv]` gated by `gate` `[B, T, H dv]` and projected.
+    fn output(&self, out: Tensor<4>, gate: Tensor<3>) -> Tensor<3> {
+        let [b, h, t, dv] = out.dims();
+        self.o.forward(out.swap_dims(1, 2).reshape([b, t, h * dv]) * sigmoid(gate))
+    }
+
+    /// Sparse prefill of `T > 1` queries at positions `start..` whose entries are already in
+    /// the cache, on the device ([`crate::kernels::retrieval_select`] and
+    /// [`crate::kernels::retrieval_prefill_attend`]): the same selection and attention as
+    /// [`Self::hidden_mask`] with [`Self::attend_latent`], but each query reads only its picked
+    /// blocks and its window, and no `[T, S]` mask or score matrix of the attention is built.
+    /// The indexer dot products and the absorbed projections stay matrix products. Returns
+    /// `[B, H, T, dv]`.
+    #[cfg(feature = "cuda")]
+    fn attend_prefill(
+        &self,
+        q_nope: Tensor<4>,
+        q_rope: Tensor<4>,
+        index: &Indexer,
+        cache: &LatentCache,
+        start: usize,
+    ) -> Tensor<4> {
+        /// Most indexer dot products held at once (`[B, hi, queries, positions]`).
+        const SELECT_BUDGET: usize = 1 << 26;
+        let [b, h, t, _] = q_nope.dims();
+        let (dn, dv, l) = (self.nope_dim, self.v_dim, self.latent);
+        let (hi, di, block) = (self.index_heads, self.index_dim, self.block);
+        let dims = self.kernel_dims();
+        let wuk = self.uk.weight.val().reshape([l, h, dn]).permute([1, 2, 0]).unsqueeze_dim::<4>(0);
+        let q = Tensor::cat(vec![q_nope.matmul(wuk), q_rope], 3).mul_scalar(self.scale());
+        let kv = cache.kv.as_ref().expect("cache");
+        // Packed scratch the selection fills for every query (its count, then that many blocks).
+        let picked = crate::kernels::scratch_i32(kv, [b, t, self.topk]);
+        let count = crate::kernels::scratch_i32(kv, [b, t]);
+        // Candidate blocks of the last query; earlier queries have a prefix of them.
+        let n = candidates(start + t - 1, block, self.local);
+        if n == 0 {
+            // No query retrieves yet: the selection only records zero blocks for each.
+            let none = q.clone();
+            crate::kernels::retrieval_select(
+                none,
+                index.w.clone(),
+                kv.clone(),
+                &picked,
+                &count,
+                start,
+                0,
+                dims,
+            );
+        } else {
+            let keys = cache.keys.as_ref().expect("cache").view(n * block);
+            let iq = index.q.clone().reshape([b, t, hi, di]).swap_dims(1, 2); // [B, hi, T, di]
+            let kt = keys.keys.clone().swap_dims(1, 2).unsqueeze_dim::<4>(1); // [B, 1, di, S']
+            let scales = keys.scales.unwrap_or(keys.keys);
+            let group = (SELECT_BUDGET / (b * hi * n * block)).clamp(1, t);
+            let mut t0 = 0;
+            while t0 < t {
+                let len = group.min(t - t0);
+                let raw = iq.clone().narrow(2, t0, len).matmul(kt.clone());
+                let w = index.w.clone();
+                crate::kernels::retrieval_select(
+                    raw,
+                    w,
+                    scales.clone(),
+                    &picked,
+                    &count,
+                    start,
+                    t0,
+                    dims,
+                );
+                t0 += len;
+            }
+        }
+        let latent = crate::kernels::retrieval_prefill_attend(q, kv, picked, count, start, dims);
+        let wuv = self.uv.weight.val().reshape([l, h, dv]).swap_dims(0, 1).unsqueeze_dim::<4>(0);
+        latent.swap_dims(1, 2).matmul(wuv)
+    }
+
+    /// Indexer scores `[B, T, S]` of queries against cached indexer keys.
+    fn index_scores(&self, index: &Indexer, keys: ScoreKeys) -> Tensor<3> {
         let [b, t, _] = index.q.dims();
-        let s = keys.dims()[1];
+        let s = keys.positions();
+        let ScoreKeys { keys, scales } = keys;
         let (hi, di) = (self.index_heads, self.index_dim);
         let q = index.q.clone().reshape([b, t, hi, di]).swap_dims(1, 2); // [B, hi, T, di]
         let w = index.w.clone().swap_dims(1, 2).unsqueeze_dim::<4>(3) // [B, hi, T, 1]
             * (1.0 / ((hi * di) as f64).sqrt());
         let keys = keys.swap_dims(1, 2).unsqueeze_dim::<4>(1); // [B, 1, di, S]
         // One head at a time keeps the transient at [B, T, S].
-        (0..hi)
+        let scores = (0..hi)
             .map(|j| {
                 let qj = q.clone().narrow(1, j, 1);
                 relu(qj.matmul(keys.clone())) * w.clone().narrow(1, j, 1)
             })
             .reduce(|a, b| a + b)
             .expect("at least one indexer head")
-            .reshape([b, t, s])
+            .reshape([b, t, s]);
+        match scales {
+            Some(scales) => scores * scales.reshape([b, 1, s]),
+            None => scores,
+        }
     }
 
     /// Block scores `[B, T, nb]`: the maximum indexer score inside each block.
@@ -368,12 +588,12 @@ impl SparseRetrieval {
     fn hidden_mask(
         &self,
         index: &Indexer,
-        keys: Tensor<3>,
+        keys: ScoreKeys,
         start: usize,
         t: usize,
     ) -> Tensor<3, Bool> {
-        let [b, s, _] = keys.dims();
-        let device = keys.device();
+        let [b, s, _] = keys.keys.dims();
+        let device = keys.keys.device();
         let (block, local) = (self.block, self.local);
         // Query minus key position, `[T, S]`, built on the device.
         let queries = Tensor::<1, Int>::arange(start as i64..(start + t) as i64, &device);
@@ -468,7 +688,7 @@ impl SparseRetrieval {
         q_rope: Tensor<4>,
         kv: Tensor<3>,
         index: &Indexer,
-        keys: Tensor<3>,
+        keys: ScoreKeys,
         pos: usize,
     ) -> Tensor<4> {
         let (block, local) = (self.block, self.local);
@@ -480,7 +700,7 @@ impl SparseRetrieval {
         let [b, _, width] = kv.dims();
         let device = kv.device();
         let k = self.topk;
-        let scores = self.index_scores(index, keys.narrow(1, 0, n * block)); // [B, 1, n*block]
+        let scores = self.index_scores(index, keys.narrow(n * block)); // [B, 1, n*block]
         let scores = self.block_scores(scores).reshape([b, n]);
         let (_, picked) = scores.topk_with_indices(k, 1); // [B, k]
         let offsets = Tensor::<1, Int>::arange(0..block as i64, &device).reshape([1, 1, block]);
