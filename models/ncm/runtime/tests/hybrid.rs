@@ -1,7 +1,7 @@
 //! The NCM hybrid in the server's engine (CPU, tiny config): block decoding streams tokens,
 //! stops at the limit, repeats across requests (the session is reset, its buffers kept), and
-//! reports what its blocks did; constrained requests stay inside the grammar; more than one
-//! slot is refused.
+//! reports what its blocks did; constrained requests stay inside the grammar; several slots
+//! decode together at block granularity.
 
 mod common;
 
@@ -68,9 +68,51 @@ fn constrained_hybrid_requests_stay_in_the_grammar() {
 }
 
 #[test]
-fn the_hybrid_serves_one_slot() {
-    let result = std::panic::catch_unwind(|| engine_with_slots(hybrid_config(), 256, 2));
-    assert!(result.is_err(), "two slots are refused");
+fn the_hybrid_batches_slots_at_block_granularity() {
+    use std::sync::Arc;
+    let prompts = ["the quick brown fox", "jumps over the lazy dog, twice over", "x"];
+    let one = engine(hybrid_config(), 256);
+    let want: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| run(&one, request(vocab().encode(p).unwrap(), 20, SamplingParams::GREEDY)).0)
+        .collect();
+    let batched = Arc::new(engine_with_slots(hybrid_config(), 256, 3));
+    let handles: Vec<_> = prompts
+        .iter()
+        .map(|&p| {
+            let engine = batched.clone();
+            std::thread::spawn(move || {
+                run(&engine, request(vocab().encode(p).unwrap(), 20, SamplingParams::GREEDY))
+            })
+        })
+        .collect();
+    for (h, want) in handles.into_iter().zip(&want) {
+        let (tokens, stats) = h.join().expect("a request");
+        assert_eq!(&tokens, want);
+        assert!(matches!(stats.path, DecodePath::Hybrid(_)));
+    }
+    let report = batched.slots().expect("a batching engine");
+    assert_eq!(report.slots.len(), 3);
+    assert_eq!(report.served, 3);
+    // Identical prompts arriving together prefill once (when one waits for the other).
+    let same = "the same prompt for every sample";
+    let sampled =
+        |seed| SamplingParams { temperature: 0.7, top_k: 0, top_p: 0.95, seed: Some(seed) };
+    let handles: Vec<_> = (0..3)
+        .map(|s| {
+            let engine = batched.clone();
+            std::thread::spawn(move || {
+                run(&engine, request(vocab().encode(same).unwrap(), 16, sampled(s)))
+            })
+        })
+        .collect();
+    for h in handles {
+        let (tokens, stats) = h.join().expect("a request");
+        assert_eq!(tokens.len(), stats.completion_tokens);
+        if stats.forked {
+            assert_eq!(stats.cached_tokens, stats.prompt_tokens);
+        }
+    }
 }
 
 /// Prefix reuse: a next turn that repeats the prompt and the reply starts from the kept end of

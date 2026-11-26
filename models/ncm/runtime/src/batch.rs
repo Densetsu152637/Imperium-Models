@@ -26,6 +26,14 @@
 //! set and counter per row), the rest step eagerly with host samplers; the NCM steps eagerly,
 //! greedy unconstrained tokens picked on the device (TODO: NCM graphs per slot set). With one
 //! slot the engine runs [`crate::engine`]'s sequential loop instead, unchanged.
+//!
+//! The NCM hybrid batches at block granularity: each decoding slot has an open block
+//! ([`ncm_model::hybrid::BlockRun`]); per iteration one batched block pass per pass mode runs
+//! over the slots due one (first pass, re-decode or recheck: rows = slots × block, per-slot
+//! memory rings and known prefixes, acceptance per row on the device), then one batched fill
+//! pass over the slots on their autoregressive fill, both replayed from graphs per slot set on
+//! CUDA ([`ncm_model::hybrid::PassGraphs`]); prefill chunks batch through one encoder pass
+//! ([`ncm_model::hybrid::HybridSession::prefill_slots`]), and identical prompts fork.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -34,12 +42,16 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
+use ncm_model::hybrid::{
+    BlockPhase, BlockRun, DecodeOptions, DrawSettings, FastSession, HybridLm, HybridSession,
+    HybridSnapshot, PassGraphs, PassMode, ar_pass_slots, block_pass_slots,
+};
 use ncm_model::{LayerCache, NcmCache, NcmLm, TokenLm};
 
 use crate::constrain::Constraint;
 use crate::engine::{
-    Core, DecodePath, EngineError, Event, Finish, GenStats, Job, Kept, MAX_EMPTY_CONCEPTS, State,
-    panic_message, read_ids, read_logits,
+    Core, DecodePath, EngineError, Event, Finish, GenStats, HybridAcceptance, Job, Kept,
+    MAX_EMPTY_CONCEPTS, State, panic_message, read_ids, read_logits,
 };
 use crate::sampling::{Sampler, argmax};
 use crate::vocab::Specials;
@@ -75,12 +87,15 @@ pub struct SlotView {
 enum Caches {
     Tok(Vec<LayerCache>),
     Ncm(NcmCache),
+    Hybrid(Box<FastSession>),
 }
 
 /// A kept prefix of one slot (see [`crate::engine`]): its snapshot restores only that slot.
 enum SlotKept {
     Tok(Kept<Vec<ncm_model::cache::LayerSnapshot>, Tensor<3>>),
     Ncm(Kept<ncm_model::ncm::NcmSnapshot, Tensor<3>>),
+    /// The hybrid's points need no output: decoding starts from the session.
+    Hybrid(Box<HybridSnapshot>),
 }
 
 impl SlotKept {
@@ -88,6 +103,7 @@ impl SlotKept {
         match self {
             Self::Tok(k) => &k.tokens,
             Self::Ncm(k) => &k.tokens,
+            Self::Hybrid(k) => k.tokens(),
         }
     }
 
@@ -95,8 +111,16 @@ impl SlotKept {
         match self {
             Self::Tok(k) => k.out.is_some(),
             Self::Ncm(k) => k.out.is_some(),
+            Self::Hybrid(_) => true,
         }
     }
+}
+
+/// A hybrid request's block state: its options, the open block's decode, what its blocks did.
+struct HybridRequest {
+    opts: DecodeOptions,
+    run: Option<BlockRun>,
+    acceptance: HybridAcceptance,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +172,8 @@ struct Active {
     /// The device sampler's settings (greedy: top-k 1), counter advanced per draw.
     #[cfg(feature = "cuda")]
     device: ncm_model::sample::SampleSettings,
+    /// The hybrid's block decode (None for the other models).
+    hybrid: Option<HybridRequest>,
 }
 
 struct Slot {
@@ -183,18 +209,55 @@ pub(crate) struct Batcher {
     /// The NCM's batched concept-step graphs, per slot set.
     #[cfg(feature = "cuda")]
     ncm_graphs: ncm_model::ncm::GraphedNcmSlots,
+    /// The hybrid's batched block and fill passes' graphs, per slot set and mode.
+    hybrid_graphs: PassGraphs,
 }
 
 #[allow(clippy::large_enum_variant)]
 enum Model {
     Tok(TokenLm),
     Ncm(NcmLm),
+    Hybrid(HybridLm),
 }
 
 impl Batcher {
     /// `count` slots over `core`'s model: the core's own caches become slot 0, the rest are
     /// allocated for the same context.
-    pub(crate) fn new(core: Core, count: usize, report: Arc<Mutex<SlotsReport>>) -> Self {
+    pub(crate) fn new(mut core: Core, count: usize, report: Arc<Mutex<SlotsReport>>) -> Self {
+        // The hybrid: one fast decode session per slot (the core's is the first).
+        if let Some((model, first)) = core.take_hybrid() {
+            let device = core.device.clone();
+            let capacity = core.capacity;
+            let mut slots = vec![Slot {
+                caches: Caches::Hybrid(Box::new(first)),
+                kept: Vec::new(),
+                last_used: 0,
+                active: None,
+            }];
+            for _ in 1..count {
+                let session = FastSession::new(&model, capacity, &device);
+                slots.push(Slot {
+                    caches: Caches::Hybrid(Box::new(session)),
+                    kept: Vec::new(),
+                    last_used: 0,
+                    active: None,
+                });
+            }
+            return Self {
+                core,
+                model: Model::Hybrid(model),
+                slots,
+                queue: VecDeque::new(),
+                report,
+                clock: 0,
+                next_prefill: 0,
+                #[cfg(feature = "cuda")]
+                tok_graphs: Default::default(),
+                #[cfg(feature = "cuda")]
+                ncm_graphs: Default::default(),
+                hybrid_graphs: PassGraphs::default(),
+            };
+        }
         let state = std::mem::replace(
             &mut *core.state.lock().unwrap_or_else(|p| p.into_inner()),
             State::Empty,
@@ -206,6 +269,7 @@ impl Batcher {
             State::Ncm { model, cache, .. } => (Model::Ncm(model), Caches::Ncm(cache)),
             State::Empty => unreachable!("a built core has a model"),
         };
+        let hybrid_graphs = PassGraphs::default();
         // With several slots, all of them get caches allocated together (on CUDA the retrieval
         // layers' rows of shared buffers, so a batched step decodes them in one set of
         // launches); one slot keeps the core's.
@@ -225,6 +289,7 @@ impl Batcher {
                     .into_iter()
                     .map(|c| slot(Caches::Ncm(c)))
                     .collect(),
+                Model::Hybrid(_) => unreachable!("the hybrid's slots are built above"),
             }
         };
         Self {
@@ -239,6 +304,7 @@ impl Batcher {
             tok_graphs: Default::default(),
             #[cfg(feature = "cuda")]
             ncm_graphs: Default::default(),
+            hybrid_graphs,
         }
     }
 
@@ -323,7 +389,7 @@ impl Batcher {
     fn stream_of(&self, prompt: &[u32]) -> (Vec<i32>, Vec<i32>, usize) {
         let ids: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
         match &self.model {
-            Model::Tok(_) => (ids, Vec::new(), 0),
+            Model::Tok(_) | Model::Hybrid(_) => (ids, Vec::new(), 0),
             Model::Ncm(m) => {
                 let k = m.concept_size();
                 let pad = k.saturating_sub(ids.len());
@@ -396,20 +462,42 @@ impl Batcher {
                         c.restore(&kept.snapshot);
                         kept.out.clone()
                     }
+                    (SlotKept::Hybrid(kept), Caches::Hybrid(c)) => {
+                        c.restore(kept);
+                        None
+                    }
                     _ => unreachable!("a slot keeps states of its own caches"),
                 };
                 let n = slot.kept[k].tokens().len();
                 (n, if n == stream.len() { out } else { None })
             }
             None => {
-                match &mut slot.caches {
-                    Caches::Tok(c) => c.iter_mut().for_each(LayerCache::reset),
-                    Caches::Ncm(c) => c.reset(),
+                match (&mut slot.caches, &self.model) {
+                    (Caches::Tok(c), _) => c.iter_mut().for_each(LayerCache::reset),
+                    (Caches::Ncm(c), _) => c.reset(),
+                    (Caches::Hybrid(c), Model::Hybrid(m)) => c.reset(m),
+                    _ => unreachable!("slots hold caches of the model"),
                 }
                 (0, None)
             }
         };
-        let phase = if out.is_some() { Phase::Decode } else { Phase::Prefill };
+        // The hybrid decodes from its session: a whole hit needs no stored output.
+        let is_hybrid = matches!(self.model, Model::Hybrid(_));
+        let whole = prefilled >= stream.len();
+        let phase =
+            if out.is_some() || (is_hybrid && whole) { Phase::Decode } else { Phase::Prefill };
+        let hybrid = is_hybrid.then(|| HybridRequest {
+            opts: crate::engine::hybrid_options(
+                request.sampling,
+                request.constraint.is_some(),
+                self.core.vocab.ids,
+            ),
+            run: None,
+            acceptance: HybridAcceptance::default(),
+        });
+        if let (Some(h), Caches::Hybrid(c)) = (&hybrid, &mut slot.caches) {
+            c.begin_request(h.opts.seed);
+        }
         #[cfg(feature = "cuda")]
         let device = if request.sampling.is_greedy() {
             ncm_model::sample::SampleSettings::GREEDY
@@ -447,6 +535,7 @@ impl Batcher {
             unappended: None,
             #[cfg(feature = "cuda")]
             device,
+            hybrid,
         });
         if phase == Phase::Decode {
             self.prompt_done(i);
@@ -467,10 +556,16 @@ impl Batcher {
             return;
         };
         let k = match &self.model {
-            Model::Tok(_) => 1,
+            Model::Tok(_) | Model::Hybrid(_) => 1,
             Model::Ncm(m) => m.concept_size(),
         };
         let chunk = self.core.chunk;
+        // The hybrid's encoder takes at most ENCODER_CHUNK tokens per call (its sliding window
+        // attends over the window plus the whole piece).
+        let chunk = match &self.model {
+            Model::Hybrid(_) => chunk.min(ncm_model::ncm::ENCODER_CHUNK),
+            _ => chunk,
+        };
         // The NCM's chunks are whole concepts (its streams are too).
         let chunk = (chunk - chunk % k).max(k);
         let left = |s: &Slot| {
@@ -517,6 +612,10 @@ impl Batcher {
         let out = match (&self.model, &mut slot.caches) {
             (Model::Tok(m), Caches::Tok(c)) => m.prefill(t, c, len),
             (Model::Ncm(m), Caches::Ncm(c)) => Some(m.prefill(t, c, len)),
+            (Model::Hybrid(m), Caches::Hybrid(c)) => {
+                c.prefill(m, piece);
+                None
+            }
             _ => unreachable!("slots hold caches of the model"),
         };
         active.prefilled += len;
@@ -543,27 +642,38 @@ impl Batcher {
                     .iter_mut()
                     .map(|s| match &mut s.caches {
                         Caches::Tok(c) => c.as_mut_slice(),
-                        Caches::Ncm(_) => unreachable!("slots hold caches of the model"),
+                        _ => unreachable!("slots hold caches of the model"),
                     })
                     .collect();
-                m.prefill_slots(t, &mut caches, len)
+                Some(m.prefill_slots(t, &mut caches, len))
             }
             Model::Ncm(m) => {
                 let mut caches: Vec<&mut NcmCache> = slots
                     .iter_mut()
                     .map(|s| match &mut s.caches {
                         Caches::Ncm(c) => c,
-                        Caches::Tok(_) => unreachable!("slots hold caches of the model"),
+                        _ => unreachable!("slots hold caches of the model"),
                     })
                     .collect();
-                m.prefill_slots(t, &mut caches, len)
+                Some(m.prefill_slots(t, &mut caches, len))
+            }
+            Model::Hybrid(m) => {
+                let mut sessions: Vec<&mut HybridSession> = slots
+                    .iter_mut()
+                    .map(|s| match &mut s.caches {
+                        Caches::Hybrid(c) => &mut c.session,
+                        _ => unreachable!("slots hold caches of the model"),
+                    })
+                    .collect();
+                HybridSession::prefill_slots(m, &mut sessions, t);
+                None
             }
         };
         for (r, slot) in slots.into_iter().enumerate() {
             let active = slot.active.as_mut().expect("prefilling");
             active.prefilled += len;
             if active.prefilled >= active.stream.len() {
-                active.out = Some(out.clone().narrow(0, r, 1));
+                active.out = out.as_ref().map(|o| o.clone().narrow(0, r, 1));
             }
         }
     }
@@ -586,6 +696,7 @@ impl Batcher {
                     out,
                 }),
                 Caches::Ncm(c) => SlotKept::Ncm(Kept { tokens, snapshot: c.snapshot(), out }),
+                Caches::Hybrid(c) => SlotKept::Hybrid(Box::new(c.snapshot())),
             });
         }
     }
@@ -605,6 +716,9 @@ impl Batcher {
                 .min_by_key(|&j| self.slots[j].last_used);
             match free {
                 Some(j) if s == stream && p == pending => {
+                    // Its kept prefixes describe the old contents, which the copy replaces.
+                    self.slots[j].kept.clear();
+                    self.start(j, w);
                     let (a, b) = if j < leader {
                         let (lo, hi) = self.slots.split_at_mut(leader);
                         (&hi[0], &mut lo[j])
@@ -617,11 +731,9 @@ impl Batcher {
                             dst.iter_mut().zip(src).for_each(|(d, s)| d.copy_from(s));
                         }
                         (Caches::Ncm(src), Caches::Ncm(dst)) => dst.copy_from(src),
+                        (Caches::Hybrid(src), Caches::Hybrid(dst)) => dst.copy_from(src),
                         _ => unreachable!("slots hold caches of one model"),
                     }
-                    // Its kept prefixes described the old contents.
-                    b.kept.clear();
-                    self.start(j, w);
                     let active = self.slots[j].active.as_mut().expect("just started");
                     active.prefilled = active.stream.len();
                     active.cached = active.stream.len().saturating_sub(active.pad);
@@ -659,6 +771,158 @@ impl Batcher {
         match &self.model {
             Model::Tok(_) => self.tok_step(&rows),
             Model::Ncm(_) => self.ncm_step(&rows),
+            Model::Hybrid(_) => self.hybrid_step(&rows),
+        }
+    }
+
+    /// The hybrid at block granularity: every decoding slot opens its block if it has none,
+    /// then one batched block pass per pass mode over the slots due one (a first pass, a
+    /// re-decode or a recheck), and one batched fill pass over the slots on their
+    /// autoregressive fill; slots whose block is done emit its tokens.
+    fn hybrid_step(&mut self, rows: &[usize]) {
+        let capacity = self.core.capacity;
+        let ids = self.ids();
+        let Model::Hybrid(model) = &self.model else { unreachable!("the hybrid") };
+        // Open the blocks.
+        let mut done = Vec::new();
+        for &i in rows {
+            let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } = &mut self.slots[i]
+            else {
+                unreachable!("a decoding hybrid slot")
+            };
+            let h = a.hybrid.as_mut().expect("a hybrid request");
+            if h.run.is_none() {
+                let room = capacity.saturating_sub(session.tokens().len());
+                let limit = a.max_tokens.saturating_sub(a.emitted).min(room);
+                if limit == 0 {
+                    done.push((i, Finish::Length));
+                    continue;
+                }
+                h.run = Some(session.begin_block(model, limit, &h.opts));
+            }
+        }
+        // Block passes, one batch per mode.
+        let mut due: Vec<(usize, PassMode, DrawSettings)> = Vec::new();
+        for &i in rows {
+            let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } = &mut self.slots[i]
+            else {
+                continue;
+            };
+            let Some(h) = a.hybrid.as_mut() else { continue };
+            let Some(run) = &h.run else { continue };
+            if run.phase() == BlockPhase::Pass {
+                let (mode, settings) = session.prepare_pass(model, run, &h.opts);
+                due.push((i, mode, settings));
+            }
+        }
+        let mut modes: Vec<PassMode> = due.iter().map(|d| d.1).collect();
+        modes.dedup();
+        modes.sort_by_key(|m| format!("{m:?}"));
+        modes.dedup();
+        for mode in modes {
+            let group: Vec<&(usize, PassMode, DrawSettings)> =
+                due.iter().filter(|d| d.1 == mode).collect();
+            let key: Vec<usize> = group.iter().map(|d| d.0).collect();
+            let settings: Vec<DrawSettings> = group.iter().map(|d| d.2.clone()).collect();
+            let results = {
+                let sessions = hybrid_sessions(&self.slots, &key);
+                block_pass_slots(model, &sessions, &key, mode, &settings, &mut self.hybrid_graphs)
+            };
+            for (&i, result) in key.iter().zip(results) {
+                let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } =
+                    &mut self.slots[i]
+                else {
+                    unreachable!("a decoding hybrid slot")
+                };
+                let Active { constraint, sampler, hybrid, .. } = a;
+                let h = hybrid.as_mut().expect("a hybrid request");
+                let run = h.run.as_mut().expect("an open block");
+                with_hooks(constraint, sampler, ids, |hooks| {
+                    session.apply_pass(model, run, result, &h.opts, hooks)
+                });
+            }
+        }
+        // Fill passes, one batch per draw kind.
+        for sampled in [false, true] {
+            let mut key = Vec::new();
+            let mut settings = Vec::new();
+            for &i in rows {
+                let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } =
+                    &mut self.slots[i]
+                else {
+                    continue;
+                };
+                let Some(h) = a.hybrid.as_mut() else { continue };
+                let Some(run) = &h.run else { continue };
+                if run.phase() == BlockPhase::Fill && run.fill_sampled(&h.opts) == sampled {
+                    settings.push(session.prepare_fill(model, run, &h.opts));
+                    key.push(i);
+                }
+            }
+            if key.is_empty() {
+                continue;
+            }
+            let (tokens, logp) = {
+                let sessions = hybrid_sessions(&self.slots, &key);
+                ar_pass_slots(model, &sessions, &key, sampled, &settings, &mut self.hybrid_graphs)
+            };
+            for (r, (&i, row_tokens)) in key.iter().zip(tokens).enumerate() {
+                let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } =
+                    &mut self.slots[i]
+                else {
+                    unreachable!("a decoding hybrid slot")
+                };
+                let Active { constraint, sampler, hybrid, .. } = a;
+                let h = hybrid.as_mut().expect("a hybrid request");
+                let run = h.run.as_mut().expect("an open block");
+                let p = run.next_position();
+                let logp = &logp;
+                let mut row = || -> Vec<f32> {
+                    logp.clone()
+                        .narrow(0, r, 1)
+                        .narrow(1, p, 1)
+                        .into_data()
+                        .convert::<f32>()
+                        .try_to_vec::<f32>()
+                        .expect("f32")
+                };
+                with_hooks(constraint, sampler, ids, |hooks| {
+                    session.apply_fill(run, row_tokens[p], &mut row, &h.opts, hooks)
+                });
+            }
+        }
+        // Blocks done: close them and emit their tokens.
+        for &i in rows {
+            if done.iter().any(|d| d.0 == i) {
+                continue;
+            }
+            let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } = &mut self.slots[i]
+            else {
+                continue;
+            };
+            let Some(h) = a.hybrid.as_mut() else { continue };
+            if h.run.as_ref().is_none_or(|r| r.phase() != BlockPhase::Done) {
+                continue;
+            }
+            let run = h.run.take().expect("a done block");
+            let block = session.end_block(model, run);
+            h.acceptance.add(&block.stats);
+            let mut ended = None;
+            for &t in &block.tokens {
+                if let Some(f) = emit(a, t as u32, ids) {
+                    ended = Some(f);
+                    break;
+                }
+            }
+            if ended.is_none() && (block.stopped || block.tokens.is_empty()) {
+                ended = Some(Finish::Length);
+            }
+            if let Some(f) = ended {
+                done.push((i, f));
+            }
+        }
+        for (i, f) in done {
+            self.finish(i, f);
         }
     }
 
@@ -928,8 +1192,16 @@ impl Batcher {
         slot.last_used = self.clock;
         let Some(a) = slot.active.take() else { return };
         let mut next = Vec::new();
+        if let (Some(_), Caches::Hybrid(c)) = (&a.prompt_kept, &slot.caches) {
+            // The hybrid keeps the point after the prompt and the end of the reply (an open
+            // block's tokens included).
+            if reuse && c.tokens().len() > a.stream.len() {
+                next.push(SlotKept::Hybrid(Box::new(c.snapshot())));
+            }
+        }
+        let hybrid_path = a.hybrid.as_ref().map(|h| DecodePath::Hybrid(h.acceptance));
         if let Some(prompt) = a.prompt_kept {
-            if reuse && a.history.len() > a.stream.len() {
+            if reuse && hybrid_path.is_none() && a.history.len() > a.stream.len() {
                 let tokens = a.history.clone();
                 // A copy: the condition may be a view of a step graph's output buffer.
                 let out = a.out.clone().map(|o| o.mul_scalar(1.0));
@@ -940,6 +1212,7 @@ impl Batcher {
                         out,
                     }),
                     Caches::Ncm(c) => SlotKept::Ncm(Kept { tokens, snapshot: c.snapshot(), out }),
+                    Caches::Hybrid(_) => unreachable!("the hybrid keeps its reply above"),
                 });
             }
             next.insert(0, prompt);
@@ -956,7 +1229,7 @@ impl Batcher {
             decode_tokens: a.emitted,
             cached_tokens: a.cached,
             capture_s: 0.0,
-            path: DecodePath::Batched,
+            path: hybrid_path.unwrap_or(DecodePath::Batched),
             queue_s: a.queued_s,
             mean_batch: if a.steps == 0 { 0.0 } else { a.rows as f64 / a.steps as f64 },
             forked: a.forked,
@@ -975,6 +1248,7 @@ impl Batcher {
                 let tokens = match &s.caches {
                     Caches::Tok(c) => c.first().map_or(0, LayerCache::len),
                     Caches::Ncm(c) => c.tokens,
+                    Caches::Hybrid(c) => c.tokens().len(),
                 };
                 match &s.active {
                     None => SlotView { id, state: "idle", tokens, ..SlotView::default() },
@@ -1049,7 +1323,7 @@ fn slot_caches_tok<'a>(slots: &'a mut [Slot], feed: &[(usize, i32)]) -> Vec<&'a 
         .iter_mut()
         .map(|s| match &mut s.caches {
             Caches::Tok(c) => Some(c.as_mut_slice()),
-            Caches::Ncm(_) => None,
+            _ => None,
         })
         .collect();
     feed.iter().map(|&(i, _)| picked[i].take().expect("one row per slot")).collect()
@@ -1064,7 +1338,7 @@ fn slot_caches_ncm<'a>(
         .iter_mut()
         .map(|s| match &mut s.caches {
             Caches::Ncm(c) => Some((c, s.active.as_mut())),
-            Caches::Tok(_) => None,
+            _ => None,
         })
         .collect();
     rows.iter()
@@ -1073,4 +1347,62 @@ fn slot_caches_ncm<'a>(
             (c, a.expect("an active slot"))
         })
         .unzip()
+}
+
+/// The hybrid sessions of slots `key`, in order.
+fn hybrid_sessions<'a>(slots: &'a [Slot], key: &[usize]) -> Vec<&'a FastSession> {
+    key.iter()
+        .map(|&i| match &slots[i].caches {
+            Caches::Hybrid(c) => &**c,
+            _ => unreachable!("slots hold caches of the hybrid"),
+        })
+        .collect()
+}
+
+/// Runs `f` with hooks over a request's grammar constraint (the scan over each check pass's
+/// tokens, the pick of every autoregressive token, both advancing the constraint) when it has
+/// one; plain hooks otherwise.
+fn with_hooks<T>(
+    constraint: &mut Option<Box<dyn Constraint>>,
+    sampler: &mut Sampler,
+    ids: Specials,
+    f: impl FnOnce(&mut ncm_model::hybrid::Hooks) -> T,
+) -> T {
+    use std::cell::RefCell;
+    if constraint.is_none() {
+        return f(&mut ncm_model::hybrid::Hooks::default());
+    }
+    let shared = RefCell::new((constraint.take(), sampler));
+    let mut scan = |proposed: &[i32]| {
+        let mut s = shared.borrow_mut();
+        let Some(c) = s.0.as_mut() else { return proposed.len() };
+        let mut n = 0;
+        for &t in proposed {
+            if !c.allows(t as u32) {
+                break;
+            }
+            c.advance(t as u32);
+            n += 1;
+        }
+        n
+    };
+    let mut pick = |row: &[f32]| {
+        let mut s = shared.borrow_mut();
+        let (c, sampler) = &mut *s;
+        let token = sampler.pick(row, c.as_deref()).unwrap_or(ids.im_end);
+        if let Some(c) = c.as_mut() {
+            c.advance(token);
+        }
+        token as i32
+    };
+    let out = {
+        let mut hooks = ncm_model::hybrid::Hooks {
+            scan: Some(&mut scan),
+            pick: Some(&mut pick),
+            ..Default::default()
+        };
+        f(&mut hooks)
+    };
+    *constraint = shared.into_inner().0;
+    out
 }

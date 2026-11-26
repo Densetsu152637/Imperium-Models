@@ -138,7 +138,7 @@ pub struct HybridAcceptance {
 }
 
 impl HybridAcceptance {
-    fn add(&mut self, stats: &ncm_model::hybrid::BlockStats) {
+    pub(crate) fn add(&mut self, stats: &ncm_model::hybrid::BlockStats) {
         self.blocks += 1;
         if let Some(a) = stats.first_accepted {
             self.first_accepted += a as u32;
@@ -404,6 +404,37 @@ pub(crate) struct Core {
     hybrid: Option<Mutex<HybridState>>,
 }
 
+/// The hybrid's decode options for a request: its sampling settings (seeded), verified mode
+/// for constrained requests, the stop tokens, and `<tool_call>` / `</tool_call>` as the
+/// mixed-block switch.
+pub(crate) fn hybrid_options(
+    params: SamplingParams,
+    constrained: bool,
+    ids: Specials,
+) -> ncm_model::hybrid::DecodeOptions {
+    ncm_model::hybrid::DecodeOptions {
+        temperature: if params.is_greedy() { 0.0 } else { f64::from(params.temperature) },
+        top_p: f64::from(params.top_p),
+        top_k: params.top_k,
+        seed: params.seed.unwrap_or_else(crate::sampling::entropy),
+        verified: constrained,
+        stop: [ids.im_end, ids.end_of_text, ids.im_start].iter().map(|&t| t as i32).collect(),
+        switch_on: vec![ids.tool_call as i32],
+        switch_off: vec![ids.tool_call_end as i32],
+        ..Default::default()
+    }
+}
+
+impl Core {
+    /// The hybrid model and its first session, for the continuous batcher.
+    pub(crate) fn take_hybrid(&mut self) -> Option<(HybridLm, FastSession)> {
+        self.hybrid.take().map(|h| {
+            let h = h.into_inner().unwrap_or_else(|p| p.into_inner());
+            (h.model, h.session)
+        })
+    }
+}
+
 /// The NCM hybrid on the sequential engine: the model and one fast decode session, reset per
 /// request (its buffers, and the graphs captured against them, are kept).
 struct HybridState {
@@ -503,12 +534,6 @@ impl Core {
                 (state, params, "tok")
             }
             Config::Ncm(cfg) if cfg.hybrid.is_some() => {
-                // TODO: batch the hybrid at block granularity; it serves one slot for now.
-                if slots > 1 {
-                    return Err(EngineError::Unsupported(
-                        "the NCM hybrid serves one request at a time (--parallel 1)".into(),
-                    ));
-                }
                 let build = || HybridLm::new(cfg, &device);
                 let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
                 let session = FastSession::new(&model, capacity, &device);
@@ -532,7 +557,8 @@ impl Core {
             ctx: capacity,
             cache_bytes: match &config {
                 Config::Ncm(c) if c.hybrid.is_some() => {
-                    ncm_model::hybrid::hybrid_cache_bytes(c, capacity, itemsize(dtype), 1)
+                    slots.max(1)
+                        * ncm_model::hybrid::hybrid_cache_bytes(c, capacity, itemsize(dtype), 1)
                 }
                 _ => slots.max(1) * cache_bytes(&config, capacity, itemsize(dtype), 1),
             },
@@ -994,17 +1020,7 @@ impl Core {
         self.sync();
         let prompt_s = started.elapsed().as_secs_f64();
         let params = run.params;
-        let opts = ncm_model::hybrid::DecodeOptions {
-            temperature: if params.is_greedy() { 0.0 } else { f64::from(params.temperature) },
-            top_p: f64::from(params.top_p),
-            top_k: params.top_k,
-            seed: params.seed.unwrap_or_else(crate::sampling::entropy),
-            verified: run.constraint.is_some(),
-            stop: [ids.im_end, ids.end_of_text, ids.im_start].iter().map(|&t| t as i32).collect(),
-            switch_on: vec![ids.tool_call as i32],
-            switch_off: vec![ids.tool_call_end as i32],
-            ..Default::default()
-        };
+        let opts = hybrid_options(params, run.constraint.is_some(), ids);
         let constraint = RefCell::new(run.constraint.take());
         let sampler = RefCell::new(Sampler::new(params));
         let constrained = constraint.borrow().is_some();
