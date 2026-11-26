@@ -283,6 +283,67 @@ fn ncm_warm_up_leaves_the_model_usable() {
     model.warm_up(1, 16, &device);
 }
 
+/// Packed (varlen) prefill chunks of different lengths, slots at different positions, equal
+/// each slot's chunk prefilled alone, for both models in both designs.
+#[test]
+fn packed_prefill_equals_single_prefill() {
+    let device = device();
+    let v2 = ncm_model::tiny_v2(2, 2, 4);
+    for cfg in [tiny_tok(8), ncm_model::tiny_tok_v2(ncm_model::tiny_v2(4, 2, 8))] {
+        let model = TokenLm::new(&cfg, &device);
+        let heads = [tokens(&device, cfg.vocab_size, 5, 1), tokens(&device, cfg.vocab_size, 11, 2)];
+        let lens = [7usize, 2];
+        let packed = tokens(&device, cfg.vocab_size, 9, 3);
+        let mut single: Vec<Vec<LayerCache>> = Vec::new();
+        let mut batched: Vec<Vec<LayerCache>> = Vec::new();
+        for h in &heads {
+            for set in [&mut single, &mut batched] {
+                let mut c = model.make_cache(32, 1, &device);
+                model.prefill(h.clone(), &mut c, 4);
+                set.push(c);
+            }
+        }
+        let mut want = Vec::new();
+        let mut at = 0;
+        for (i, &len) in lens.iter().enumerate() {
+            let piece = packed.clone().narrow(1, at, len);
+            want.extend(values(model.prefill(piece, &mut single[i], len).unwrap()));
+            at += len;
+        }
+        let mut rows: Vec<&mut [LayerCache]> =
+            batched.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.prefill_packed(packed, &lens, &mut rows));
+        assert_close(&got, &want, 1e-4, 1e-4);
+    }
+    for cfg in [tiny_ncm(8, 4), ncm_model::tiny_ncm_v2(8, v2)] {
+        let model = NcmLm::new(&cfg, &device);
+        let k = cfg.k;
+        let heads =
+            [tokens(&device, cfg.vocab_size, 2 * k, 4), tokens(&device, cfg.vocab_size, 5 * k, 5)];
+        let lens = [3 * k, k];
+        let packed = tokens(&device, cfg.vocab_size, 4 * k, 6);
+        let mut single = Vec::new();
+        let mut batched = Vec::new();
+        for h in &heads {
+            for set in [&mut single, &mut batched] {
+                let mut c = model.make_cache(16 * k, 1, &device);
+                model.prefill(h.clone(), &mut c, 2 * k);
+                set.push(c);
+            }
+        }
+        let mut want = Vec::new();
+        let mut at = 0;
+        for (i, &len) in lens.iter().enumerate() {
+            let piece = packed.clone().narrow(1, at, len);
+            want.extend(values(model.append_tokens(piece, &mut single[i])));
+            at += len;
+        }
+        let mut rows: Vec<&mut ncm_model::NcmCache> = batched.iter_mut().collect();
+        let got = values(model.append_packed(packed, &lens, &mut rows));
+        assert_close(&got, &want, 1e-4, 1e-4);
+    }
+}
+
 /// Batched prefill chunks of several slots at different positions equal each slot prefilled
 /// alone, for both models in both designs.
 #[test]

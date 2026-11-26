@@ -87,6 +87,36 @@ pub fn gemv_matches(device: &Device, tol: f32) {
     }
 }
 
+/// The small-M GEMM against an f32 CPU matmul: 9 to 64 rows, split and unsplit `K`, ragged
+/// widths, a row-major and a transposed (tied-embedding) weight.
+pub fn gemm_small_matches(device: &Device, tol: f32) {
+    device.seed(5);
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (rows, k, n, transposed) in [
+        (9, 512, 1536, false),
+        (16, 2048, 6784, false),
+        (32, 2240, 1024, false),
+        (64, 1024, 4112, false),
+        (17, 37, 70, false),
+        (40, 512, 32000, true),
+        (12, 64, 300, true),
+    ] {
+        let x = Tensor::<3>::random([1, rows, k], normal, device);
+        let (got, want) = if transposed {
+            let emb = Tensor::<2>::random([n, k], normal, device);
+            let got = values(ncm_model::kernels::gemm_small(x.clone(), emb.clone().transpose()));
+            (got, values(to_cpu(&x).matmul(to_cpu(&emb).transpose().unsqueeze::<3>())))
+        } else {
+            let w = Tensor::<2>::random([k, n], normal, device);
+            let got = values(ncm_model::kernels::gemm_small(x.clone(), w.clone()));
+            (got, values(to_cpu(&x).matmul(to_cpu(&w).unsqueeze::<3>())))
+        };
+        let err = rel_error(&got, &want);
+        eprintln!("gemm_small {rows}x{k}x{n} (transposed {transposed}): error {err:.2e}");
+        assert!(err <= tol, "gemm_small {rows}x{k}x{n}: error {err:.2e}");
+    }
+}
+
 /// The fused MLP half ([`ncm_model::layers::Mlp::residual_step`]: add, norm, gate/up GEMV with
 /// SwiGLU, down GEMV with the residual add) against the same block run unfused on the CUDA
 /// path (`fused::set_fused_mlp(false)`) and on the CPU in f32: the models' widths, one and
@@ -95,7 +125,16 @@ pub fn fused_mlp_matches(device: &Device, tol: f32) {
     use ncm_model::fused::set_fused_mlp;
     use ncm_model::layers::{Mlp, rms_norm};
     let normal = Distribution::Normal(0.0, 1.0);
-    for (rows, d, ff) in [(1, 1024, 2688), (4, 512, 1536), (1, 64, 128), (2, 1000, 600)] {
+    // GEMV rows and the small-M tile kernel (9 ..= 64 rows).
+    for (rows, d, ff) in [
+        (1, 1024, 2688),
+        (4, 512, 1536),
+        (1, 64, 128),
+        (2, 1000, 600),
+        (16, 1024, 2688),
+        (40, 512, 1536),
+        (64, 200, 600),
+    ] {
         for spec in [None, Some(quant_specs()[0]), Some(quant_specs()[1])] {
             device.seed(6);
             let mlp = quant::build(spec, || Mlp::new(d, ff, device));
@@ -138,7 +177,14 @@ pub fn fused_projections_match(device: &Device, tol: f32) {
     use ncm_model::quant::QLinear;
     let normal = Distribution::Normal(0.0, 1.0);
     // Eight rows of 960 still fit the quantised kernel's staged row (8 * (960 + 31) slots).
-    for (rows, d, n) in [(1, 1024, 4112), (3, 512, 1536), (8, 960, 1024), (8, 128, 72)] {
+    for (rows, d, n) in [
+        (1, 1024, 4112),
+        (3, 512, 1536),
+        (8, 960, 1024),
+        (8, 128, 72),
+        (24, 960, 1024),
+        (33, 128, 72),
+    ] {
         for spec in [None, Some(quant_specs()[0]), Some(quant_specs()[1])] {
             device.seed(7);
             let layer = quant::build(spec, || QLinear::new(d, n, device));
@@ -1204,6 +1250,19 @@ pub fn pooled_slot_steps_match(device: &Device, tol: f32) {
         separate.iter_mut().map(|c| c.as_mut_slice()).collect();
     let want = values(model.step_slots(token, &mut rows));
     assert_close("pooled step after the subset", &got, &want, &want, tol);
+    // Several new positions per slot in one pooled launch set (a verify-sized step), causal
+    // within each slot's rows, then a one-token step on top.
+    for (t, seed) in [(5usize, 7usize), (1, 2)] {
+        let ids: Vec<i32> = (0..3 * t).map(|j| ((j * seed + 1) % cfg.vocab_size) as i32).collect();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(ids, [3, t]), device);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            pooled.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.prefill_slots(tokens.clone(), &mut rows, t));
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            separate.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let want = values(model.prefill_slots(tokens, &mut rows, t));
+        assert_close(&format!("pooled {t}-token step"), &got, &want, &want, tol);
+    }
 }
 
 /// The NCM's batched concept-step graph ([`ncm_model::ncm::GraphedNcmSlots`], greedy) gives

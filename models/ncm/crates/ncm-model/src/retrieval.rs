@@ -524,11 +524,15 @@ impl SparseRetrieval {
             .collect()
     }
 
-    /// Whether `caches` are distinct rows of one slot pool, each still a view of the pool's
-    /// buffers with room for a position (so [`Self::decode_rows`] takes them): any subset of
-    /// the pool's slots, in any order.
+    /// Most new positions per slot of one pooled decode ([`Self::decode_rows`]).
     #[cfg(feature = "cuda")]
-    pub(crate) fn rows_pooled(caches: &[&LatentCache]) -> bool {
+    pub(crate) const POOLED_TOKENS: usize = 32;
+
+    /// Whether `caches` are distinct rows of one slot pool, each still a view of the pool's
+    /// buffers with room for `t` new positions (so [`Self::decode_rows`] takes them): any
+    /// subset of the pool's slots, in any order.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn rows_pooled(caches: &[&LatentCache], t: usize) -> bool {
         let Some(Some(first)) = caches.first().map(|c| c.pooled.as_ref()) else {
             return false;
         };
@@ -536,12 +540,14 @@ impl SparseRetrieval {
         caches.iter().all(|c| {
             let Some(p) = c.pooled.as_ref() else { return false };
             let fresh = p.id == first.id && !std::mem::replace(&mut seen[p.row], true);
-            fresh && c.length < c.capacity && c.aliases_pool()
+            fresh && c.length + t <= c.capacity && c.aliases_pool()
         })
     }
 
-    /// One-token fused decode of pooled slots at once: `p` `[n, 1, W]` (row i the input
-    /// projection of `caches[i]`), `ropes[i]` the tables of its position. The same kernels as
+    /// Fused decode of pooled slots at once, `t` new positions each (one token, or up to
+    /// [`POOLED_TOKENS`] for a verify pass or batched speculation; causal within each slot's
+    /// rows): `p` `[n, t, W]` (row i the input projection of `caches[i]`), `ropes[i]` the
+    /// tables of its `t` positions. The same kernels as
     /// [`Self::decode_fused`] over the whole pool's buffers, one launch set: each active row at
     /// its own position, the pool's idle rows marked with position -1 (the kernels skip them:
     /// they neither read nor write). Eagerly every position is uploaded at once; inside a
@@ -582,12 +588,13 @@ impl SparseRetrieval {
             }
         }
         // The inputs and RoPE tables laid out by pool row (idle rows: zeros, any table).
+        let t = p.dims()[1];
         let (p_all, tables) = if whole {
             let (cos, sin): (Vec<Tensor<4>>, Vec<Tensor<4>>) =
                 ropes.iter().map(|r| r.tables()).unzip();
             (p, (Tensor::cat(cos, 0), Tensor::cat(sin, 0)))
         } else {
-            let [_, t, w] = p.dims();
+            let w = p.dims()[2];
             let mut xs = Vec::with_capacity(pool.rows);
             let (mut cos, mut sin) = (Vec::new(), Vec::new());
             for slot in &slot_of {
@@ -601,6 +608,14 @@ impl SparseRetrieval {
                 sin.push(s);
             }
             (Tensor::cat(xs, 0), (Tensor::cat(cos, 0), Tensor::cat(sin, 0)))
+        };
+        // One table row per query row (pool row, then its positions in order).
+        let tables = if t == 1 {
+            tables
+        } else {
+            let dr = tables.0.dims()[3];
+            let q = pool.rows * t;
+            (tables.0.reshape([q, 1, 1, dr]), tables.1.reshape([q, 1, 1, dr]))
         };
         let norms =
             [&self.q_norm, &self.kv_norm, &self.rope_norm, &self.index_norm].map(|n| n.gamma.val());
@@ -623,7 +638,7 @@ impl SparseRetrieval {
         };
         for cache in caches.iter_mut() {
             cache.check_pooled();
-            cache.length += 1;
+            cache.length += t;
         }
         // The combine kernel has applied the gate.
         MixOut { x: out, gate: None }

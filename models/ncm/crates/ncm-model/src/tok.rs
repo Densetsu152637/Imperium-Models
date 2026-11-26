@@ -151,6 +151,24 @@ impl TokenLm {
         self.logits(h.narrow(1, len - 1, 1))
     }
 
+    /// One prefill chunk per slot, the chunks of different lengths packed into one batch row
+    /// (varlen): `tokens` `[1, sum of lens]`, slot i's `lens[i]` tokens (each > 0) after the
+    /// earlier slots', into `caches[i]` at its own position
+    /// ([`crate::layers::Stack::forward_packed`]; nothing padded). Returns the logits of each
+    /// slot's last position `[slots, 1, V]`.
+    pub fn prefill_packed(
+        &self,
+        tokens: Tensor<2, Int>,
+        lens: &[usize],
+        caches: &mut [&mut [LayerCache]],
+    ) -> Tensor<3> {
+        let device = tokens.device();
+        let h = self.stack.forward_packed(self.emb.forward(tokens), lens, caches);
+        let d = h.dims()[2];
+        let last = crate::layers::segment_ends(lens, &device);
+        self.logits(h.select(1, last).reshape([lens.len(), 1, d]))
+    }
+
     /// One decode step for tokens `[B, 1]` whose rows are separate streams, row i with its own
     /// caches `caches[i]` (built for batch 1) at its own position: logits `[B, 1, V]`
     /// ([`crate::layers::Stack::forward_slots`]).

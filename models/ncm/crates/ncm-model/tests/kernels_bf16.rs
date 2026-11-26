@@ -72,6 +72,12 @@ fn gemv_matches_cpu_bf16() {
 }
 
 #[test]
+fn gemm_small_matches_cpu_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    gemm_small_matches(&device, TOL);
+}
+
+#[test]
 fn graphed_speculation_matches_eager_bf16() {
     let (device, _lock) = setup(DTYPE);
     graphed_speculation_matches(&device, false, None);

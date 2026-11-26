@@ -156,6 +156,9 @@ pub trait NcmKernels: Backend {
         counters: IntTensor<Self>,
     ) -> FloatTensor<Self>;
 
+    /// See [`gemm_small`]: `x` `[m, K]` with `m <= gemv::GEMM_ROWS`, `w` `[K, N]`.
+    fn ncm_gemm_small(x: FloatTensor<Self>, w: FloatTensor<Self>) -> FloatTensor<Self>;
+
     /// See [`qmatmul`]; `x` `[rows, d_in]` with `rows <= GEMV_ROWS`.
     fn ncm_qgemv(
         x: FloatTensor<Self>,
@@ -165,6 +168,19 @@ pub trait NcmKernels: Backend {
         bits: u32,
         group_words: usize,
     ) -> FloatTensor<Self>;
+
+    /// See [`qmatmul`]: `x` `[m, d_in]` with `GEMV_ROWS < m <= quant::QGEMM_ROWS`.
+    fn ncm_qgemm_small(
+        x: FloatTensor<Self>,
+        packed: IntTensor<Self>,
+        scales: FloatTensor<Self>,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+    ) -> FloatTensor<Self>;
+
+    /// See [`packed_int`].
+    fn ncm_packed_int(x: IntTensor<Self>) -> IntTensor<Self>;
 
     /// See [`qmatmul`]; the decoded weight `[d_in, d_out]` at `dtype`.
     fn ncm_dequant(
@@ -301,11 +317,65 @@ pub trait NcmKernels: Backend {
         codes: IntTensor<Self>,
         scales: FloatTensor<Self>,
         position: IntTensor<Self>,
+        per: usize,
         dims: RetrievalDims,
     ) -> FloatTensor<Self>;
 }
 
 impl NcmKernels for CubeBackend {
+    fn ncm_gemm_small(x: CubeTensor, w: CubeTensor) -> CubeTensor {
+        use gemv::{CUBE, GEMM_COLS, GEMM_GROUPS, GEMM_K};
+        let [m, k] = x.meta.shape().dims::<2>();
+        let [_, n] = w.meta.shape().dims::<2>();
+        let y = empty_like(&x, vec![m, n]);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        let strides = w.meta.strides().to_vec();
+        let kmajor = strides[1] != 1 && strides[0] == 1;
+        // Registers per unit: its column of every GEMM_GROUPS-th row, in steps of four so few
+        // variants compile.
+        let rows_per = m.div_ceil(GEMM_GROUPS).next_multiple_of(4).max(4);
+        // Split K until about two cubes per SM are reading (splits of at least 256).
+        let tiles = n.div_ceil(GEMM_COLS);
+        let splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(256).max(1));
+        let k_split = k.div_ceil(splits).next_multiple_of(GEMM_K);
+        let splits = k.div_ceil(k_split);
+        let part = scratch(&x, vec![if splits > 1 { splits * m * n } else { 1 }], DType::F32);
+        unsafe {
+            gemv::gemm_small_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(tiles as u32, splits as u32, 1),
+                CubeDim::new_1d(CUBE as u32),
+                x.into_tensor_arg(),
+                w.into_tensor_arg(),
+                y.clone().into_tensor_arg(),
+                part.clone().into_tensor_arg(),
+                m,
+                k,
+                n,
+                k_split,
+                rows_per,
+                kmajor,
+                splits > 1,
+                dtype,
+            );
+            if splits > 1 {
+                let count = m * n;
+                gemv::gemv_sum_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(count.div_ceil(CUBE) as u32, 1, 1),
+                    CubeDim::new_1d(CUBE as u32),
+                    part.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    count,
+                    splits,
+                    dtype,
+                );
+            }
+        }
+        y
+    }
+
     fn ncm_gemv(x: CubeTensor, w: CubeTensor, counters: CubeTensor) -> CubeTensor {
         use gemv::{COLS, CUBE};
         let [rows, k] = x.meta.shape().dims::<2>();
@@ -373,8 +443,8 @@ impl NcmKernels for CubeBackend {
             // With splits, the last cube of each tile combined them (no second launch).
             return y;
         }
-        // A strided weight neither layout serves: the scalar column kernel (up to four rows).
-        assert!(rows <= gemv::COLS_ROWS, "a strided GEMV weight takes at most four rows");
+        // A strided weight neither layout serves: the scalar column kernel (up to eight rows).
+        assert!(rows <= gemv::COLS_ROWS, "a strided GEMV weight takes at most eight rows");
         // Enough cubes to keep every SM reading: split K when N alone gives too few tiles.
         let tiles = n.div_ceil(COLS);
         let mut splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(COLS).max(1));
@@ -423,50 +493,25 @@ impl NcmKernels for CubeBackend {
         bits: u32,
         group_words: usize,
     ) -> CubeTensor {
-        use quant::{PLANE, PLANES};
+        use quant::PLANE;
         let rows = x.meta.shape().dims::<2>()[0];
+        // Codes not contiguous along the words (loaders repack them once, see `packed_int`)
+        // are packed here, so every shape takes the vector kernel.
+        let packed =
+            if packed.meta.strides()[1] == 1 { packed } else { Self::ncm_packed_int(packed) };
         let [n_len, words] = packed.meta.shape().dims::<2>();
         let out = empty_like(&x, vec![rows, n_len]);
         let dtype = elem(x.dtype);
         let client = x.client.clone();
-        // Vectors of words per load when every vector lies in one scale group: four (16 bytes)
-        // for q8; two for q4, whose decoding rather than its loads limits it.
-        let vec = if bits == 4 { 2 } else { 4 };
-        let strides = packed.meta.strides().to_vec();
-        // Any width: the kernel stages x a tile at a time.
-        if rows <= crate::quant::GEMV_ROWS
-            && strides[1] == 1
-            && strides[0].is_multiple_of(vec)
-            && words.is_multiple_of(vec)
-            && group_words.is_multiple_of(vec)
-        {
-            unsafe {
-                quant::qgemv_vec_kernel::launch_unchecked(
-                    &client,
-                    CubeCount::Static(n_len.div_ceil(quant::QPLANES) as u32, 1, 1),
-                    CubeDim::new_2d(PLANE as u32, quant::QPLANES as u32),
-                    vec,
-                    x.into_tensor_arg(),
-                    packed.into_tensor_arg(),
-                    scales.into_tensor_arg(),
-                    out.clone().into_tensor_arg(),
-                    d_in,
-                    n_len,
-                    words,
-                    quant::staged_tile(rows, d_in, quant::QX),
-                    bits,
-                    rows,
-                    group_words,
-                    dtype,
-                );
-            }
-            return out;
-        }
+        // Any width (x staged a tile at a time), any word count (narrower vectors down to one
+        // word) and any group length (per-word scales when vectors cross groups).
+        let vec = quant::vector_words(bits, words, packed.meta.strides()[0]);
         unsafe {
-            quant::qgemv_kernel::launch_unchecked(
+            quant::qgemv_vec_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static(n_len.div_ceil(PLANES) as u32, 1, 1),
-                CubeDim::new_2d(PLANE as u32, PLANES as u32),
+                CubeCount::Static(n_len.div_ceil(quant::QPLANES) as u32, 1, 1),
+                CubeDim::new_2d(PLANE as u32, quant::QPLANES as u32),
+                vec,
                 x.into_tensor_arg(),
                 packed.into_tensor_arg(),
                 scales.into_tensor_arg(),
@@ -474,13 +519,83 @@ impl NcmKernels for CubeBackend {
                 d_in,
                 n_len,
                 words,
+                quant::staged_tile(rows, d_in, quant::QX),
                 bits,
                 rows,
                 group_words,
+                quant::straddles(vec, group_words),
                 dtype,
             );
         }
         out
+    }
+
+    fn ncm_qgemm_small(
+        x: CubeTensor,
+        packed: CubeTensor,
+        scales: CubeTensor,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+    ) -> CubeTensor {
+        use quant::{QGEMM_COLS, QGEMM_CUBE, QGEMM_GROUPS, QGEMM_K};
+        let m = x.meta.shape().dims::<2>()[0];
+        let [n, words] = packed.meta.shape().dims::<2>();
+        let k = d_in;
+        let y = empty_like(&x, vec![m, n]);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        let rows_per = m.div_ceil(QGEMM_GROUPS).next_multiple_of(4).max(4);
+        // Split K until about two cubes per SM are decoding (splits of at least 256).
+        let tiles = n.div_ceil(QGEMM_COLS);
+        let splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(256).max(1));
+        let k_split = k.div_ceil(splits).next_multiple_of(QGEMM_K);
+        let splits = k.div_ceil(k_split);
+        let part = scratch(&x, vec![if splits > 1 { splits * m * n } else { 1 }], DType::F32);
+        unsafe {
+            quant::qgemm_small_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(tiles as u32, splits as u32, 1),
+                CubeDim::new_1d(QGEMM_CUBE as u32),
+                x.into_tensor_arg(),
+                packed.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                y.clone().into_tensor_arg(),
+                part.clone().into_tensor_arg(),
+                m,
+                k,
+                n,
+                words,
+                k_split,
+                bits,
+                group_words,
+                rows_per,
+                splits > 1,
+                dtype,
+            );
+            if splits > 1 {
+                let count = m * n;
+                gemv::gemv_sum_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(count.div_ceil(gemv::CUBE) as u32, 1, 1),
+                    CubeDim::new_1d(gemv::CUBE as u32),
+                    part.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    count,
+                    splits,
+                    dtype,
+                );
+            }
+        }
+        y
+    }
+
+    fn ncm_packed_int(x: CubeTensor) -> CubeTensor {
+        if x.is_contiguous() {
+            return x;
+        }
+        let out = empty_like(&x, x.meta.shape().to_vec());
+        Self::ncm_assign(out, x, 0, 0)
     }
 
     fn ncm_dequant(
@@ -755,10 +870,16 @@ impl NcmKernels for CubeBackend {
         let client = q.client.clone();
         let plane = client.properties().hardware.plane_size_max as usize;
         assert_eq!(plane, retrieval::PREFILL_LANES, "the prefill kernel takes 32-lane planes");
+        // The largest head group up to PREFILL_HEAD_GROUP that splits the heads evenly (16
+        // heads at 1B: two groups of 8, each keeping 250M's register footprint).
+        let hg = (1..=retrieval::PREFILL_HEAD_GROUP.min(h))
+            .rev()
+            .find(|g| h.is_multiple_of(*g))
+            .unwrap_or(1);
         unsafe {
             retrieval::ret_prefill_attend_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * t) as u32, 1, 1),
+                CubeCount::Static((b * t * (h / hg)) as u32, 1, 1),
                 CubeDim::new_1d(CUBE as u32),
                 q.into_tensor_arg(),
                 kv.into_tensor_arg(),
@@ -769,6 +890,7 @@ impl NcmKernels for CubeBackend {
                 t,
                 dims.topk,
                 h,
+                hg,
                 dims.latent,
                 dims.rope_dim,
                 dims.block,
@@ -809,6 +931,7 @@ impl NcmKernels for CubeBackend {
         codes: CubeTensor,
         scales: CubeTensor,
         position: CubeTensor,
+        per: usize,
         dims: RetrievalDims,
     ) -> CubeTensor {
         use retrieval::{CUBE, INDEX_CUBE};
@@ -845,6 +968,7 @@ impl NcmKernels for CubeBackend {
                 codes.clone().into_tensor_arg(),
                 scales.clone().into_tensor_arg(),
                 position.clone().into_tensor_arg(),
+                per,
                 b,
                 scale,
                 d.eps as f32,
@@ -876,6 +1000,7 @@ impl NcmKernels for CubeBackend {
                     scales.into_tensor_arg(),
                     scores.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
+                    per,
                     blocks,
                     1.0 / ((d.index_heads * d.index_dim) as f32).sqrt(),
                     d.index_heads,
@@ -893,6 +1018,7 @@ impl NcmKernels for CubeBackend {
                     scores.into_tensor_arg(),
                     picked.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
+                    per,
                     blocks,
                     d.topk,
                     d.block,
@@ -917,6 +1043,7 @@ impl NcmKernels for CubeBackend {
                 part_sum.clone().into_tensor_arg(),
                 part_acc.clone().into_tensor_arg(),
                 position.clone().into_tensor_arg(),
+                per,
                 chunks,
                 tiles,
                 d.topk,
@@ -940,6 +1067,7 @@ impl NcmKernels for CubeBackend {
                 part_acc.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
                 position.into_tensor_arg(),
+                per,
                 chunks,
                 h,
                 d.v_dim,
@@ -1033,25 +1161,51 @@ fn launch_attend_decode(
     let out = empty_like(&q, vec![b, kvh, rows, d]);
     let dtype = elem(q.dtype);
     let client = q.client.clone();
+    let cubes = b * kvh * rows;
+    // Split-KV: every split holds at most MAX_KEYS scores, and long caches split further
+    // (splits of at least 256 keys) until about two cubes per SM are reading.
+    let needed = keys.div_ceil(attend::MAX_KEYS);
+    let wanted = 168usize.div_ceil(cubes).min(keys.div_ceil(256));
+    let splits = needed.max(wanted).max(1);
+    let split_len = keys.div_ceil(splits);
+    let splits = keys.div_ceil(split_len);
+    let part = scratch(&q, vec![if splits > 1 { splits * cubes * (d + 2) } else { 1 }], DType::F32);
     unsafe {
         attend::attend_decode_kernel::launch_unchecked(
             &client,
-            CubeCount::Static((b * kvh * rows) as u32, 1, 1),
+            CubeCount::Static(cubes as u32, splits as u32, 1),
             CubeDim::new_1d(attend::CUBE as u32),
             q.into_tensor_arg(),
             k.into_tensor_arg(),
             v.into_tensor_arg(),
             mask.into_tensor_arg(),
             out.clone().into_tensor_arg(),
+            part.clone().into_tensor_arg(),
             kvh,
             rows,
             keys,
             t,
+            split_len,
             1.0 / (d as f32).sqrt(),
             d,
             masked,
+            splits > 1,
             dtype,
         );
+        if splits > 1 {
+            let count = cubes * d;
+            attend::attend_combine_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(count.div_ceil(attend::CUBE) as u32, 1, 1),
+                CubeDim::new_1d(attend::CUBE as u32),
+                part.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                count,
+                splits,
+                d,
+                dtype,
+            );
+        }
     }
     out
 }
@@ -1059,7 +1213,8 @@ fn launch_attend_decode(
 /// Whether [`attend_decode`] takes `rows` query rows per key/value head of width `d` against
 /// `keys` cached positions.
 pub fn attend_decode_fits(rows: usize, d: usize, keys: usize) -> bool {
-    rows <= 16 && d <= attend::CUBE && (1..=attend::MAX_KEYS).contains(&keys)
+    // Any number of keys: past MAX_KEYS the kernel splits them (split-KV).
+    rows <= 16 && d <= attend::CUBE && keys >= 1
 }
 
 /// Attention of a decode step in one kernel: `q` `[B, KVH, R, d]` (a group's query heads
@@ -1136,8 +1291,11 @@ pub fn retrieval_prefill_attend(
     Tensor::from_dispatch(out)
 }
 
-/// One-token sparse retrieval decode at the position held by the device tensor `position`
-/// (`[1]`, i32) from the layer's input projection `proj` `[B, 1, W]`: writes the position's entry
+/// Sparse retrieval decode of `t` new positions per stream from the device tensor `position`
+/// (`[1]` or one per batch row, i32: each stream's first new position; negative marks an idle
+/// pool row) and the layer's input projection `proj` `[B, t, W]` (`t` small: a decode step, a
+/// verify pass, a few speculative tokens; causal within each stream's rows), with the RoPE
+/// tables one per query row `[B t, 1, 1, dr]` (or one for all when `B t` is 1): writes the position's entry
 /// into the cache in place (`kv` `[B, S, l + dr]` and the indexer `keys`, whoever else holds them),
 /// selects blocks with the indexer on the device and attends over them and the local window (or
 /// the whole context when it has no more candidates than `topk`, or in dense mode). Returns the
@@ -1165,6 +1323,9 @@ pub fn retrieval_decode(
         IndexKeys::Float(k) => (k.clone(), position.clone().reshape([1, 1, 1]), k.clone()),
         IndexKeys::Int8 { codes, scales } => (scales.clone(), codes.clone(), scales.clone()),
     };
+    // `per` new positions per stream: one query row each, cache row `b / per`.
+    let [rows, per, width] = proj.dims();
+    let proj = proj.reshape([rows * per, 1, width]);
     let out = <Dispatch as NcmKernels>::ncm_retrieval_decode(
         proj.into_dispatch(),
         q.into_dispatch(),
@@ -1180,9 +1341,12 @@ pub fn retrieval_decode(
         codes.into_dispatch(),
         scales.into_dispatch(),
         position.clone().into_dispatch(),
+        per,
         dims,
     );
-    Tensor::from_dispatch(out)
+    let out: Tensor<3> = Tensor::from_dispatch(out);
+    let hv = out.dims()[2];
+    out.reshape([rows, per, hv])
 }
 
 /// `x.argmax(D - 1)` for `x` `[..., n]` in one kernel launch (one cube per row); the result has
@@ -1255,6 +1419,12 @@ pub fn packed<const D: usize>(x: Tensor<D>) -> Tensor<D> {
     Tensor::from_dispatch(<Dispatch as NcmKernels>::ncm_packed(x.into_dispatch()))
 }
 
+/// [`packed`] for int tensors: `x` itself when packed row-major, otherwise a packed copy. The
+/// quantised layers' codes go through it once at load, so the kernels read them contiguously.
+pub fn packed_int<const D: usize>(x: Tensor<D, Int>) -> Tensor<D, Int> {
+    Tensor::from_dispatch(<Dispatch as NcmKernels>::ncm_packed_int(x.into_dispatch()))
+}
+
 /// [`assign_into`] for int tensors of the same dtype (i32).
 pub fn assign_int_into<const D: usize>(
     dst: &Tensor<D, Int>,
@@ -1266,7 +1436,7 @@ pub fn assign_int_into<const D: usize>(
     drop(<Dispatch as NcmKernels>::ncm_assign_int(dst, src.into_dispatch(), axis, at));
 }
 
-/// `x W` for `x` `[.., K]` with at most four rows in all and `w` `[K, N]` (row-major, or the
+/// `x W` for `x` `[.., K]` with at most eight rows in all and `w` `[K, N]` (row-major, or the
 /// transpose of a row-major `[N, K]`), as bandwidth-bound matrix-vector kernels.
 pub fn gemv<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
     let mut shape = x.dims();
@@ -1288,10 +1458,33 @@ pub fn gemv_rows_ok(rows: usize) -> bool {
     rows <= gemv::MAX_ROWS
 }
 
+/// `x W` for `x` `[.., K]` with at most [`gemm_small_rows_ok`] rows in all and `w` `[K, N]`
+/// (row-major, or the transpose of a row-major `[N, K]`): the small-M tiled GEMM for steps too
+/// big for the GEMV kernels and too small for a full GEMM to read the weight efficiently
+/// (batched slot steps, verify passes, short prefill pieces).
+pub fn gemm_small<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
+    let mut shape = x.dims();
+    let k = shape[D - 1];
+    let rows = shape.iter().product::<usize>() / k;
+    debug_assert!(gemm_small_rows_ok(rows), "gemm_small takes 1 ..= {} rows", gemv::GEMM_ROWS);
+    shape[D - 1] = w.dims()[1];
+    let y = <Dispatch as NcmKernels>::ncm_gemm_small(
+        x.reshape([rows, k]).into_dispatch(),
+        w.into_dispatch(),
+    );
+    Tensor::<2>::from_dispatch(y).reshape(shape)
+}
+
+/// Whether [`gemm_small`] takes an input of `rows` rows.
+pub fn gemm_small_rows_ok(rows: usize) -> bool {
+    (1..=gemv::GEMM_ROWS).contains(&rows)
+}
+
 /// `x` `[M, d_in]` times a quantised weight (`qweight` `[d_out, words]` i32, `scales`
 /// `[d_out, groups]` f32, in `format`): one dequantise-and-multiply GEMV kernel for up to
-/// [`GEMV_ROWS`](crate::quant::GEMV_ROWS) rows (decode), else the weight decoded at `x`'s dtype
-/// and Burn's matmul (prefill). Codes and scales are only read, so the call can be captured into
+/// [`GEMV_ROWS`](crate::quant::GEMV_ROWS) rows (decode), the small-M quantised GEMM (weight
+/// tiles decoded in shared memory) up to 64 rows, else the weight decoded at `x`'s dtype and
+/// Burn's matmul (long prefill). Codes and scales are only read, so the call can be captured into
 /// a CUDA graph.
 pub fn qmatmul(
     x: Tensor<2>,
@@ -1303,6 +1496,17 @@ pub fn qmatmul(
     let group_words = format.group_len(d_in) / format.per_word();
     if x.dims()[0] <= crate::quant::GEMV_ROWS {
         let y = <Dispatch as NcmKernels>::ncm_qgemv(
+            x.into_dispatch(),
+            qweight.into_dispatch(),
+            scales.into_dispatch(),
+            d_in,
+            format.bits,
+            group_words,
+        );
+        return Tensor::from_dispatch(y);
+    }
+    if x.dims()[0] <= quant::QGEMM_ROWS {
+        let y = <Dispatch as NcmKernels>::ncm_qgemm_small(
             x.into_dispatch(),
             qweight.into_dispatch(),
             scales.into_dispatch(),

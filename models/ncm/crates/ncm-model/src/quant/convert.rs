@@ -270,6 +270,21 @@ impl ModuleMapper for CastExceptScales {
         self.path.exit();
     }
 
+    /// The codes repacked once contiguous along their words on CUDA (a loaded tensor may be
+    /// pitched or strided), so the quantised kernels read them as vectors.
+    fn map_int<const D: usize>(
+        &mut self,
+        param: Param<Tensor<D, burn::tensor::Int>>,
+    ) -> Param<Tensor<D, burn::tensor::Int>> {
+        #[cfg(feature = "cuda")]
+        if self.path.0.last().is_some_and(|leaf| leaf == "qweight") {
+            return param.map(|t| {
+                if crate::fused::active(&t.device()) { crate::kernels::packed_int(t) } else { t }
+            });
+        }
+        param
+    }
+
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
         if self.path.0.last().is_some_and(|leaf| leaf == "scales") {
             param
