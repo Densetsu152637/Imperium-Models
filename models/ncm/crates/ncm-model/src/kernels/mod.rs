@@ -372,6 +372,8 @@ impl NcmKernels for CubeBackend {
             // With splits, the last cube of each tile combined them (no second launch).
             return y;
         }
+        // A strided weight neither layout serves: the scalar column kernel (up to four rows).
+        assert!(rows <= gemv::COLS_ROWS, "a strided GEMV weight takes at most four rows");
         // Enough cubes to keep every SM reading: split K when N alone gives too few tiles.
         let tiles = n.div_ceil(COLS);
         let mut splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(COLS).max(1));

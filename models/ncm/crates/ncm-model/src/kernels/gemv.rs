@@ -18,7 +18,11 @@ pub(crate) const CUBE: usize = 256;
 pub(crate) const COLS: usize = 64;
 const LANES: usize = CUBE / COLS;
 /// Most rows `x` may have.
-pub(crate) const MAX_ROWS: usize = 4;
+/// Most rows `x` may have (the vector and transposed kernels; the scalar column kernel
+/// takes at most [`COLS_ROWS`]).
+pub(crate) const MAX_ROWS: usize = 8;
+/// Most rows of [`gemv_cols_kernel`].
+pub(crate) const COLS_ROWS: usize = 4;
 
 /// Sums the `LANES` partial values of each column held in `red` (`CUBE` slots, lane-major).
 #[cube]
@@ -59,7 +63,7 @@ pub(crate) fn gemv_cols_kernel<F: Float>(
     let s = CUBE_POS_Y as usize;
     let k0 = s * k_split;
     let k1 = select(k0 + k_split < k, k0 + k_split, k);
-    let mut xs = Shared::<[f32]>::new_slice(MAX_ROWS * 512);
+    let mut xs = Shared::<[f32]>::new_slice(COLS_ROWS * 512);
     let mut red = Shared::<[f32]>::new_slice(CUBE);
     // Stage this split's slice of x (k_split <= 512).
     let (x0, x1) = (x.stride(0), x.stride(1));
@@ -279,35 +283,27 @@ pub(crate) fn gemv_vec_kernel<F: Float, L: Size>(
     sync_cube();
     let w0 = w.stride(0);
     let zero = Vector::<f32, L>::new(0.0f32);
-    let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+    let mut acc = Array::<Vector<f32, L>>::new(rows);
+    #[unroll]
+    for r in 0..rows {
+        acc[r] = zero;
+    }
     if col0 < n {
         let mut kk = k0 + lane;
         while kk < k1 {
             let wv = Vector::<f32, L>::cast_from(w[(kk * w0 + col0) / v]);
             let at = kk - k0;
-            a0 += wv * Vector::new(xs[at]);
-            if comptime!(rows > 1) {
-                a1 += wv * Vector::new(xs[VEC_K + at]);
-            }
-            if comptime!(rows > 2) {
-                a2 += wv * Vector::new(xs[2 * VEC_K + at]);
-            }
-            if comptime!(rows > 3) {
-                a3 += wv * Vector::new(xs[3 * VEC_K + at]);
+            #[unroll]
+            for r in 0..rows {
+                acc[r] += wv * Vector::new(xs[r * VEC_K + at]);
             }
             kk += VEC_LANES;
         }
     }
     let mut red = Shared::<[f32]>::new_slice(CUBE * 8);
-    vec_store::<F, L>(&mut red, a0, y, part, 0, rows, n, split);
-    if comptime!(rows > 1) {
-        vec_store::<F, L>(&mut red, a1, y, part, 1, rows, n, split);
-    }
-    if comptime!(rows > 2) {
-        vec_store::<F, L>(&mut red, a2, y, part, 2, rows, n, split);
-    }
-    if comptime!(rows > 3) {
-        vec_store::<F, L>(&mut red, a3, y, part, 3, rows, n, split);
+    #[unroll]
+    for r in 0..rows {
+        vec_store::<F, L>(&mut red, acc[r], y, part, r, rows, n, split);
     }
     if comptime!(split) {
         let splits = CUBE_COUNT_Y as usize;
