@@ -25,8 +25,12 @@ pub const HYBRID_GATE: f64 = 2.5;
 pub const GATE_P: f64 = 0.986;
 
 /// The hybrid config the benchmark runs.
-pub fn hybrid_config(tiny: bool) -> Config {
-    Config::Ncm(if tiny { tiny_hybrid(tiny_v2(2, 2, 4)) } else { ncm_250m_hybrid() })
+pub fn hybrid_config(tiny: bool, size: crate::SizeChoice) -> Config {
+    Config::Ncm(match (tiny, size) {
+        (true, _) => tiny_hybrid(tiny_v2(2, 2, 4)),
+        (false, crate::SizeChoice::M250) => ncm_250m_hybrid(),
+        (false, crate::SizeChoice::B1) => ncm_model::ncm_hybrid_1b(),
+    })
 }
 
 fn random_tokens(vocab: usize, n: usize, seed: u64) -> Vec<i32> {
@@ -124,7 +128,7 @@ pub fn bench_hybrid(
     device: &Device,
     spec: Option<QuantSpec>,
 ) -> (Value, Vec<(usize, String, f64)>) {
-    let cfg = hybrid_config(cli.tiny);
+    let cfg = hybrid_config(cli.tiny, cli.size);
     let Config::Ncm(ncm) = &cfg else { unreachable!("the hybrid is an NCM config") };
     device.seed(0);
     let model = quant::build(spec, || HybridLm::new(ncm, device));

@@ -78,6 +78,15 @@ impl DesignChoice {
     }
 }
 
+/// Model size: the 250M research pair (Princeps-Lite) or the ~1B configs (Princeps).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SizeChoice {
+    #[value(name = "250m")]
+    M250,
+    #[value(name = "1b")]
+    B1,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum DeviceChoice {
     /// CUDA (build with `--features cuda`).
@@ -127,6 +136,10 @@ pub struct Cli {
     /// Attention design(s) to run.
     #[arg(long, value_enum, default_value = "both")]
     pub design: DesignChoice,
+    /// Model size: `250m` (configs/*-250m*.toml) or `1b` (configs/*-1b.toml, the v2 design
+    /// only; `--design both` then runs v2).
+    #[arg(long, value_enum, default_value = "250m")]
+    pub size: SizeChoice,
     /// Prompt lengths in tokens.
     #[arg(long, num_args = 1.., default_values_t = [2048usize, 16384], value_name = "N")]
     pub context: Vec<usize>,
@@ -636,8 +649,15 @@ fn bench_speculative(
     out
 }
 
-/// The config of model `kind` ("tok" or "ncm") in `design`.
-fn config_for(kind: &str, design: Design, tiny: bool) -> Config {
+/// The config of model `kind` ("tok" or "ncm") in `design` at `size` (the 1B configs exist in
+/// the v2 design only).
+fn config_for(kind: &str, design: Design, tiny: bool, size: SizeChoice) -> Config {
+    if size == SizeChoice::B1 && !tiny {
+        return match kind {
+            "tok" => Config::Tok(ncm_model::tok_1b()),
+            _ => Config::Ncm(ncm_model::ncm_1b()),
+        };
+    }
     match (kind, design, tiny) {
         ("tok", Design::Fallback, true) => Config::Tok(tiny_tok(8)),
         ("tok", Design::V2, true) => Config::Tok(tiny_tok_v2(tiny_v2(4, 2, 8))),
@@ -710,14 +730,23 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     };
     let mut results = Vec::new();
     let mut rates: Vec<(&str, Design, Rates)> = Vec::new();
-    for design in cli.design.designs() {
+    let designs = match cli.size {
+        SizeChoice::B1 if !cli.tiny => {
+            if cli.design == DesignChoice::Fallback {
+                return Err("--size 1b has the v2 design only".into());
+            }
+            vec![Design::V2]
+        }
+        _ => cli.design.designs(),
+    };
+    for design in designs.clone() {
         for kind in &kinds {
             let chunk = match design {
                 Design::V2 => 8192,
                 Design::Fallback => 512,
             };
             PREFILL_CHUNK.store(cli.prefill_chunk.unwrap_or(chunk).max(1), Ordering::Relaxed);
-            let mut cfg = config_for(kind, design, cli.tiny);
+            let mut cfg = config_for(kind, design, cli.tiny, cli.size);
             if cli.float_index_keys {
                 match &mut cfg {
                     Config::Tok(c) => c.v2.idx_8bit = false,
@@ -764,7 +793,7 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     };
     let note = if cli.tiny { "  (tiny config: smoke run, not a gate result)" } else { "" };
     let mut ratios = Vec::new();
-    for design in cli.design.designs() {
+    for design in designs {
         let (Some(tok), Some(ncm)) = (find("tok", design), find("ncm", design)) else { continue };
         for (context, ratio) in rate_ratios(ncm, tok) {
             let v = verdict(ratio);

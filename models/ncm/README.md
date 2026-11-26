@@ -27,7 +27,7 @@ target/release/ncm-bench --device cuda --design fallback --context 2048 16384   
 target/release/ncm-bench --device cpu --tiny --context 64 --new-tokens 8              # smoke run
 ```
 
-`--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models. `--quant q8|q4` runs the linear layers on 8-bit or 4-bit weights (`--quant-group 64|128` for q4, `--dense-head` to keep the output head dense; see `docs/quantisation.md`). With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
+`--design v2|fallback|both` (default `both`) and `--model tok|ncm|both` pick the models; `--size 250m|1b` (default `250m`) picks the size (`configs/*-1b.toml`: `tok-1b`, `ncm-1b`, `ncm-hybrid-1b`, ~1.04B each, the v2 design only). `--quant q8|q4` runs the linear layers on 8-bit or 4-bit weights (`--quant-group 64|128` for q4, `--dense-head` to keep the output head dense; see `docs/quantisation.md`). With both designs the report adds the second gate of the local test plan: v2 NCM decode speed over fallback NCM, which passes at 0.75x or more.
 
 More switches:
 

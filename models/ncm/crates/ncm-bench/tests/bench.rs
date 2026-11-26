@@ -204,7 +204,7 @@ fn train_memory_estimates_every_model() {
     let cli = TrainMemoryCli::parse_from(["train-memory", "--seq", "4096", "--micro-batch", "1"]);
     let payload = run(&cli);
     let models = payload["models"].as_array().unwrap();
-    assert_eq!(models.len(), 4);
+    assert_eq!(models.len(), 6);
     for m in models {
         let p = m["params"].as_f64().unwrap();
         assert!(p > 1e8, "{m}");
@@ -214,7 +214,8 @@ fn train_memory_estimates_every_model() {
         // Recomputation never keeps more.
         assert!(m["activations_recompute_gib"].as_f64() <= m["activations_gib"].as_f64());
     }
-    // The 1B variants are larger than the 250M ones.
-    assert!(models[2]["params"].as_f64() > models[0]["params"].as_f64());
-    assert!(models[3]["params"].as_f64() > models[1]["params"].as_f64());
+    // The 1B models are larger than the 250M ones.
+    for i in 0..3 {
+        assert!(models[i + 3]["params"].as_f64() > models[i]["params"].as_f64());
+    }
 }
