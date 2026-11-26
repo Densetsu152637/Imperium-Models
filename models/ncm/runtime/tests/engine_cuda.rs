@@ -57,9 +57,19 @@ fn configs() -> [Config; 4] {
     [tiny_tok_config(), tiny_tok_v2_config(), tiny_ncm_config(), tiny_ncm_v2_config()]
 }
 
+/// The tests one at a time: a graph capture on one thread is invalidated by another thread's
+/// launches and allocations on the device meanwhile (CUDA_ERROR_STREAM_CAPTURE_INVALIDATED),
+/// and the graph switch is process-wide.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// One test so the process-wide graph switch is never flipped under another test.
 #[test]
 fn graphed_paths_match_eager_and_sample_by_seed() {
+    let _serial = serial();
     let prompts = ["the quick brown fox jumps over the lazy dog, twice over", "a different prompt"];
     let prompt = prompts[0];
     for config in configs() {
@@ -136,6 +146,7 @@ fn graphed_paths_match_eager_and_sample_by_seed() {
 #[test]
 fn batched_slots_match_sequential_greedy_on_cuda() {
     use std::sync::Arc;
+    let _serial = serial();
     let prompts = ["the quick brown fox jumps over the lazy dog", "a different prompt", "x"];
     for config in configs() {
         let one = engine(config.clone(), false);
