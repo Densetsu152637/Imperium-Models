@@ -767,7 +767,12 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
         results.push(result);
         let k4 = rates.iter().find(|r| r.0 == "ncm" && r.1 == Design::V2).map(|r| r.2.clone());
         for (context, label, tok_s) in &hybrid_rates {
-            let Some(base) = k4.as_ref().and_then(|r| r.iter().find(|(c, _)| c == context)) else {
+            // The k = 4 NCM runs whole concepts (context 37 runs as 36): its run at the largest
+            // context up to the hybrid's.
+            let base = k4
+                .as_ref()
+                .and_then(|r| r.iter().filter(|(c, _)| *c <= *context).max_by_key(|(c, _)| *c));
+            let Some(base) = base else {
                 continue;
             };
             let ratio = tok_s / base.1;
