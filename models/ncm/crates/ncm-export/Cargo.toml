@@ -1,0 +1,37 @@
+[package]
+name = "ncm-export"
+description = "Writes the NCM runtime's per-phase static-shape ONNX graphs (opset 21, QDQ int8/int4 weights) and their manifest, for ncm-ort and the NPU execution providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ncm_export"
+
+[[bin]]
+name = "ncm-export"
+path = "src/main.rs"
+
+[features]
+# Parity tests that run the exported graphs on ONNX Runtime's CPU EP (they need a pinned
+# onnxruntime shared library: `ORT_DYLIB_PATH`). CI enables it after fetching one.
+ort-tests = ["dep:ort"]
+
+[dependencies]
+ncm-exec = { path = "../ncm-exec" }
+ncm-model = { path = "../ncm-model" }
+# Protobuf (de)serialisation of the ONNX messages, derived by hand in `onnx.rs`: no protoc or
+# build script. Apache-2.0.
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+# Only for the parity tests (`ort-tests`): the same pin as ncm-ort. MIT OR Apache-2.0.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "load-dynamic"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+burn = { workspace = true, features = ["flex"] }

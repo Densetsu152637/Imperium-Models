@@ -7,12 +7,15 @@
 //! - [`footprint`]: what a model costs in bytes, by [`Tier`] and [`Part`], shared with the CPU
 //!   offload planner.
 //! - [`exec`]: the [`ExecBackend`] and [`ExecSession`] traits and their plain-data types.
+//! - [`manifest`]: what `ncm-export` writes and `ncm-ort` reads; [`rope`]: host RoPE tables.
 //! - [`hybrid`]: the hybrid's block types and the host half of its block state machine
 //!   ([`hybrid::BlockLogic`]), shared by every backend's block run.
 
 pub mod exec;
 pub mod footprint;
 pub mod hybrid;
+pub mod manifest;
+pub mod rope;
 
 pub use exec::{
     Capabilities, ExecBackend, ExecError, ExecSession, HostChoice, ModelKind, PendingOutput,
