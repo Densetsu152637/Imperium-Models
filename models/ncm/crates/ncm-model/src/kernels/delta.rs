@@ -152,3 +152,116 @@ pub(crate) fn delta_step_kernel<F: Float>(
         sync_cube();
     }
 }
+
+/// Units per cube of [`delta_scan_kernel`] (a multiple of every column group).
+pub(crate) const SCAN_CUBE: usize = 256;
+/// State columns per cube of [`delta_scan_kernel`]: few, so that a (batch, head) spreads over
+/// many cubes (the scan is sequential in the chunks, so its parallelism is the columns).
+pub(crate) const SCAN_COLUMNS: usize = 8;
+
+/// The sequential part of the chunked gated delta rule (`crate::delta::delta_rule_chunked`) for
+/// one (batch, head) and a group of `g` state columns per cube, chunk after chunk with the state
+/// in shared memory: per chunk `i`,
+///
+/// ```text
+/// fresh = values_i - w_i S
+/// out_i = qg_i S + qk_i fresh
+/// S     = carry_i S + k_out_i^T fresh
+/// ```
+///
+/// The columns of the state never mix, so the column groups run in separate cubes. Inputs are
+/// `[BH, N C, *]` (`qk` `[BH, N C, C]`, `carry` `[BH, N]`, `state` `[BH, dk, dv]`), read through
+/// their strides. `out` `[BH, N C + dk, dv]` (contiguous) takes the chunk outputs in its first
+/// `N C` rows and the final state in the last `dk`. The state stays in f32 between chunks.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delta_scan_kernel<F: Float>(
+    values: &Tensor<F>,
+    w: &Tensor<F>,
+    qk: &Tensor<F>,
+    qg: &Tensor<F>,
+    k_out: &Tensor<F>,
+    carry: &Tensor<F>,
+    state: &Tensor<F>,
+    out: &mut Tensor<F>,
+    chunks: usize,
+    groups: usize,
+    #[comptime] dk: usize,
+    #[comptime] dv: usize,
+    #[comptime] c: usize,
+    #[comptime] g: usize,
+    #[define(F)] _dtype: ElemType,
+) {
+    let bh = CUBE_POS / groups;
+    let col0 = (CUBE_POS % groups) * g;
+    let tid = UNIT_POS as usize;
+    let col = tid % g;
+    let r0 = tid / g;
+    let rows = comptime!(SCAN_CUBE / g);
+    let out_rows = chunks * c + dk;
+    let mut s_sh = Shared::<[f32]>::new_slice(dk * g);
+    let mut f_sh = Shared::<[f32]>::new_slice(c * g);
+    let (st0, st1, st2) = (state.stride(0), state.stride(1), state.stride(2));
+    let mut kk = r0;
+    while kk < dk {
+        s_sh[kk * g + col] = f32::cast_from(state[bh * st0 + kk * st1 + (col0 + col) * st2]);
+        kk += rows;
+    }
+    sync_cube();
+    let (v0, v1, v2) = (values.stride(0), values.stride(1), values.stride(2));
+    let (w0, w1, w2) = (w.stride(0), w.stride(1), w.stride(2));
+    let (a0, a1, a2) = (qk.stride(0), qk.stride(1), qk.stride(2));
+    let (g0, g1, g2) = (qg.stride(0), qg.stride(1), qg.stride(2));
+    let (k0, k1, k2) = (k_out.stride(0), k_out.stride(1), k_out.stride(2));
+    for i in 0..chunks {
+        let row0 = i * c;
+        // fresh = values - w S
+        let mut rr = r0;
+        while rr < c {
+            let wr = bh * w0 + (row0 + rr) * w1;
+            let mut acc = f32::cast_from(values[bh * v0 + (row0 + rr) * v1 + (col0 + col) * v2]);
+            for kk in 0..dk {
+                acc -= f32::cast_from(w[wr + kk * w2]) * s_sh[kk * g + col];
+            }
+            f_sh[rr * g + col] = acc;
+            rr += rows;
+        }
+        sync_cube();
+        // out = qg S + qk fresh (qk is zero above the diagonal)
+        let mut rr = r0;
+        while rr < c {
+            let gr = bh * g0 + (row0 + rr) * g1;
+            let ar = bh * a0 + (row0 + rr) * a1;
+            let mut acc = 0.0f32;
+            for kk in 0..dk {
+                acc += f32::cast_from(qg[gr + kk * g2]) * s_sh[kk * g + col];
+            }
+            for j in 0..c {
+                if j <= rr {
+                    acc += f32::cast_from(qk[ar + j * a2]) * f_sh[j * g + col];
+                }
+            }
+            out[(bh * out_rows + row0 + rr) * dv + col0 + col] = F::cast_from(acc);
+            rr += rows;
+        }
+        sync_cube();
+        // S = carry S + k_out^T fresh
+        let keep = f32::cast_from(carry[bh * carry.stride(0) + i * carry.stride(1)]);
+        let mut kk = r0;
+        while kk < dk {
+            let mut acc = s_sh[kk * g + col] * keep;
+            for j in 0..c {
+                acc +=
+                    f32::cast_from(k_out[bh * k0 + (row0 + j) * k1 + kk * k2]) * f_sh[j * g + col];
+            }
+            s_sh[kk * g + col] = acc;
+            kk += rows;
+        }
+        sync_cube();
+    }
+    let mut kk = r0;
+    while kk < dk {
+        out[(bh * out_rows + chunks * c + kk) * dv + col0 + col] = F::cast_from(s_sh[kk * g + col]);
+        kk += rows;
+    }
+}

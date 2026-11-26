@@ -17,7 +17,7 @@
 use burn::module::{Module, Param};
 use burn::nn::{Initializer, RmsNorm};
 use burn::tensor::activation::{sigmoid, silu, softplus};
-use burn::tensor::{Bool, Device, Tensor, TensorData};
+use burn::tensor::{Bool, Device, FloatDType, Tensor, TensorData};
 
 use crate::layers::{linear, rms_norm};
 use crate::quant::QLinear as Linear;
@@ -84,7 +84,7 @@ fn pad_time<const D: usize>(x: Tensor<D>, pad: usize) -> Tensor<D> {
     }
     let mut shape = x.dims();
     shape[2] = pad;
-    let zeros = Tensor::zeros(shape, &x.device());
+    let zeros = Tensor::<D>::zeros(shape, &x.device()).cast(FloatDType::from(x.dtype()));
     Tensor::cat(vec![x, zeros], 2)
 }
 
@@ -111,6 +111,17 @@ pub fn delta_rule_chunked(
     state: Tensor<4>,
     chunk: usize,
 ) -> (Tensor<4>, Tensor<4>) {
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&q.device()) && q.dtype() != burn::tensor::DType::F32 {
+        // The triangular inverse by repeated squaring loses most of its accuracy in bf16, so
+        // the fused path runs the chunk algebra in f32 and rounds only the results.
+        let dtype = q.dtype();
+        let f32 = |x: Tensor<4>| x.cast(FloatDType::F32);
+        let f32_3 = |x: Tensor<3>| x.cast(FloatDType::F32);
+        let (out, state) =
+            delta_rule_chunked(f32(q), f32(k), f32(v), f32_3(g), f32_3(beta), f32(state), chunk);
+        return (out.cast(dtype), state.cast(dtype));
+    }
     let [b, h, t, dk] = q.dims();
     let dv = v.dims()[3];
     let device = q.device();
@@ -137,7 +148,8 @@ pub fn delta_rule_chunked(
         .neg();
     // A is strictly lower triangular, so (I + A)^-1 = sum_m (-A)^m
     //   = (I - A)(I + A^2)(I + A^4)...: exact once the powers reach C.
-    let eye = Tensor::<2>::eye(c, &device).reshape([1, 1, 1, c, c]);
+    let eye =
+        Tensor::<2>::eye(c, &device).cast(FloatDType::from(q.dtype())).reshape([1, 1, 1, c, c]);
     let mut inverse = neg_a.clone() + eye;
     let mut power = neg_a;
     let mut covered = 2;
@@ -154,6 +166,27 @@ pub fn delta_rule_chunked(
     let last = gamma.clone().narrow(3, c - 1, 1);
     let k_out = k * (last.clone() - gamma).exp().unsqueeze_dim::<5>(4);
     let carry = last.exp();
+
+    #[cfg(feature = "cuda")]
+    if crate::fused::active(&device) {
+        // The chunk-to-chunk recurrence in one kernel instead of a few launches per chunk.
+        let rows = |x: Tensor<5>| {
+            let [_, _, _, c, w] = x.dims();
+            x.reshape([b * h, n * c, w])
+        };
+        let (out, state) = crate::kernels::delta_scan(
+            rows(values),
+            rows(w),
+            rows(qk),
+            rows(qg),
+            rows(k_out),
+            carry.reshape([b * h, n]),
+            state.reshape([b * h, dk, dv]),
+        );
+        let out = out.reshape([b, h, n * c, dv]);
+        let out = if pad > 0 { out.narrow(2, 0, t) } else { out };
+        return (out, state.reshape([b, h, dk, dv]));
+    }
 
     let take = |x: &Tensor<5>, i: usize| {
         let [_, _, _, rows, cols] = x.dims();

@@ -7,6 +7,8 @@ use burn::tensor::activation::sigmoid;
 use burn::tensor::{Device, Distribution, Int, Tensor, TensorData};
 use ncm_model::config::{NCM_250M_V2_TOML, TOK_250M_V2_TOML};
 use ncm_model::delta::{delta_rule_chunked, delta_rule_recurrent};
+use ncm_model::layers::{Rope, Yarn};
+use ncm_model::retrieval::{dequantize_keys, quantize_keys};
 use ncm_model::{
     Config, Design, LayerCache, NcmConfig, NcmLm, TokConfig, TokenLm, V2Config, cache_bytes,
     cache_bytes_with, ncm_250m_v2, tiny_ncm_v2, tiny_tok_v2, tiny_v2, tok_250m_v2,
@@ -304,15 +306,74 @@ fn v2_cache_bytes_at_one_million_tokens() {
 #[test]
 fn v2_cache_bytes_match_allocation() {
     let device = device();
-    for n in [20, 64] {
-        let (ncm_cfg, tok_cfg) = (ncm_v2(), tok_v2());
+    for (n, int8) in [(20, true), (64, true), (20, false), (64, false)] {
+        let (mut ncm_cfg, mut tok_cfg) = (ncm_v2(), tok_v2());
+        ncm_cfg.v2.idx_8bit = int8;
+        tok_cfg.v2.idx_8bit = int8;
         let ncm = NcmLm::new(&ncm_cfg, &device).make_cache(n, 1, &device);
-        // The reference stores indexer keys at the run dtype (f32 here).
-        assert_eq!(ncm.nbytes(), cache_bytes_with(&Config::Ncm(ncm_cfg), n, 4, 4, 1));
+        // 8-bit indexer keys: one byte per value and an f32 scale per position; otherwise f32.
+        let index = if int8 { 1 } else { 4 };
+        assert_eq!(ncm.nbytes(), cache_bytes(&Config::Ncm(ncm_cfg.clone()), n, 4, 1));
+        assert_eq!(ncm.nbytes(), cache_bytes_with(&Config::Ncm(ncm_cfg), n, 4, index, 1));
         let tok = TokenLm::new(&tok_cfg, &device).make_cache(n, 1, &device);
         let got: usize = tok.iter().map(LayerCache::nbytes).sum();
-        assert_eq!(got, cache_bytes_with(&Config::Tok(tok_cfg), n, 4, 4, 1));
+        assert_eq!(got, cache_bytes(&Config::Tok(tok_cfg.clone()), n, 4, 1));
+        assert_eq!(got, cache_bytes_with(&Config::Tok(tok_cfg), n, 4, index, 1));
     }
+}
+
+#[test]
+fn indexer_keys_round_trip_through_8_bits() {
+    let device = device();
+    let keys = Tensor::<3>::random([2, 7, 32], Distribution::Normal(0.0, 1.5), &device);
+    let (codes, scales) = quantize_keys(keys.clone());
+    let back = values(dequantize_keys(codes.clone(), scales.clone()));
+    let codes: Vec<i64> = codes.into_data().convert::<i64>().try_to_vec::<i64>().unwrap();
+    assert!(codes.iter().all(|c| c.abs() <= 127));
+    let (want, scales) = (values(keys), values(scales));
+    for (i, (b, w)) in back.iter().zip(&want).enumerate() {
+        // Each value is within half a step of its code; the largest of a row is exact.
+        let step = scales[i / 32];
+        assert!((b - w).abs() <= 0.5 * step * 1.0001, "value {i}: {b} for {w} (step {step})");
+    }
+    for row in want.chunks(32).zip(scales.iter()) {
+        let top = row.0.iter().fold(0f32, |m, x| m.max(x.abs()));
+        assert!((row.1 * 127.0 - top).abs() <= 1e-5 * top);
+    }
+}
+
+#[test]
+fn yarn_factor_one_is_plain_rope() {
+    let device = device();
+    for (start, len, dim, base) in [(0, 9, 64, 1e6), (1000, 5, 64, 1e6), (3, 4, 16, 1e4)] {
+        let plain = Rope::new(start, len, dim, base, 1.0, &device).to_vecs();
+        let yarn = Yarn { factor: 1.0, original: 1024 };
+        let same = Rope::with_yarn(start, len, dim, base, 1.0, yarn, &device).to_vecs();
+        assert_eq!(plain, same);
+    }
+}
+
+#[test]
+fn yarn_stretches_long_wavelengths_and_keeps_short_ones() {
+    let device = device();
+    let (dim, base, factor, original) = (64, 1e6, 8.0, 1024);
+    let yarn = Yarn { factor, original };
+    let temperature = (0.1 * f64::ln(factor) + 1.0) as f32;
+    // Position 0: every angle is zero, so cos is the temperature and sin zero.
+    let (cos, sin) = Rope::with_yarn(0, 1, dim, base, 1.0, yarn, &device).to_vecs();
+    assert!(cos.iter().all(|c| (c - temperature).abs() < 1e-6));
+    assert!(sin.iter().all(|s| s.abs() < 1e-6));
+    // The angle of frequency i at position p, from the tables.
+    let angle = |p: usize, i: usize| {
+        let (cos, sin) = Rope::with_yarn(p, 1, dim, base, 1.0, yarn, &device).to_vecs();
+        (sin[i] as f64).atan2(cos[i] as f64)
+    };
+    let theta = |i: usize| 1.0 / f64::powf(base, (2 * i) as f64 / dim as f64);
+    // The fastest frequency turns 163 times in 1,024 positions: kept.
+    assert!((angle(1, 0) - theta(0)).abs() < 1e-5);
+    // The slowest turns far less than once: interpolated by the factor.
+    let i = dim / 2 - 1;
+    assert!((angle(1000, i) - 1000.0 * theta(i) / factor).abs() < 1e-5);
 }
 
 #[test]

@@ -15,6 +15,7 @@
 //! output.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
@@ -35,7 +36,8 @@ pub const PASS_RATIO: f64 = 1.5;
 pub const WEAK_RATIO: f64 = 1.2;
 /// The v2 NCM may be at most 25% slower than the fallback NCM (plan, local test plan step 2).
 pub const FALLBACK_FLOOR: f64 = 0.75;
-const PREFILL_CHUNK: usize = 512;
+/// Prompt tokens per prefill call of the model being measured (`--prefill-chunk`).
+static PREFILL_CHUNK: AtomicUsize = AtomicUsize::new(512);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ModelChoice {
@@ -158,6 +160,13 @@ pub struct Cli {
     /// Keep the tied output head dense when quantising.
     #[arg(long)]
     pub dense_head: bool,
+    /// Prompt tokens per prefill call [default: 8192 for v2, whose layers prefill sparsely,
+    /// 512 for the fallback design, whose full-attention layers build `[chunk, context]` scores].
+    #[arg(long)]
+    pub prefill_chunk: Option<usize>,
+    /// Cache the v2 indexer keys at the run dtype instead of 8-bit codes.
+    #[arg(long)]
+    pub float_index_keys: bool,
 }
 
 impl Cli {
@@ -280,7 +289,7 @@ fn run_once(
             let mut cache = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK);
+            let cond = m.prefill(prompt.clone(), &mut cache, PREFILL_CHUNK.load(Ordering::Relaxed));
             sync(device);
             let prefilled = Instant::now();
             let k = m.concept_size();
@@ -349,7 +358,11 @@ fn run_once(
             let mut caches = m.make_cache(context + new_tokens, 1, device);
             sync(device);
             let started = Instant::now();
-            let _ = m.prefill(prompt.clone().narrow(1, 0, context - 1), &mut caches, PREFILL_CHUNK);
+            let _ = m.prefill(
+                prompt.clone().narrow(1, 0, context - 1),
+                &mut caches,
+                PREFILL_CHUNK.load(Ordering::Relaxed),
+            );
             sync(device);
             let prefilled = Instant::now();
             let mut token = prompt.clone().narrow(1, context - 1, 1);
@@ -665,7 +678,18 @@ pub fn run(cli: &Cli) -> Result<Value, String> {
     let mut rates: Vec<(&str, Design, Rates)> = Vec::new();
     for design in cli.design.designs() {
         for kind in &kinds {
-            let cfg = config_for(kind, design, cli.tiny);
+            let chunk = match design {
+                Design::V2 => 8192,
+                Design::Fallback => 512,
+            };
+            PREFILL_CHUNK.store(cli.prefill_chunk.unwrap_or(chunk).max(1), Ordering::Relaxed);
+            let mut cfg = config_for(kind, design, cli.tiny);
+            if cli.float_index_keys {
+                match &mut cfg {
+                    Config::Tok(c) => c.v2.idx_8bit = false,
+                    Config::Ncm(c) => c.v2.idx_8bit = false,
+                }
+            }
             let (result, decode) = bench_model(&cfg, cli, &device, itemsize, spec);
             results.push(result);
             rates.push((kind, design, decode));

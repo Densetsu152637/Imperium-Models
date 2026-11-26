@@ -34,18 +34,24 @@ pub use ncm::{NcmCache, NcmLm, NcmParts, ncm_cache_bytes};
 pub use speculative::{Acceptance, DraftLoss, SpecStats, Speculator, draft_loss};
 pub use tok::{TokParts, TokenLm, tok_cache_bytes};
 
-/// Bytes per indexer-key value in the v2 design: 8-bit keys, as in DeepSeek-V3.2. The reference
-/// implementation stores them at the run dtype until a fused kernel reads 8-bit keys.
+/// Bytes per indexer-key value in the v2 design: 8-bit keys, as in DeepSeek-V3.2, with one scale
+/// per position at the run dtype (`V2Config::idx_8bit`).
 pub const INDEX_KEY_BYTES: usize = 1;
 
-/// Cache bytes of the design at `max_tokens` for either model config, with indexer keys in
-/// [`INDEX_KEY_BYTES`] and everything else at `itemsize`.
+/// Cache bytes of the design at `max_tokens` for either model config: indexer keys in
+/// [`INDEX_KEY_BYTES`] plus a scale when the config caches them in 8 bits (the default),
+/// otherwise at `itemsize` like everything else. What the cache allocates.
 pub fn cache_bytes(cfg: &Config, max_tokens: usize, itemsize: usize, batch: usize) -> usize {
-    cache_bytes_with(cfg, max_tokens, itemsize, INDEX_KEY_BYTES, batch)
+    let v2 = match cfg {
+        Config::Tok(c) => &c.v2,
+        Config::Ncm(c) => &c.v2,
+    };
+    let index = if v2.idx_8bit { INDEX_KEY_BYTES } else { itemsize };
+    cache_bytes_with(cfg, max_tokens, itemsize, index, batch)
 }
 
-/// Cache bytes with indexer keys at `index_itemsize`: what the reference allocates when that is
-/// the run's float size.
+/// Cache bytes with indexer keys at `index_itemsize` per value (narrower than `itemsize`: 8-bit,
+/// plus one scale per position at `itemsize`), whatever the config says.
 pub fn cache_bytes_with(
     cfg: &Config,
     max_tokens: usize,

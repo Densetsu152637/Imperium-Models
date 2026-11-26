@@ -20,6 +20,18 @@ const TOL: f32 = 4e-2;
 const APPEND_TOL: f32 = 1e-5;
 
 #[test]
+fn delta_chunked_matches_recurrent_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    delta_chunked_matches(&device, TOL);
+}
+
+#[test]
+fn delta_prefill_matches_reference_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    delta_prefill_matches(&device, TOL);
+}
+
+#[test]
 fn delta_step_matches_reference_bf16() {
     let (device, _lock) = setup(DTYPE);
     delta_matches(&device, TOL);
@@ -30,6 +42,14 @@ fn retrieval_decode_matches_reference_bf16() {
     let (device, _lock) = setup(DTYPE);
     for case in retrieval_cases().into_iter().filter(|c| c.bf16_stable) {
         retrieval_matches(&device, &case, TOL);
+    }
+}
+
+#[test]
+fn retrieval_prefill_matches_reference_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    for case in retrieval_cases().into_iter().filter(|c| !c.spec.dense && c.bf16_stable) {
+        retrieval_prefill_matches(&device, &case, TOL);
     }
 }
 
