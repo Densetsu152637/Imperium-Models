@@ -779,6 +779,10 @@ impl NcmKernels for CubeBackend {
         let (h, dr, l) = (d.heads, d.rope_dim, d.latent);
         let (gate, index_q, index_k) = d.offsets();
         let (blocks, chunks) = d.grids(capacity);
+        // Heads per attention cube: a pair when they split evenly, else one.
+        let hg = if h.is_multiple_of(retrieval::HEAD_GROUP) { retrieval::HEAD_GROUP } else { 1 };
+        let plane = proj.client.properties().hardware.plane_size_max as usize;
+        assert_eq!(plane, retrieval::LANES, "the decode kernels take 32-lane planes");
         let dtype = elem(proj.dtype);
         let client = proj.client.clone();
         let q_lat = scratch(&proj, vec![b, h, l], DType::F32);
@@ -787,7 +791,7 @@ impl NcmKernels for CubeBackend {
         unsafe {
             retrieval::ret_prep_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * h + b) as u32, 1, 1),
+                CubeCount::Static((b * h * retrieval::PREP_SLICES + 3 * b) as u32, 1, 1),
                 CubeDim::new_1d(CUBE as u32),
                 proj.clone().into_tensor_arg(),
                 q_gamma.into_tensor_arg(),
@@ -845,15 +849,17 @@ impl NcmKernels for CubeBackend {
                     d.index_8bit,
                     dtype,
                 );
+                let slices = blocks.div_ceil(retrieval::TOPK_CUBE);
                 retrieval::ret_topk_kernel::launch_unchecked(
                     &client,
-                    CubeCount::Static(b as u32, 1, 1),
-                    CubeDim::new_1d(CUBE as u32),
+                    CubeCount::Static((b * slices) as u32, 1, 1),
+                    CubeDim::new_1d(retrieval::TOPK_CUBE as u32),
                     scores.into_tensor_arg(),
                     picked.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
                     blocks,
                     d.topk,
+                    slices,
                     d.block,
                     d.local,
                 );
@@ -866,7 +872,7 @@ impl NcmKernels for CubeBackend {
         unsafe {
             retrieval::ret_attend_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * chunks) as u32, 1, 1),
+                CubeCount::Static((b * chunks * (h / hg)) as u32, 1, 1),
                 CubeDim::new_1d(CUBE as u32),
                 q_lat.into_tensor_arg(),
                 q_rope.into_tensor_arg(),
@@ -884,11 +890,12 @@ impl NcmKernels for CubeBackend {
                 d.block,
                 d.local,
                 d.dense,
+                hg,
                 dtype,
             );
             retrieval::ret_combine_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static((b * h) as u32, 1, 1),
+                CubeCount::Static((b * h * d.v_dim.div_ceil(retrieval::LANES)) as u32, 1, 1),
                 CubeDim::new_1d(CUBE as u32),
                 proj.into_tensor_arg(),
                 wuv.into_tensor_arg(),
