@@ -37,7 +37,7 @@ mod kernel {
     use cubecl::prelude::*;
 
     /// Units per cube (one cube per row).
-    pub(super) const CUBE: usize = 256;
+    pub(super) const CUBE: usize = 1024;
     /// Most candidates the fast path gathers in shared memory (and the largest `top_k` it serves).
     const CAP: usize = 2048;
     /// Bands the fast path counts to bound the candidates.
@@ -180,7 +180,7 @@ mod kernel {
             if held <= f32::cast_from(CAP) {
                 let mut vals = Shared::<[f32]>::new_slice(CAP);
                 let mut ids = Shared::<[u32]>::new_slice(CAP);
-                let mut offs = Shared::<[u32]>::new_slice(CUBE + 1);
+                let mut offs = Shared::<[u32]>::new_slice(PLANES + 1);
                 // Each unit's share, an exclusive scan, then the writes.
                 let mut mine = u32::new(0);
                 let mut i = tid;
@@ -188,19 +188,24 @@ mod kernel {
                     mine += select(logit(x, row, i) >= floor, 1u32, 0u32);
                     i += CUBE;
                 }
-                offs[tid] = mine;
+                // Exclusive scan of the units' shares: within each plane, then over the planes.
+                let before = plane_exclusive_sum(mine);
+                let plane = tid / PLANE_DIM as usize;
+                if UNIT_POS_PLANE == PLANE_DIM - 1 {
+                    offs[plane] = before + mine;
+                }
                 sync_cube();
                 if tid == 0 {
                     let mut acc = u32::new(0);
-                    for u in 0..CUBE {
-                        let c = offs[u];
-                        offs[u] = acc;
+                    for p in 0..PLANES {
+                        let c = offs[p];
+                        offs[p] = acc;
                         acc += c;
                     }
-                    offs[CUBE] = acc;
+                    offs[PLANES] = acc;
                 }
                 sync_cube();
-                let mut at = offs[tid] as usize;
+                let mut at = (offs[plane] + before) as usize;
                 let mut i = tid;
                 while i < n {
                     let v = logit(x, row, i);
@@ -211,7 +216,7 @@ mod kernel {
                     }
                     i += CUBE;
                 }
-                let m = offs[CUBE] as usize;
+                let m = offs[PLANES] as usize;
                 sync_cube();
                 // The top-k cut over the candidates (it lies within them).
                 let mut a = key(floor);

@@ -86,10 +86,12 @@ fn a_seed_makes_sampled_decoding_repeatable() {
     }
 }
 
+/// Prompts of any length: a trailing partial concept starts the first decoded one, and a
+/// prompt shorter than one concept is padded to one.
 #[test]
-fn the_ncm_pads_prompts_that_are_not_whole_concepts() {
+fn the_ncm_serves_prompts_that_are_not_whole_concepts() {
     let engine = build(tiny_ncm_config(), 256);
-    // 1, 2, 3 and 4 tokens: all valid even though k = 4.
+    // 1 to 5 tokens: all valid even though k = 4.
     for n in 1..=5 {
         let text: String = "abcde".chars().take(n).collect();
         let (_, stats) = run(&engine, request(prompt(&text), 4, SamplingParams::GREEDY));
@@ -328,36 +330,74 @@ fn engine_with_reuse(config: ncm_model::Config, reuse: bool) -> Engine {
 }
 
 /// One engine throughout: tests run in parallel and seed the shared CPU generator, so two
-/// engines of one config need not hold the same random weights.
+/// engines of one config need not hold the same random weights. For each config, prompts of
+/// every length modulo 4 (the NCM's k) extend an earlier prompt of every length modulo 4: the
+/// earlier prompt's whole concepts (all of it for the token baseline) are reused, and the reply
+/// equals the one decoded after a full prefill.
 #[test]
 fn a_prompt_extending_the_last_one_reuses_its_prefix_and_decodes_the_same() {
     let configs =
         [tiny_tok_config(), tiny_tok_v2_config(), tiny_ncm_config(), tiny_ncm_v2_config()];
+    let greedy = SamplingParams::GREEDY;
     for config in configs {
         let engine = engine_with_reuse(config.clone(), true);
-        // 40 and 56 tokens: the same length modulo the NCM's k, so its padding matches.
-        let first = prompt("the first turn of a conversation, forty.");
-        let mut second = first.clone();
-        second.extend(prompt(" and a follow-up"));
-        assert_eq!((first.len(), second.len() % 4), (40, first.len() % 4));
-        let greedy = SamplingParams::GREEDY;
-        run(&engine, request(first.clone(), 12, greedy));
-        let (extended, stats) = run(&engine, request(second.clone(), 12, greedy));
-        assert_eq!(stats.cached_tokens, first.len(), "{config:?}: the prefix is reused");
-        // The same prompt again: nothing to prefill.
-        let (again, stats) = run(&engine, request(second.clone(), 12, greedy));
-        assert_eq!(stats.cached_tokens, second.len());
-        // A prompt that does not extend the last one starts afresh: the full prefill.
-        let (_, stats) = run(&engine, request(prompt("something else"), 4, greedy));
-        assert_eq!(stats.cached_tokens, 0);
-        let (want, stats) = run(&engine, request(second.clone(), 12, greedy));
-        assert_eq!(stats.cached_tokens, 0);
-        assert_eq!(extended, want, "{config:?}: prefix reuse changes the reply");
-        assert_eq!(again, want, "{config:?}: a whole-prompt hit changes the reply");
+        let ncm = matches!(config, ncm_model::Config::Ncm(_));
+        for a in 0..4 {
+            let first = prompt(&format!("the first turn of a conversation{}", ".".repeat(a)));
+            for b in 0..4 {
+                let mut second = first.clone();
+                second.extend(prompt(&format!(" and a follow-up{}", "!".repeat(b))));
+                run(&engine, request(first.clone(), 8, greedy));
+                let (extended, stats) = run(&engine, request(second.clone(), 8, greedy));
+                let reused = if ncm { first.len() - first.len() % 4 } else { first.len() };
+                assert_eq!(stats.cached_tokens, reused, "{config:?} {a} {b}: prefix reuse");
+                // The same prompt again reuses all of it but a pending partial concept.
+                let (again, stats) = run(&engine, request(second.clone(), 8, greedy));
+                let whole = if ncm { second.len() - second.len() % 4 } else { second.len() };
+                assert_eq!(stats.cached_tokens, whole);
+                // A prompt that does not extend the last one starts afresh: the full prefill.
+                let (_, stats) = run(&engine, request(prompt("something else"), 4, greedy));
+                assert_eq!(stats.cached_tokens, 0);
+                let (want, stats) = run(&engine, request(second.clone(), 8, greedy));
+                assert_eq!(stats.cached_tokens, 0);
+                assert_eq!(extended, want, "{config:?} {a} {b}: prefix reuse changes the reply");
+                assert_eq!(again, want, "{config:?} {a} {b}: a whole hit changes the reply");
+            }
+        }
     }
     // Turned off, nothing is reused.
     let engine = engine_with_reuse(tiny_ncm_config(), false);
-    run(&engine, request(prompt("abcd"), 4, SamplingParams::GREEDY));
-    let (_, stats) = run(&engine, request(prompt("abcdefgh"), 4, SamplingParams::GREEDY));
+    run(&engine, request(prompt("abcdefgh"), 4, SamplingParams::GREEDY));
+    let (_, stats) = run(&engine, request(prompt("abcdefghijkl"), 4, SamplingParams::GREEDY));
     assert_eq!(stats.cached_tokens, 0);
+}
+
+/// The next turn of an agent loop repeats the previous prompt and its reply: the cache as it
+/// stood at the end of the reply is reused (beyond the prompt), and the next reply equals the
+/// one decoded after a full prefill.
+#[test]
+fn a_prompt_repeating_the_last_reply_reuses_the_reply_too() {
+    let greedy = SamplingParams::GREEDY;
+    for config in [tiny_tok_v2_config(), tiny_ncm_v2_config(), tiny_tok_config(), tiny_ncm_config()]
+    {
+        let engine = engine_with_reuse(config.clone(), true);
+        let ncm = matches!(config, ncm_model::Config::Ncm(_));
+        let first = prompt("an agent's first prompt, of some length");
+        let (reply, _) = run(&engine, request(first.clone(), 24, greedy));
+        let mut next = first.clone();
+        next.extend(&reply);
+        next.extend(prompt(" and the tool's answer"));
+        let (got, stats) = run(&engine, request(next.clone(), 8, greedy));
+        let prompt_end = if ncm { first.len() - first.len() % 4 } else { first.len() };
+        assert!(stats.cached_tokens >= prompt_end, "{config:?}: {}", stats.cached_tokens);
+        if !ncm {
+            // All but the last reply token went back into the cache.
+            assert_eq!(stats.cached_tokens, first.len() + reply.len() - 1, "{config:?}");
+        }
+        eprintln!("{config:?}: reused {} of {}", stats.cached_tokens, next.len());
+        run(&engine, request(prompt("something else"), 4, greedy));
+        let (want, stats) = run(&engine, request(next, 8, greedy));
+        assert_eq!(stats.cached_tokens, 0);
+        assert_eq!(got, want, "{config:?}: reply reuse changes the reply");
+    }
 }

@@ -939,19 +939,35 @@ impl GraphedStep {
         Self { sampler: Some(StepSampler { params, settings }), ..Default::default() }
     }
 
-    /// The first concept of a reply from the prompt's condition `cond`, picked like every later
-    /// one (argmax, or the device sampler, advancing its counter), run eagerly: the step graph
-    /// serves only concepts that follow a written one.
+    /// The first concept of a reply from the prompt's condition `cond`, run eagerly (the step
+    /// graph serves only concepts that follow a written one). Its first tokens are `forced`
+    /// (the prompt's trailing partial concept, fewer than k tokens), teacher-forced as in
+    /// training; the rest are picked like every later token (argmax, or the device sampler,
+    /// whose counter advances by k either way).
     pub fn first(
         &mut self,
         model: &NcmLm,
         cond: Tensor<3>,
         cache: &mut NcmCache,
+        forced: &[i32],
     ) -> Tensor<2, Int> {
-        let out = match self.pick() {
-            Pick::Sample(params) => sampled_concept(model, cond, cache, &params),
-            _ => model.decode_concept(cond, cache, None, false).0,
+        assert!(forced.len() < model.k, "at most k - 1 tokens are pending");
+        let device = cond.device();
+        let [b, _, _] = cond.dims();
+        let forced: Vec<Tensor<2, Int>> = forced
+            .iter()
+            .map(|&t| {
+                let data = burn::tensor::TensorData::new(vec![t; b], [b, 1]);
+                Tensor::<2, Int>::from_data(data, &device).cast(burn::tensor::IntDType::I32)
+            })
+            .collect();
+        let pick = self.pick();
+        let mut choose = |j: usize, logits: &Tensor<3>| match (forced.get(j), &pick) {
+            (Some(token), _) => token.clone(),
+            (None, Pick::Sample(params)) => sample_pick(logits, params, j),
+            (None, _) => greedy(j, logits),
         };
+        let out = model.decode_concept_with(cond, cache, false, &mut choose).0;
         self.advance(model.k);
         out
     }

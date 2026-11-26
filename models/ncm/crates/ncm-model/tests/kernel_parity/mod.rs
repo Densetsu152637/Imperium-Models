@@ -183,7 +183,7 @@ fn ncm_sampled_decode(model: &NcmLm, graphs: bool, device: &Device) -> Vec<Vec<i
     let settings =
         SampleSettings { temperature: 0.9, top_k: 40, top_p: 0.95, seed: 1234, counter: 0 };
     let mut graphed = GraphedStep::sampled(device, settings);
-    let mut next = graphed.first(model, cond, &mut cache);
+    let mut next = graphed.first(model, cond, &mut cache, &[]);
     let mut tokens = vec![ints(next.clone())];
     for _ in 1..12 {
         next = graphed.step(model, next, &mut cache);
