@@ -59,8 +59,8 @@ mod kernel {
     pub(super) const PLANES: usize = 8;
     /// Lanes per plane.
     pub(super) const PLANE: usize = 32;
-    /// Most staged `x` slots of a quantised cube.
-    pub(super) const QX: usize = 8192;
+    /// Most staged `x` slots of a quantised cube (eight rows of a 1,024-wide input).
+    pub(super) const QX: usize = 9216;
 
     /// Sum of `v` over the cube (`CUBE` units, planes of 32).
     #[cube]

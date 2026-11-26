@@ -23,8 +23,9 @@ pub(crate) const PLANES: usize = 4;
 pub(crate) const PLANE: usize = 32;
 /// Output features per cube of [`qgemv_vec_kernel`].
 pub(crate) const QPLANES: usize = 8;
-/// Most `x` slots [`qgemv_vec_kernel`] stages.
-pub(crate) const QX: usize = 8192;
+/// Most `x` slots [`qgemv_vec_kernel`] stages (36 KiB: eight rows of a 1,024-wide input with
+/// its skew, so batched slot steps of eight rows keep the vector kernel).
+pub(crate) const QX: usize = 9216;
 /// Units per dequantisation cube.
 pub(crate) const DEQUANT_CUBE: usize = 256;
 
