@@ -197,3 +197,24 @@ fn hybrid_runs_against_the_k4_ncm() {
     ]);
     assert!(run(&bad).is_err());
 }
+
+#[test]
+fn train_memory_estimates_every_model() {
+    use ncm_bench::train_memory::{TrainMemoryCli, run};
+    let cli = TrainMemoryCli::parse_from(["train-memory", "--seq", "4096", "--micro-batch", "1"]);
+    let payload = run(&cli);
+    let models = payload["models"].as_array().unwrap();
+    assert_eq!(models.len(), 4);
+    for m in models {
+        let p = m["params"].as_f64().unwrap();
+        assert!(p > 1e8, "{m}");
+        // AdamW fp32 moments are 8 bytes per parameter, 8-bit about 2.
+        let (a, a8) = (m["adamw_gib"].as_f64().unwrap(), m["adamw8_gib"].as_f64().unwrap());
+        assert!((a / a8 - 4.0).abs() < 0.05);
+        // Recomputation never keeps more.
+        assert!(m["activations_recompute_gib"].as_f64() <= m["activations_gib"].as_f64());
+    }
+    // The 1B variants are larger than the 250M ones.
+    assert!(models[2]["params"].as_f64() > models[0]["params"].as_f64());
+    assert!(models[3]["params"].as_f64() > models[1]["params"].as_f64());
+}

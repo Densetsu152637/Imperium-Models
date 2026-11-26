@@ -39,6 +39,7 @@ More switches:
 | `--assume-accept 1.0 0.75 0.5` | With `--speculate on`, one more speculative run per rate that keeps that share of draft tokens whatever the decoder says. **Synthetic**: it times the passes a trained model with that acceptance would run (random weights accept few drafts); the output is not the model's, and the report labels it |
 | `--model hybrid` / `all` | The NCM hybrid (`configs/ncm-250m-hybrid.toml`, block decoder over 32-token blocks; `all` adds the token baseline and the k = 4 NCM, and reports hybrid / k = 4 ratios with the local test plan's step 6 gate). Runs the fast decode path (`ncm_model::hybrid::FastSession`, graphed on CUDA) |
 | `--hybrid-p 1.0 0.986 0.967 0.950` | The hybrid's **synthetic** per-token agreement rates (geometric first rejections, re-decodes and autoregressive fills run for real), plus a run on the autoregressive path alone and one with full rejection |
+| `train-memory` (subcommand) | Training-memory estimate, no GPU: parameters, weights, optional fp32 master copy (`--master`), gradients, AdamW states (fp32 or 8-bit), and activations per micro-batch (`--seq`, `--micro-batch`, `--value-bytes`) with and without per-layer recomputation, for the token baseline and the hybrid at 250M and about 1B, against `--gpu-gib` (16). An estimate: the activation model is written out in `crates/ncm-bench/src/train_memory.rs` |
 
 ```
 target/release/ncm-bench --model ncm --design v2 --device cuda --context 2048 16384 --new-tokens 256 \

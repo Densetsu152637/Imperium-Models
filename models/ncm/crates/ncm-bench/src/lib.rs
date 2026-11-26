@@ -17,8 +17,11 @@
 //! `--model hybrid` (or `all`) runs the NCM hybrid's block decode loop ([`hybrid`]): the
 //! autoregressive path alone and synthetic per-token agreement rates `--hybrid-p` (step 6 of the
 //! local test plan), against the k = 4 NCM of the v2 design when that runs too.
+//!
+//! `ncm-bench train-memory` prints a training-memory estimate instead ([`train_memory`]).
 
 pub mod hybrid;
+pub mod train_memory;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
