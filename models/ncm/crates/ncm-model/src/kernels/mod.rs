@@ -622,7 +622,7 @@ impl NcmKernels for CubeBackend {
             delta::delta_step_kernel::launch_unchecked(
                 &client,
                 CubeCount::Static((b * heads) as u32, 1, 1),
-                CubeDim::new_1d(hd as u32),
+                CubeDim::new_1d((hd * delta::STEP_SPLIT) as u32),
                 proj.into_tensor_arg(),
                 conv_w.into_tensor_arg(),
                 a_log.into_tensor_arg(),
