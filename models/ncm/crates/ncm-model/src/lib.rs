@@ -14,6 +14,7 @@ pub mod config;
 pub mod delta;
 pub mod fused;
 pub(crate) mod graph;
+pub mod hybrid;
 #[cfg(feature = "cuda")]
 pub(crate) mod inplace;
 #[cfg(feature = "cuda")]
