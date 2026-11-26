@@ -1353,6 +1353,28 @@ pub fn enable_kernel_cache(root: Option<std::path::PathBuf>) -> Option<std::path
     CubeClRuntimeConfig::try_set(config).then_some(dir)
 }
 
+/// The id of the device buffer behind a dispatch tensor (cubecl tensors; None elsewhere).
+fn dispatch_buffer_id(t: burn::backend::DispatchTensor) -> Option<usize> {
+    use burn::backend::{BackendTensor, DispatchTensorKind};
+    let handle = match t.kind {
+        DispatchTensorKind::Cube(BackendTensor::Float(c)) => c.handle,
+        DispatchTensorKind::Cube(BackendTensor::Int(c)) => c.handle,
+        _ => return None,
+    };
+    Some(handle.memory.descriptor().id.value)
+}
+
+/// The id of the device buffer behind `t` (cubecl tensors; None elsewhere): views of one
+/// buffer share it, so it tells whether a view still aliases the buffer it was cut from.
+pub fn buffer_id<const D: usize>(t: &Tensor<D>) -> Option<usize> {
+    dispatch_buffer_id(t.clone().into_dispatch())
+}
+
+/// [`buffer_id`] of an int tensor.
+pub fn int_buffer_id<const D: usize>(t: &Tensor<D, Int>) -> Option<usize> {
+    dispatch_buffer_id(t.clone().into_dispatch())
+}
+
 #[cfg(test)]
 mod cache_tests {
     #[test]

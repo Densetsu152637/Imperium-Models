@@ -291,6 +291,32 @@ impl LatentCache {
             _ => panic!("copies come from a cache of the same layout"),
         }
         self.length = src.length;
+        #[cfg(feature = "cuda")]
+        self.check_pooled();
+    }
+
+    /// Whether a pooled cache's latents, indexer keys and position are still views of the
+    /// pool's buffers (an in-place write keeps them; a replacing one would silently detach the
+    /// slot from batched decoding). True for a cache outside a pool.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn aliases_pool(&self) -> bool {
+        use crate::kernels::{buffer_id, int_buffer_id};
+        let Some(pool) = self.pooled.as_ref() else {
+            return true;
+        };
+        let keys = |k: &IndexKeys| match k {
+            IndexKeys::Float(t) => buffer_id(t),
+            IndexKeys::Int8 { codes, .. } => int_buffer_id(codes),
+        };
+        buffer_id(&pool.kv) == self.kv.as_ref().and_then(buffer_id)
+            && self.keys.as_ref().and_then(keys) == keys(&pool.keys)
+            && int_buffer_id(&self.position) == int_buffer_id(&pool.position)
+    }
+
+    /// Debug builds: panics when a pooled cache no longer aliases its pool.
+    #[cfg(feature = "cuda")]
+    fn check_pooled(&self) {
+        debug_assert!(self.aliases_pool(), "a pooled retrieval cache detached from its pool");
     }
 
     /// Positions the cache holds at most.
@@ -367,6 +393,7 @@ impl LatentCache {
             crate::inplace::write_float(self.kv.as_ref().expect("cache"), kv, 1, start);
             self.keys.as_ref().expect("cache").write_into(start, keys);
             self.length += t;
+            self.check_pooled();
             return;
         }
         let old_kv = self.kv.take().expect("cache");
@@ -494,8 +521,8 @@ impl SparseRetrieval {
             .collect()
     }
 
-    /// Whether `caches` are every row of one slot pool, in row order (so [`Self::decode_rows`]
-    /// takes them).
+    /// Whether `caches` are every row of one slot pool, in row order, each still a view of the
+    /// pool's buffers (so [`Self::decode_rows`] takes them).
     #[cfg(feature = "cuda")]
     pub(crate) fn rows_pooled(caches: &[&LatentCache]) -> bool {
         let Some(Some(first)) = caches.first().map(|c| c.pooled.as_ref()) else {
@@ -505,6 +532,7 @@ impl SparseRetrieval {
             && caches.iter().enumerate().all(|(i, c)| {
                 c.pooled.as_ref().is_some_and(|p| p.id == first.id && p.row == i)
                     && c.length < c.capacity
+                    && c.aliases_pool()
             })
     }
 
@@ -544,6 +572,7 @@ impl SparseRetrieval {
             self.kernel_dims(),
         );
         for cache in caches.iter_mut() {
+            cache.check_pooled();
             cache.length += 1;
         }
         // The combine kernel has applied the gate.
