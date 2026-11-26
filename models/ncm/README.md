@@ -1,6 +1,6 @@
 # NCM: Next Concept Modelling models for Imperium
 
-Training code, configs and the inference runtime for the 250M Next Concept Modelling (NCM) versions of Emperor and Consul, plus the same-size token baselines they are compared with. Written in Rust on Burn 0.22. Nothing is trained yet.
+Training code, configs and the inference runtime for the 250M Next Concept Modelling (NCM) version of **Princeps**, plus the same-size token baseline it is compared with. Princeps is one model that runs both Imperium harnesses: the Emperor harness (root agent: plans, delegates, checks) and the Consul harness (critic of plans, diffs and agent reports). Further model training is on hold until the Imperium Harness Research session has finished building the harnesses; runtime optimisation continues. Written in Rust on Burn 0.22. Nothing is trained yet.
 
 The design, plan and acceptance checks live in Imperium-Research under `docs/next-concept-modelling/` (roadmap R4). This folder holds code and data only.
 
@@ -39,8 +39,10 @@ The speed gate passed. NCM against the token baseline: 1.45x to 2.02x at 2k cont
 |---|---|---|
 | `tok-250m-base` | Token baseline | Scratch |
 | `ncm-250m-base` | NCM | Scratch |
-| `emperor-tok-250m`, `consul-tok-250m` | Token baseline | `tok-250m-base` |
-| `emperor-ncm-250m`, `consul-ncm-250m` | NCM | `ncm-250m-base` |
+| `princeps-tok-250m` | Token baseline | `tok-250m-base` |
+| `princeps-ncm-250m` | NCM | `ncm-250m-base` |
+
+Each base is fine-tuned once, on the union of the Emperor-harness and Consul-harness SFT sets (`data/sft/emperor/` and `data/sft/consul/`, which keep their names and are now per-harness sets).
 
 All models support a context of at least 1M tokens. Tests allocate 2k to 16k.
 

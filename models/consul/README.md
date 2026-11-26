@@ -1,5 +1,7 @@
 # Consul
 
+> **Current line (2026-11-26):** the token-era Qwen LoRA line below is retired history. The current line is **Princeps**, a single NCM model trained from scratch (see [`models/ncm`](../ncm)). Emperor and Consul now name Imperium harnesses (root agent, and critic of plans, diffs and agent reports) that Princeps runs.
+
 Training, evaluation, and export for **Consul**, an open-weight critic model for
 [Imperium](https://github.com/Densetsu152637/Imperium-AI). Consul keeps
 [Emperor](https://github.com/Densetsu152637/emperor), Imperium's orchestrator model, in check:

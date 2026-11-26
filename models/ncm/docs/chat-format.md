@@ -1,6 +1,6 @@
 # NCM chat format
 
-The text format of every fine-tuning sample for the NCM models (Emperor and Consul). The stage 2 tokenizer reserves each tag below as a single special token, so no tag may appear inside message content. One renderer, `ncm_model::chat` (`crates/ncm-model/src/chat.rs`), produces it for every crate: `ncm-sft` renders the token-era teacher data and refuses records whose content already holds a reserved tag, `ncm-data` renders the pretraining chat and reasoning sources and defuses reserved tags in them (a space after the first character, `< |im_end|>`), and the runtime renders prompts.
+The text format of every fine-tuning sample for the NCM models (Princeps). Princeps runs two Imperium harnesses, Emperor and Consul; the role comes from the harness's system prompt, as in the examples below. The stage 2 tokenizer reserves each tag below as a single special token, so no tag may appear inside message content. One renderer, `ncm_model::chat` (`crates/ncm-model/src/chat.rs`), produces it for every crate: `ncm-sft` renders the token-era teacher data and refuses records whose content already holds a reserved tag, `ncm-data` renders the pretraining chat and reasoning sources and defuses reserved tags in them (a space after the first character, `< |im_end|>`), and the runtime renders prompts.
 
 ## Turns
 
@@ -16,7 +16,7 @@ The system turn holds the system prompt, then the tool definitions the sample wa
 
 ```text
 <|im_start|>system
-You are Emperor, the root agent of an Imperium session. ...
+You are Emperor, the root agent of an Imperium session. ...  (Emperor harness system prompt)
 
 <tools>
 {"name":"web_search","description":"...","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}
@@ -68,7 +68,7 @@ Dramatiq vs Celery: which Python task queue ...
 
 ```text
 <|im_start|>system
-You are Consul. ...
+You are Consul. ...  (Consul harness system prompt)
 <|im_end|>
 <|im_start|>user
 Review this plan: ...

@@ -1,5 +1,7 @@
 # Emperor
 
+> **Current line (2026-11-26):** the token-era Qwen LoRA line below is retired history. The current line is **Princeps**, a single NCM model trained from scratch (see [`models/ncm`](../ncm)). Emperor and Consul now name Imperium harnesses (root agent, and critic of plans, diffs and agent reports) that Princeps runs.
+
 Training, evaluation, and export for **Emperor**, an open-weight model built to be the root
 agent of an [Imperium](https://github.com/Densetsu152637/Imperium-AI) session on a 16 GB GPU:
 it plans, writes compact briefs, and delegates the work to hosted and local subagents through

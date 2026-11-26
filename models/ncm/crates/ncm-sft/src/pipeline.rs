@@ -23,6 +23,9 @@ fn io<T>(path: &Path, result: std::io::Result<T>) -> Result<T, SftError> {
     result.map_err(|source| SftError::Io { path: path.to_owned(), source })
 }
 
+/// Which per-harness set: the Emperor harness (root agent) or the Consul harness (critic).
+/// Both feed Princeps, the single model that runs either harness. The names are kept for
+/// data paths and CLI values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Model {
     Emperor,
