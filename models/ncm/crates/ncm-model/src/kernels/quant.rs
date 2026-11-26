@@ -1,24 +1,22 @@
 //! Fused dequantise-and-multiply kernels for quantised linear layers ([`crate::quant`]).
 //!
-//! * [`qgemv_kernel`]: `y = x W` for up to [`crate::quant::GEMV_ROWS`] rows of `x`. One plane
-//!   (warp) per output feature streams that feature's packed row once, each lane taking every
-//!   32nd word, decoding its codes in registers and accumulating every row of `x` against them;
-//!   a plane sum finishes the dot products. The weight is read once per call whatever the row count, so decode
-//!   moves `bits / 16` of the bf16 weight traffic.
-//! * [`qgemv_vec_kernel`]: the same product with `x` staged in shared memory once per cube of
-//!   eight features and each lane's words read as one vector, when `x` fits and the word count
-//!   and group length allow (decode at the models' widths).
+//! * [`qgemv_vec_kernel`]: `y = x W` for up to [`crate::quant::GEMV_ROWS`] rows of `x` (decode).
+//!   One plane (warp) per output feature streams that feature's packed row once in vectors of
+//!   words, decoding its codes in registers against `x` staged in shared memory (in K tiles for
+//!   wide inputs); a plane sum finishes the dot products. The weight is read once per call
+//!   whatever the row count, so decode moves `bits / 16` of the bf16 weight traffic.
+//! * [`qgemm_small_kernel`]: 9 to [`QGEMM_ROWS`] rows (batched slot steps, verify passes, short
+//!   prefill pieces): tiles of the weight decoded into shared memory on the fly and multiplied
+//!   against staged tiles of `x`, the weight still read once per column tile.
 //! * [`dequant_kernel`]: decodes the weight to `[d_in, d_out]` at the run dtype for Burn's
-//!   tuned matmul when there are more rows (prefill, where compute rather than weight traffic
-//!   dominates).
+//!   tuned matmul when there are more rows (long prefill, where compute rather than weight
+//!   traffic dominates).
 //!
 //! Arithmetic is f32; `x` and outputs are at the run dtype, codes i32, scales f32.
 
 use burn_cubecl::cubecl;
 use cubecl::prelude::*;
 
-/// Output features per GEMV cube (one plane each).
-pub(crate) const PLANES: usize = 4;
 /// Lanes per plane: the CUDA warp.
 pub(crate) const PLANE: usize = 32;
 /// Output features per cube of [`qgemv_vec_kernel`].
@@ -29,78 +27,10 @@ pub(crate) const QX: usize = 9216;
 /// Units per dequantisation cube.
 pub(crate) const DEQUANT_CUBE: usize = 256;
 
-/// `x` `[rows, k_len]` (any strides), `packed` `[n_len, words]` i32, `scales` `[n_len, groups]`
-/// f32; writes `out` `[rows, n_len]` (contiguous). Cube `c`, plane `p` computes feature
-/// `c * PLANES + p`.
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn qgemv_kernel<F: Float>(
-    x: &Tensor<F>,
-    packed: &Tensor<i32>,
-    scales: &Tensor<f32>,
-    out: &mut Tensor<F>,
-    k_len: usize,
-    n_len: usize,
-    words: usize,
-    #[comptime] bits: u32,
-    #[comptime] rows: usize,
-    #[comptime] group_words: usize,
-    #[define(F)] _dtype: ElemType,
-) {
-    let lane = UNIT_POS_X as usize;
-    let n = CUBE_POS_X as usize * PLANES + UNIT_POS_Y as usize;
-    if n >= n_len {
-        terminate!();
-    }
-    let per = comptime!(32 / bits) as usize;
-    let mask = comptime!((1u32 << bits) - 1) as i32;
-    let offset = comptime!(1u32 << (bits - 1)) as f32;
-    let (x0, x1) = (x.stride(0), x.stride(1));
-    let row = n * packed.stride(0);
-    let srow = n * scales.stride(0);
-    let mut acc = Array::<f32>::new(rows);
-    #[unroll]
-    for r in 0..rows {
-        acc[r] = 0.0;
-    }
-    let mut w = lane;
-    while w < words {
-        let word = packed[row + w];
-        let scale = scales[srow + w / group_words];
-        let k0 = w * per;
-        let mut part = Array::<f32>::new(rows);
-        #[unroll]
-        for r in 0..rows {
-            part[r] = 0.0;
-        }
-        #[unroll]
-        for j in 0..per {
-            let k = k0 + j;
-            if k < k_len {
-                let code = f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
-                let q = code - offset;
-                #[unroll]
-                for r in 0..rows {
-                    part[r] += q * f32::cast_from(x[r * x0 + k * x1]);
-                }
-            }
-        }
-        #[unroll]
-        for r in 0..rows {
-            acc[r] += part[r] * scale;
-        }
-        w += PLANE;
-    }
-    #[unroll]
-    for r in 0..rows {
-        let total = plane_sum(acc[r]);
-        if lane == 0 {
-            out[r * n_len + n] = F::cast_from(total);
-        }
-    }
-}
-
-/// [`qgemv_kernel`] with `x` staged in shared memory (f32, skewed) a tile of `tile_k` inputs
+/// `y = x W` for `x` `[rows, k_len]` (any strides, `rows <= GEMV_ROWS`), `packed`
+/// `[n_len, words]` i32 (contiguous along the words; [`crate::kernels::packed_int`]),
+/// `scales` `[n_len, groups]` f32, into `out` `[rows, n_len]` (contiguous), with `x` staged in
+/// shared memory (f32, skewed) a tile of `tile_k` inputs
 /// at a time (`rows * (tile_k + tile_k / 32 + 1) <= QX`, a multiple of 512 unless it is all of
 /// `k_len`), so inputs of any width keep it, and each lane's words read as one vector of `v`
 /// (`v` from [`vector_words`]: as wide as the rows' alignment allows, down to one word): lane
@@ -282,6 +212,129 @@ pub(crate) fn dequant_kernel<F: Float>(
         if k < k_len {
             let code = f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
             out[k * n_len + n] = F::cast_from((code - offset) * scale);
+        }
+    }
+}
+
+/// Output features per cube of [`qgemm_small_kernel`].
+pub(crate) const QGEMM_COLS: usize = 64;
+/// `K` per decoded tile of [`qgemm_small_kernel`] (a multiple of every format's codes per word).
+pub(crate) const QGEMM_K: usize = 32;
+/// Units per cube of [`qgemm_small_kernel`].
+pub(crate) const QGEMM_CUBE: usize = 256;
+/// Row groups of [`qgemm_small_kernel`]: unit `u` owns feature `u % QGEMM_COLS` of rows
+/// `u / QGEMM_COLS + QGEMM_GROUPS i`.
+pub(crate) const QGEMM_GROUPS: usize = QGEMM_CUBE / QGEMM_COLS;
+/// Most rows [`qgemm_small_kernel`] takes.
+pub(crate) const QGEMM_ROWS: usize = 64;
+
+/// Small-M quantised GEMM `y = x W` for `x` `[m, k]` (`m <= QGEMM_ROWS`, any strides) and the
+/// weight as `packed` `[n, words]` codes with `scales` `[n, groups]` (read through their
+/// strides). Cube `(tile, split)`: features `tile * QGEMM_COLS ..` over `k` in
+/// `split * k_split ..` (a multiple of `QGEMM_K`): per `QGEMM_K`-deep tile, `x` staged and the
+/// tile's codes decoded with their scales into shared memory (each feature's words read
+/// contiguously, once per cube), then every unit accumulates its feature of `rows_per` rows in
+/// registers. With one split it writes `y` `[m, n]` at the run dtype, otherwise f32 partials
+/// `part` `[splits, m, n]` for `gemv::gemv_sum_kernel`.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qgemm_small_kernel<F: Float>(
+    x: &Tensor<F>,
+    packed: &Tensor<i32>,
+    scales: &Tensor<f32>,
+    y: &mut Tensor<F>,
+    part: &mut Tensor<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    words: usize,
+    k_split: usize,
+    #[comptime] bits: u32,
+    #[comptime] group_words: usize,
+    #[comptime] rows_per: usize,
+    #[comptime] split: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let per = comptime!(32 / bits) as usize;
+    let wpt = comptime!(QGEMM_K / (32 / bits) as usize);
+    let mask = comptime!((1u32 << bits) - 1) as i32;
+    let offset = comptime!(1u32 << (bits - 1)) as f32;
+    let tid = UNIT_POS as usize;
+    let c = tid % QGEMM_COLS;
+    let g = tid / QGEMM_COLS;
+    let n0 = CUBE_POS_X as usize * QGEMM_COLS;
+    let col = n0 + c;
+    let s = CUBE_POS_Y as usize;
+    let k_start = s * k_split;
+    let k_end = select(k_start + k_split < k, k_start + k_split, k);
+    let mut xs = Shared::<[f32]>::new_slice(comptime!(QGEMM_ROWS * (QGEMM_K + 1)));
+    let mut ws = Shared::<[f32]>::new_slice(comptime!(QGEMM_K * QGEMM_COLS));
+    let (x0, x1) = (x.stride(0), x.stride(1));
+    let (p0, p1) = (packed.stride(0), packed.stride(1));
+    let (s0, s1) = (scales.stride(0), scales.stride(1));
+    let mut acc = Array::<f32>::new(rows_per);
+    #[unroll]
+    for i in 0..rows_per {
+        acc[i] = 0.0;
+    }
+    let mut kb = k_start;
+    while kb < k_end {
+        // x tile `[m, QGEMM_K]` (padded by one per row against bank conflicts), zeros past K.
+        let mut i = tid;
+        while i < m * QGEMM_K {
+            let (r, kk) = (i / QGEMM_K, i % QGEMM_K);
+            let at = kb + kk;
+            let mut v = 0.0f32;
+            if at < k_end {
+                v = f32::cast_from(x[r * x0 + at * x1]);
+            }
+            xs[r * (QGEMM_K + 1) + kk] = v;
+            i += QGEMM_CUBE;
+        }
+        // The weight tile `[QGEMM_K, QGEMM_COLS]` decoded: `wpt` words per feature.
+        let mut i = tid;
+        while i < QGEMM_COLS * wpt {
+            let (cc, wi) = (i / wpt, i % wpt);
+            let feature = n0 + cc;
+            let w = kb / per + wi;
+            let live = feature < n && w < words;
+            let f = select(live, feature, 0usize);
+            let wc = select(live, w, 0usize);
+            let word = packed[f * p0 + wc * p1];
+            let scale = select(live, scales[f * s0 + (wc / group_words) * s1], 0.0f32);
+            #[unroll]
+            for j in 0..per {
+                let code = f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
+                ws[(wi * per + j) * QGEMM_COLS + cc] = (code - offset) * scale;
+            }
+            i += QGEMM_CUBE;
+        }
+        sync_cube();
+        #[unroll]
+        for kk in 0..QGEMM_K {
+            let wv = ws[kk * QGEMM_COLS + c];
+            #[unroll]
+            for i in 0..rows_per {
+                let r = g + i * QGEMM_GROUPS;
+                if r < m {
+                    acc[i] += xs[r * (QGEMM_K + 1) + kk] * wv;
+                }
+            }
+        }
+        sync_cube();
+        kb += QGEMM_K;
+    }
+    if col < n {
+        #[unroll]
+        for i in 0..rows_per {
+            let r = g + i * QGEMM_GROUPS;
+            if r < m {
+                if comptime!(split) {
+                    part[s * m * n + r * n + col] = acc[i];
+                } else {
+                    y[r * n + col] = F::cast_from(acc[i]);
+                }
+            }
         }
     }
 }

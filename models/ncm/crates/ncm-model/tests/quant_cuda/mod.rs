@@ -58,7 +58,8 @@ pub fn layers_match_host(device: &Device, dtype: FloatDType, tol: f64) {
             let packed = quantize(&w, d_out, d_in, format);
             let decoded = packed.dequantize();
             let layer = QLinear::from_packed(&packed, device);
-            for rows in [1, 3, GEMV_ROWS, GEMV_ROWS + 1, 37] {
+            // GEMV, the small-M quantised GEMM (9 ..= 64) and the dequantised matmul.
+            for rows in [1, 3, GEMV_ROWS, GEMV_ROWS + 1, 37, 64, 65] {
                 let x = Tensor::<2>::from_data(
                     TensorData::new(random(rows * d_in, rows as u64, 1.0), [rows, d_in]),
                     device,

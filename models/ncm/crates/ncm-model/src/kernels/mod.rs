@@ -169,6 +169,19 @@ pub trait NcmKernels: Backend {
         group_words: usize,
     ) -> FloatTensor<Self>;
 
+    /// See [`qmatmul`]: `x` `[m, d_in]` with `GEMV_ROWS < m <= quant::QGEMM_ROWS`.
+    fn ncm_qgemm_small(
+        x: FloatTensor<Self>,
+        packed: IntTensor<Self>,
+        scales: FloatTensor<Self>,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+    ) -> FloatTensor<Self>;
+
+    /// See [`packed_int`].
+    fn ncm_packed_int(x: IntTensor<Self>) -> IntTensor<Self>;
+
     /// See [`qmatmul`]; the decoded weight `[d_in, d_out]` at `dtype`.
     fn ncm_dequant(
         packed: IntTensor<Self>,
@@ -480,45 +493,25 @@ impl NcmKernels for CubeBackend {
         bits: u32,
         group_words: usize,
     ) -> CubeTensor {
-        use quant::{PLANE, PLANES};
+        use quant::PLANE;
         let rows = x.meta.shape().dims::<2>()[0];
+        // Codes not contiguous along the words (loaders repack them once, see `packed_int`)
+        // are packed here, so every shape takes the vector kernel.
+        let packed =
+            if packed.meta.strides()[1] == 1 { packed } else { Self::ncm_packed_int(packed) };
         let [n_len, words] = packed.meta.shape().dims::<2>();
         let out = empty_like(&x, vec![rows, n_len]);
         let dtype = elem(x.dtype);
         let client = x.client.clone();
-        let strides = packed.meta.strides().to_vec();
         // Any width (x staged a tile at a time), any word count (narrower vectors down to one
         // word) and any group length (per-word scales when vectors cross groups).
-        let vec = quant::vector_words(bits, words, strides[0]);
-        if rows <= crate::quant::GEMV_ROWS && strides[1] == 1 {
-            unsafe {
-                quant::qgemv_vec_kernel::launch_unchecked(
-                    &client,
-                    CubeCount::Static(n_len.div_ceil(quant::QPLANES) as u32, 1, 1),
-                    CubeDim::new_2d(PLANE as u32, quant::QPLANES as u32),
-                    vec,
-                    x.into_tensor_arg(),
-                    packed.into_tensor_arg(),
-                    scales.into_tensor_arg(),
-                    out.clone().into_tensor_arg(),
-                    d_in,
-                    n_len,
-                    words,
-                    quant::staged_tile(rows, d_in, quant::QX),
-                    bits,
-                    rows,
-                    group_words,
-                    quant::straddles(vec, group_words),
-                    dtype,
-                );
-            }
-            return out;
-        }
+        let vec = quant::vector_words(bits, words, packed.meta.strides()[0]);
         unsafe {
-            quant::qgemv_kernel::launch_unchecked(
+            quant::qgemv_vec_kernel::launch_unchecked(
                 &client,
-                CubeCount::Static(n_len.div_ceil(PLANES) as u32, 1, 1),
-                CubeDim::new_2d(PLANE as u32, PLANES as u32),
+                CubeCount::Static(n_len.div_ceil(quant::QPLANES) as u32, 1, 1),
+                CubeDim::new_2d(PLANE as u32, quant::QPLANES as u32),
+                vec,
                 x.into_tensor_arg(),
                 packed.into_tensor_arg(),
                 scales.into_tensor_arg(),
@@ -526,13 +519,83 @@ impl NcmKernels for CubeBackend {
                 d_in,
                 n_len,
                 words,
+                quant::staged_tile(rows, d_in, quant::QX),
                 bits,
                 rows,
                 group_words,
+                quant::straddles(vec, group_words),
                 dtype,
             );
         }
         out
+    }
+
+    fn ncm_qgemm_small(
+        x: CubeTensor,
+        packed: CubeTensor,
+        scales: CubeTensor,
+        d_in: usize,
+        bits: u32,
+        group_words: usize,
+    ) -> CubeTensor {
+        use quant::{QGEMM_COLS, QGEMM_CUBE, QGEMM_GROUPS, QGEMM_K};
+        let m = x.meta.shape().dims::<2>()[0];
+        let [n, words] = packed.meta.shape().dims::<2>();
+        let k = d_in;
+        let y = empty_like(&x, vec![m, n]);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        let rows_per = m.div_ceil(QGEMM_GROUPS).next_multiple_of(4).max(4);
+        // Split K until about two cubes per SM are decoding (splits of at least 256).
+        let tiles = n.div_ceil(QGEMM_COLS);
+        let splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(256).max(1));
+        let k_split = k.div_ceil(splits).next_multiple_of(QGEMM_K);
+        let splits = k.div_ceil(k_split);
+        let part = scratch(&x, vec![if splits > 1 { splits * m * n } else { 1 }], DType::F32);
+        unsafe {
+            quant::qgemm_small_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(tiles as u32, splits as u32, 1),
+                CubeDim::new_1d(QGEMM_CUBE as u32),
+                x.into_tensor_arg(),
+                packed.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                y.clone().into_tensor_arg(),
+                part.clone().into_tensor_arg(),
+                m,
+                k,
+                n,
+                words,
+                k_split,
+                bits,
+                group_words,
+                rows_per,
+                splits > 1,
+                dtype,
+            );
+            if splits > 1 {
+                let count = m * n;
+                gemv::gemv_sum_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(count.div_ceil(gemv::CUBE) as u32, 1, 1),
+                    CubeDim::new_1d(gemv::CUBE as u32),
+                    part.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    count,
+                    splits,
+                    dtype,
+                );
+            }
+        }
+        y
+    }
+
+    fn ncm_packed_int(x: CubeTensor) -> CubeTensor {
+        if x.is_contiguous() {
+            return x;
+        }
+        let out = empty_like(&x, x.meta.shape().to_vec());
+        Self::ncm_assign(out, x, 0, 0)
     }
 
     fn ncm_dequant(
@@ -1356,6 +1419,12 @@ pub fn packed<const D: usize>(x: Tensor<D>) -> Tensor<D> {
     Tensor::from_dispatch(<Dispatch as NcmKernels>::ncm_packed(x.into_dispatch()))
 }
 
+/// [`packed`] for int tensors: `x` itself when packed row-major, otherwise a packed copy. The
+/// quantised layers' codes go through it once at load, so the kernels read them contiguously.
+pub fn packed_int<const D: usize>(x: Tensor<D, Int>) -> Tensor<D, Int> {
+    Tensor::from_dispatch(<Dispatch as NcmKernels>::ncm_packed_int(x.into_dispatch()))
+}
+
 /// [`assign_into`] for int tensors of the same dtype (i32).
 pub fn assign_int_into<const D: usize>(
     dst: &Tensor<D, Int>,
@@ -1413,8 +1482,9 @@ pub fn gemm_small_rows_ok(rows: usize) -> bool {
 
 /// `x` `[M, d_in]` times a quantised weight (`qweight` `[d_out, words]` i32, `scales`
 /// `[d_out, groups]` f32, in `format`): one dequantise-and-multiply GEMV kernel for up to
-/// [`GEMV_ROWS`](crate::quant::GEMV_ROWS) rows (decode), else the weight decoded at `x`'s dtype
-/// and Burn's matmul (prefill). Codes and scales are only read, so the call can be captured into
+/// [`GEMV_ROWS`](crate::quant::GEMV_ROWS) rows (decode), the small-M quantised GEMM (weight
+/// tiles decoded in shared memory) up to 64 rows, else the weight decoded at `x`'s dtype and
+/// Burn's matmul (long prefill). Codes and scales are only read, so the call can be captured into
 /// a CUDA graph.
 pub fn qmatmul(
     x: Tensor<2>,
@@ -1426,6 +1496,17 @@ pub fn qmatmul(
     let group_words = format.group_len(d_in) / format.per_word();
     if x.dims()[0] <= crate::quant::GEMV_ROWS {
         let y = <Dispatch as NcmKernels>::ncm_qgemv(
+            x.into_dispatch(),
+            qweight.into_dispatch(),
+            scales.into_dispatch(),
+            d_in,
+            format.bits,
+            group_words,
+        );
+        return Tensor::from_dispatch(y);
+    }
+    if x.dims()[0] <= quant::QGEMM_ROWS {
+        let y = <Dispatch as NcmKernels>::ncm_qgemm_small(
             x.into_dispatch(),
             qweight.into_dispatch(),
             scales.into_dispatch(),

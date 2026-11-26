@@ -55,12 +55,17 @@ impl QLinear {
         let f = p.format;
         let qweight = TensorData::new(p.words.clone(), [p.d_out, f.words(p.d_in)]);
         let scales = TensorData::new(p.scales.clone(), [p.d_out, f.groups(p.d_in)]);
+        let qweight = Tensor::<2, Int>::from_data(qweight, (device, DType::I32));
+        // Contiguous along the words on CUDA (new buffers may be pitched), once.
+        #[cfg(feature = "cuda")]
+        let qweight = if crate::fused::active(device) {
+            crate::kernels::packed_int(qweight)
+        } else {
+            qweight
+        };
         Self {
             weight: None,
-            qweight: Some(Param::initialized(
-                ParamId::new(),
-                Tensor::<2, Int>::from_data(qweight, (device, DType::I32)),
-            )),
+            qweight: Some(Param::initialized(ParamId::new(), qweight)),
             scales: Some(Param::from_tensor(Tensor::from_data(scales, (device, DType::F32)))),
             d_in: p.d_in,
             d_out: p.d_out,
