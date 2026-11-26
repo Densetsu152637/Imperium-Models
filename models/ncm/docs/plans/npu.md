@@ -535,10 +535,10 @@ Memory is all system RAM:
   - Write release notes listing the supported targets and their status.
   - Notify the Imperium and research sessions.
 - **Depends on:** stage 3, for `ort-cpu`, and stage 4, for the first NPU target. Later targets are added to the notes as 6a and 6b land.
-- **Owned paths:** `runtime/README.md`, the release notes; the Imperium PR is owned by the Imperium implementation session.
+- **Owned paths:** `runtime/README.md` and the release notes. Also a launch-line test in an Imperium-AI PR under `crates/imperium-local` tests, modelled on PR #335's launch-line test, which asserts that `runtime.ncm.device` becomes the matching `--device` argument. This stage owns that test; the Imperium implementation session reviews and merges the PR.
 - **Acceptance checks:**
   - With Imperium set to `runtime.ncm.device = "npu:intel"` (or `ort-cpu` without hardware), Imperium launches `ncm-server` with the matching `--device` and completes a chat.
-  - The e2e test of the Imperium launch line passes.
+  - The new `crates/imperium-local` launch-line test passes in Imperium-AI CI.
 - **Status:** pending
 - **Outcome:**
 - **Handoff notes:** NPU batching stays out of scope until a target shows batch-1 is dispatch-bound and the EP supports it.
