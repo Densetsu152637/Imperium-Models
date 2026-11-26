@@ -15,7 +15,7 @@ use ncm_model::{Config, TokConfig};
 
 use crate::ExportError;
 use crate::graph::{Graph, Val, WeightPool};
-use crate::layers::{AttnDims, Cx, DeltaDims, DeltaWeights};
+use crate::layers::{AttnDims, AttnExtras, Cx, DeltaDims, DeltaWeights};
 use crate::onnx::DType;
 use crate::quant::WeightForm;
 use crate::weights::{F32Tensor, Weights};
@@ -85,11 +85,6 @@ fn kinds_support(cfg: &TokConfig) -> Support {
     for (i, kind) in spec.kinds.iter().enumerate() {
         match kind {
             LayerKind::DeltaNet => {}
-            LayerKind::Attention { .. } if spec.gated => {
-                return Support::Unsupported(format!(
-                    "layer {i}: the v2 design's gated attention with QK-norm"
-                ));
-            }
             LayerKind::Attention { .. } => {}
             LayerKind::Retrieval => {
                 return Support::Unsupported(format!(
@@ -224,6 +219,8 @@ struct Plan<'a> {
     rope_of: Vec<Option<usize>>,
     ctx: usize,
     form: WeightForm,
+    /// The v2 design: attention layers have an output gate and QK-norm.
+    gated: bool,
 }
 
 impl Plan<'_> {
@@ -320,6 +317,22 @@ impl Plan<'_> {
                     let dm = self.attn_dims();
                     let qkv = self.names.mixer(i, "Attention", "qkv.weight")?;
                     let o = self.names.mixer(i, "Attention", "o.weight")?;
+                    // v2: output gate and QK-norm (`Attention::gated`).
+                    let v2 = if self.gated {
+                        Some((
+                            self.names.mixer(i, "Attention", "gate.weight")?,
+                            self.names.mixer(i, "Attention", "q_norm.gamma")?,
+                            self.names.mixer(i, "Attention", "k_norm.gamma")?,
+                        ))
+                    } else {
+                        None
+                    };
+                    let extras = v2.as_ref().map(|(gate, q_norm, k_norm)| AttnExtras {
+                        gate,
+                        q_norm,
+                        k_norm,
+                        eps: cfg.norm_eps,
+                    });
                     let (kvh, hd) = (dm.kv_heads as i64, dm.head_dim as i64);
                     let ring_shape = [1, kvh, *ring as i64, hd];
                     let bias_shape = [ti, (*ring + t) as i64];
@@ -344,6 +357,7 @@ impl Plan<'_> {
                         &rv,
                         &bias,
                         t,
+                        extras.as_ref(),
                     )?;
                     let new_shape = [1, kvh, ti, hd];
                     let (nk, nv) = (format!("l{i}.k_new"), format!("l{i}.v_new"));
@@ -462,6 +476,7 @@ pub fn export(
         rope_of,
         ctx: opts.ctx,
         form: opts.form,
+        gated: spec.gated,
     };
     let _ = (&plan.rope_of, plan.ctx);
     std::fs::create_dir_all(out).map_err(|e| ExportError::Io(format!("{}: {e}", out.display())))?;

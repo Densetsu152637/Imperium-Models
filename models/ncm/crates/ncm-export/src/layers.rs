@@ -396,6 +396,16 @@ pub struct AttnDims {
     pub head_dim: usize,
 }
 
+/// The v2 design's additions to an attention layer: a sigmoid output gate (`gate`, `[d, H*D]`)
+/// and QK-norm (an RMSNorm of each query and key head over `D` before RoPE). UNVERIFIED: written
+/// from `layers::Attention::{input, project_from}` without a run.
+pub struct AttnExtras<'a> {
+    pub gate: &'a F32Tensor,
+    pub q_norm: &'a F32Tensor,
+    pub k_norm: &'a F32Tensor,
+    pub eps: f64,
+}
+
 /// What an attention layer returns: its output and the new keys and values for the host to
 /// write into its ring.
 pub struct AttnOut {
@@ -424,6 +434,7 @@ impl Cx<'_> {
         ring_v: &Val,
         bias: &Val,
         t: usize,
+        extras: Option<&AttnExtras>,
     ) -> Result<AttnOut, ExportError> {
         let (h, kvh, hd) = (dm.heads as i64, dm.kv_heads as i64, dm.head_dim as i64);
         let groups = h / kvh;
@@ -437,6 +448,21 @@ impl Cx<'_> {
         let q = heads(self, 0, h);
         let k = heads(self, h, kvh);
         let v = heads(self, h + kvh, kvh);
+        // v2: QK-norm of each head row, then RoPE (`norm_rope`); the gate is computed from `x`.
+        let (q, k) = match extras {
+            Some(e) => (
+                self.rms_norm(&format!("{key}.q_norm.gamma"), &q, e.q_norm, e.eps),
+                self.rms_norm(&format!("{key}.k_norm.gamma"), &k, e.k_norm, e.eps),
+            ),
+            None => (q, k),
+        };
+        let gate = match extras {
+            Some(e) => {
+                let g = self.linear(&format!("{key}.gate.weight"), x, e.gate)?;
+                Some(self.g.sigmoid(&g))
+            }
+            None => None,
+        };
         let q = self.rope(&q, cos, sin, dm.head_dim);
         let k = self.rope(&k, cos, sin, dm.head_dim);
         let keys = self.g.concat(&[ring_k, &k], 2);
@@ -457,6 +483,10 @@ impl Cx<'_> {
         let out = self.g.reshape(&out, &[1, h, ti, hd]);
         let merged = self.g.transpose(&out, &[0, 2, 1, 3]);
         let merged = self.g.reshape(&merged, &[1, ti, h * hd]);
+        let merged = match &gate {
+            Some(g) => self.g.mul(&merged, g),
+            None => merged,
+        };
         let y = self.linear(&format!("{key}.o.weight"), &merged, o)?;
         Ok(AttnOut { y, k_new: k, v_new: v })
     }
@@ -573,6 +603,42 @@ mod tests {
     }
 
     #[test]
+    fn a_gated_qk_norm_attention_graph_is_well_formed() {
+        let dm = AttnDims { d: 32, heads: 4, kv_heads: 2, head_dim: 8 };
+        let (gate, qn, kn) = (tensor(&[32, 32], 9), tensor(&[8], 10), tensor(&[8], 11));
+        let extras = AttnExtras { gate: &gate, q_norm: &qn, k_norm: &kn, eps: 1e-6 };
+        let mut pool = WeightPool::default();
+        let mut g = Graph::new("attn_v2");
+        let x = g.input("x", DType::F32, &[1, 1, 32]);
+        let cos = g.input("cos", DType::F32, &[1, 1, 1, 8]);
+        let sin = g.input("sin", DType::F32, &[1, 1, 1, 8]);
+        let rk = g.input("ring_k", DType::F32, &[1, 2, 5, 8]);
+        let rv = g.input("ring_v", DType::F32, &[1, 2, 5, 8]);
+        let bias = g.input("bias", DType::F32, &[1, 6]);
+        let out = Cx { g: &mut g, pool: &mut pool, form: WeightForm::F32 }
+            .attention(
+                "a",
+                &dm,
+                &tensor(&[32, 64], 7),
+                &tensor(&[32, 32], 8),
+                &x,
+                &cos,
+                &sin,
+                &rk,
+                &rv,
+                &bias,
+                1,
+                Some(&extras),
+            )
+            .unwrap();
+        g.output("y", &out.y, DType::F32, &[1, 1, 32]);
+        g.validate().unwrap();
+        for k in ["a.gate.weight", "a.q_norm.gamma", "a.k_norm.gamma"] {
+            assert!(pool.tensor(k).is_some(), "{k}");
+        }
+    }
+
+    #[test]
     fn an_attention_graph_is_well_formed() {
         let dm = AttnDims { d: 32, heads: 4, kv_heads: 2, head_dim: 8 };
         let mut pool = WeightPool::default();
@@ -596,6 +662,7 @@ mod tests {
                 &rv,
                 &bias,
                 1,
+                None,
             )
             .unwrap();
         g.output("y", &out.y, DType::F32, &[1, 1, 32]);

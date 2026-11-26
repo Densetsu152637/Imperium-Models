@@ -288,3 +288,64 @@ fn the_f32_chunk_inverse_matches_forward_substitution() {
         got["inv"].iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()).fold(0.0, f64::max);
     assert!(worst <= 1e-4, "inverse max |delta| = {worst}");
 }
+
+/// The v2 gated attention with QK-norm over a prefill chunk (a one-slot ring hidden by the
+/// mask) against the Burn layer's own forward. UNVERIFIED: written without a run.
+#[test]
+fn gated_qk_norm_attention_matches_the_burn_layer() {
+    use ncm_export::layers::{AttnDims, AttnExtras};
+    use ncm_model::layers::{Attention, Rope};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let device = Device::flex();
+    device.seed(21);
+    let (d, h, kvh, hd, t) = (32usize, 4usize, 2usize, 8usize, 4usize);
+    let net = Attention::new(d, h, kvh, hd, None, &device).gated(d, 1e-6, &device);
+    let path = dir.path().join("attn.safetensors");
+    save_weights(&net, &Config::Tok(tiny_tok(8)), &path).unwrap();
+    let w = Weights::open(&path).unwrap();
+    let get = |n: &str| w.get(n).unwrap_or_else(|e| panic!("{n}: {e}"));
+    let (qkv, o, gate) = (get("qkv.weight"), get("o.weight"), get("gate.weight"));
+    let (qn, kn) = (get("q_norm.gamma"), get("k_norm.gamma"));
+    let extras = AttnExtras { gate: &gate, q_norm: &qn, k_norm: &kn, eps: 1e-6 };
+    let dm = AttnDims { d, heads: h, kv_heads: kvh, head_dim: hd };
+    let mut pool = WeightPool::default();
+    let mut g = Graph::new("attn");
+    let (ti, ring) = (t as i64, 1usize);
+    let x = g.input("x", DType::F32, &[1, ti, d as i64]);
+    let cos = g.input("cos", DType::F32, &[1, 1, ti, hd as i64]);
+    let sin = g.input("sin", DType::F32, &[1, 1, ti, hd as i64]);
+    let rk = g.input("rk", DType::F32, &[1, kvh as i64, ring as i64, hd as i64]);
+    let rv = g.input("rv", DType::F32, &[1, kvh as i64, ring as i64, hd as i64]);
+    let bias = g.input("bias", DType::F32, &[ti, (ring + t) as i64]);
+    let out = Cx { g: &mut g, pool: &mut pool, form: WeightForm::F32 }
+        .attention("a", &dm, &qkv, &o, &x, &cos, &sin, &rk, &rv, &bias, t, Some(&extras))
+        .unwrap();
+    g.output("y", &out.y, DType::F32, &[1, ti, d as i64]);
+    let mut s = session(&write_graph(dir.path(), "attn", &g, &pool));
+    let mut seed = 99u64;
+    let xs = pseudo(&mut seed, t * d);
+    let rope = Rope::new(0, t, hd, 10_000.0, 1.0, &device);
+    let (c, sn) = rope.to_vecs();
+    let mut b = vec![f32::NEG_INFINITY; t * (ring + t)];
+    for i in 0..t {
+        for j in 0..=i {
+            b[i * (ring + t) + ring + j] = 0.0;
+        }
+    }
+    let zeros = vec![0f32; kvh * ring * hd];
+    let got = run(
+        &mut s,
+        &[
+            ("x", &[1, t, d], &xs),
+            ("cos", &[1, 1, t, hd], &c),
+            ("sin", &[1, 1, t, hd], &sn),
+            ("rk", &[1, kvh, ring, hd], &zeros),
+            ("rv", &[1, kvh, ring, hd], &zeros),
+            ("bias", &[t, ring + t], &b),
+        ],
+    );
+    let want = net.forward(Tensor::from_data(TensorData::new(xs, [1, t, d]), &device), &rope, None);
+    let diff = max_diff(&got["y"], &host(want));
+    assert!(diff <= 1e-4, "gated attention max |dy| = {diff}");
+}
