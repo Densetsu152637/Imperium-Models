@@ -887,7 +887,7 @@ fn lockstep(
                 let mode = prepared[0].0;
                 let settings: Vec<_> = prepared.into_iter().map(|p| p.1).collect();
                 let refs: Vec<&FastSession> = pass.iter().map(|&i| &sessions[i]).collect();
-                let results = block_pass_slots(model, &refs, &pass, mode, &settings, &mut graphs);
+                let results = block_pass_slots(model, &refs, mode, &settings, &mut graphs);
                 for (&i, r) in pass.iter().zip(results) {
                     sessions[i].apply_pass(model, &mut runs[i], r, opts, &mut Hooks::default());
                 }
@@ -898,7 +898,7 @@ fn lockstep(
                 let settings: Vec<_> =
                     fill.iter().map(|&i| sessions[i].prepare_fill(model, &runs[i], opts)).collect();
                 let refs: Vec<&FastSession> = fill.iter().map(|&i| &sessions[i]).collect();
-                let (ids, _) = ar_pass_slots(model, &refs, &fill, false, &settings, &mut graphs);
+                let (ids, _) = ar_pass_slots(model, &refs, false, &settings, &mut graphs);
                 for (&i, row) in fill.iter().zip(ids) {
                     let p = runs[i].next_position();
                     let mut no_row = || -> Vec<f32> { unreachable!("a greedy fill reads no row") };
@@ -915,8 +915,9 @@ fn lockstep(
                 break;
             }
         }
-        for (i, run) in runs.into_iter().enumerate() {
-            let block = sessions[i].end_block(model, run);
+        // Close every block together (one batched backbone step).
+        let mut refs: Vec<&mut FastSession> = sessions.iter_mut().collect();
+        for (i, block) in FastSession::end_blocks(model, &mut refs, runs).into_iter().enumerate() {
             out[i].extend_from_slice(&block.tokens);
         }
     }
@@ -942,14 +943,11 @@ fn batched_slots_decode_what_single_sessions_do() {
             }
             want.push(tokens);
         }
-        let mut sessions: Vec<FastSession> = prompts
-            .iter()
-            .map(|p| {
-                let mut s = FastSession::new(&model, 10 * l, &device);
-                s.prefill(&model, p);
-                s
-            })
-            .collect();
+        // One pool, its rows shared by the slots, and pooled backbone caches.
+        let mut sessions = FastSession::pooled(&model, prompts.len(), 10 * l, &device);
+        for (s, p) in sessions.iter_mut().zip(prompts) {
+            s.prefill(&model, p);
+        }
         let got = lockstep(&model, &mut sessions, &opts, 2);
         assert_eq!(got, want, "{opts:?}");
     }

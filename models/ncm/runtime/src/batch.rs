@@ -228,21 +228,22 @@ impl Batcher {
         if let Some((model, first)) = core.take_hybrid() {
             let device = core.device.clone();
             let capacity = core.capacity;
-            let mut slots = vec![Slot {
-                caches: Caches::Hybrid(Box::new(first)),
-                kept: Vec::new(),
-                last_used: 0,
-                active: None,
-            }];
-            for _ in 1..count {
-                let session = FastSession::new(&model, capacity, &device);
-                slots.push(Slot {
+            // One pool of device buffers (rows per slot) and pooled backbone caches.
+            let sessions = if count <= 1 {
+                vec![first]
+            } else {
+                drop(first);
+                FastSession::pooled(&model, count, capacity, &device)
+            };
+            let slots = sessions
+                .into_iter()
+                .map(|session| Slot {
                     caches: Caches::Hybrid(Box::new(session)),
                     kept: Vec::new(),
                     last_used: 0,
                     active: None,
-                });
-            }
+                })
+                .collect();
             return Self {
                 core,
                 model: Model::Hybrid(model),
@@ -826,7 +827,7 @@ impl Batcher {
             let settings: Vec<DrawSettings> = group.iter().map(|d| d.2.clone()).collect();
             let results = {
                 let sessions = hybrid_sessions(&self.slots, &key);
-                block_pass_slots(model, &sessions, &key, mode, &settings, &mut self.hybrid_graphs)
+                block_pass_slots(model, &sessions, mode, &settings, &mut self.hybrid_graphs)
             };
             for (&i, result) in key.iter().zip(results) {
                 let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } =
@@ -864,9 +865,9 @@ impl Batcher {
             }
             let (tokens, logp) = {
                 let sessions = hybrid_sessions(&self.slots, &key);
-                ar_pass_slots(model, &sessions, &key, sampled, &settings, &mut self.hybrid_graphs)
+                ar_pass_slots(model, &sessions, sampled, &settings, &mut self.hybrid_graphs)
             };
-            for (r, (&i, row_tokens)) in key.iter().zip(tokens).enumerate() {
+            for ((&i, row_tokens), logp) in key.iter().zip(tokens).zip(logp) {
                 let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } =
                     &mut self.slots[i]
                 else {
@@ -876,10 +877,8 @@ impl Batcher {
                 let h = hybrid.as_mut().expect("a hybrid request");
                 let run = h.run.as_mut().expect("an open block");
                 let p = run.next_position();
-                let logp = &logp;
                 let mut row = || -> Vec<f32> {
                     logp.clone()
-                        .narrow(0, r, 1)
                         .narrow(1, p, 1)
                         .into_data()
                         .convert::<f32>()
@@ -891,34 +890,52 @@ impl Batcher {
                 });
             }
         }
-        // Blocks done: close them and emit their tokens.
-        for &i in rows {
-            if done.iter().any(|d| d.0 == i) {
-                continue;
-            }
-            let Slot { caches: Caches::Hybrid(session), active: Some(a), .. } = &mut self.slots[i]
-            else {
-                continue;
+        // Blocks done: close them together (one batched backbone step) and emit their tokens.
+        let closing: Vec<usize> =
+            rows.iter()
+                .copied()
+                .filter(|&i| !done.iter().any(|d| d.0 == i))
+                .filter(|&i| {
+                    self.slots[i].active.as_ref().and_then(|a| a.hybrid.as_ref()).is_some_and(|h| {
+                        h.run.as_ref().is_some_and(|r| r.phase() == BlockPhase::Done)
+                    })
+                })
+                .collect();
+        if !closing.is_empty() {
+            let runs: Vec<BlockRun> = closing
+                .iter()
+                .map(|&i| {
+                    let a = self.slots[i].active.as_mut().expect("decoding");
+                    a.hybrid.as_mut().expect("hybrid").run.take().expect("a done block")
+                })
+                .collect();
+            let blocks = {
+                let mut picked: Vec<Option<&mut Slot>> = self.slots.iter_mut().map(Some).collect();
+                let mut sessions: Vec<&mut FastSession> = closing
+                    .iter()
+                    .map(|&i| match &mut picked[i].take().expect("one row per slot").caches {
+                        Caches::Hybrid(c) => &mut **c,
+                        _ => unreachable!("slots hold caches of the hybrid"),
+                    })
+                    .collect();
+                FastSession::end_blocks(model, &mut sessions, runs)
             };
-            let Some(h) = a.hybrid.as_mut() else { continue };
-            if h.run.as_ref().is_none_or(|r| r.phase() != BlockPhase::Done) {
-                continue;
-            }
-            let run = h.run.take().expect("a done block");
-            let block = session.end_block(model, run);
-            h.acceptance.add(&block.stats);
-            let mut ended = None;
-            for &t in &block.tokens {
-                if let Some(f) = emit(a, t as u32, ids) {
-                    ended = Some(f);
-                    break;
+            for (&i, block) in closing.iter().zip(blocks) {
+                let a = self.slots[i].active.as_mut().expect("decoding");
+                a.hybrid.as_mut().expect("hybrid").acceptance.add(&block.stats);
+                let mut ended = None;
+                for &t in &block.tokens {
+                    if let Some(f) = emit(a, t as u32, ids) {
+                        ended = Some(f);
+                        break;
+                    }
                 }
-            }
-            if ended.is_none() && (block.stopped || block.tokens.is_empty()) {
-                ended = Some(Finish::Length);
-            }
-            if let Some(f) = ended {
-                done.push((i, f));
+                if ended.is_none() && (block.stopped || block.tokens.is_empty()) {
+                    ended = Some(Finish::Length);
+                }
+                if let Some(f) = ended {
+                    done.push((i, f));
+                }
             }
         }
         for (i, f) in done {

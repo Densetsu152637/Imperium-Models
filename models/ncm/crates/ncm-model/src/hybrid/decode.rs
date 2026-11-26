@@ -203,10 +203,33 @@ impl HybridSession {
     /// An empty stream with caches for up to `max_tokens`.
     pub fn new(model: &HybridLm, max_tokens: usize, device: &Device) -> Self {
         let l = model.config().block;
+        let backbone = model.backbone().make_caches(max_tokens / l + 1, 1, device);
+        Self::with_backbone(model, max_tokens, backbone, device)
+    }
+
+    /// `slots` sessions for a batcher: their backbone caches are rows of shared buffers on
+    /// CUDA ([`crate::layers::Stack::make_slot_caches`]), so a batched backbone step over
+    /// closing slots decodes each retrieval layer in one set of launches.
+    pub fn slots(model: &HybridLm, slots: usize, max_tokens: usize, device: &Device) -> Vec<Self> {
+        let l = model.config().block;
+        model
+            .backbone()
+            .make_slot_caches(slots, max_tokens / l + 1, device)
+            .into_iter()
+            .map(|backbone| Self::with_backbone(model, max_tokens, backbone, device))
+            .collect()
+    }
+
+    fn with_backbone(
+        model: &HybridLm,
+        max_tokens: usize,
+        backbone: Vec<LayerCache>,
+        device: &Device,
+    ) -> Self {
         Self {
             tokens: Vec::new(),
             encoder: model.encoder().make_caches(max_tokens, 1, device),
-            backbone: model.backbone().make_caches(max_tokens / l + 1, 1, device),
+            backbone,
             states: None,
             states_start: 0,
             encoded: 0,
@@ -392,6 +415,69 @@ impl HybridSession {
             let drop = keep_from - self.states_start;
             self.states = (held > drop).then(|| s.narrow(1, drop, held - drop));
             self.states_start = keep_from;
+        }
+    }
+
+    /// [`Self::close_block`] for several sessions at once: each encodes what it wrote, and the
+    /// sessions whose block is now complete (exactly one new block each) take their backbone
+    /// step together, one batched forward over their pooled blocks
+    /// ([`crate::layers::Stack::forward_slots`]). `closes[i]`: (block start, emitted tokens,
+    /// stopped, close span) of `sessions[i]`.
+    pub(crate) fn close_blocks(
+        model: &HybridLm,
+        sessions: &mut [&mut HybridSession],
+        closes: &[(usize, Vec<i32>, bool, bool)],
+    ) {
+        let l = model.config().block;
+        let mut stepping = Vec::new();
+        for (i, (s, (start, emitted, stopped, close_span))) in
+            sessions.iter_mut().zip(closes).enumerate()
+        {
+            s.tokens.extend_from_slice(emitted);
+            s.encode_pending(model);
+            let complete = s.encoded / l;
+            if s.tokens.len() - start >= l && complete == s.blocks + 1 {
+                stepping.push(i);
+            } else if s.tokens.len() - start >= l {
+                // Not a single new block (cannot happen after a block's decode): alone.
+                s.step_complete_blocks(model);
+            }
+            if s.tokens.len() - start >= l && *close_span {
+                s.verified_span = false;
+            }
+            if *stopped {
+                s.verified_span = false;
+            }
+        }
+        if stepping.is_empty() {
+            return;
+        }
+        let pooled: Vec<Tensor<3>> = stepping
+            .iter()
+            .map(|&i| {
+                let s = &sessions[i];
+                model.pool_blocks(s.states(s.blocks * l, (s.blocks + 1) * l).expect("block states"))
+            })
+            .collect();
+        let x = Tensor::cat(pooled.clone(), 0);
+        let h = {
+            let mut picked: Vec<Option<&mut HybridSession>> =
+                sessions.iter_mut().map(|s| Some(&mut **s)).collect();
+            let mut caches: Vec<&mut [LayerCache]> = stepping
+                .iter()
+                .map(|&i| picked[i].take().expect("one row per session").backbone.as_mut_slice())
+                .collect();
+            model.backbone().forward_slots(x, &mut caches)
+        };
+        for (r, &i) in stepping.iter().enumerate() {
+            let s = &mut sessions[i];
+            s.cond = h.clone().narrow(0, r, 1);
+            let host: Vec<f32> =
+                pooled[r].clone().into_data().convert::<f32>().try_to_vec::<f32>().expect("f32");
+            s.pooled.push(host);
+            s.blocks += 1;
+            // Trim the states as `step_complete_blocks` does.
+            s.step_complete_blocks(model);
         }
     }
 

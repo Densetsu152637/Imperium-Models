@@ -46,30 +46,39 @@ use super::model::{FastMemory, HybridLm, retrieved_tokens};
 use super::vq::Resampler;
 use crate::layers::Rope;
 
-/// Writes `src` into `dst`: in `dst`'s own buffer on CUDA with the fused kernels on (a graph
-/// reads it), by replacing it elsewhere. `axis`/`at`: where along `dst`.
-fn put<const D: usize>(dst: &mut Tensor<D>, src: Tensor<D>, axis: usize, at: usize) {
+/// Writes `src` into row `row` of the pooled `dst` (axis 0), at offset `at` along `axis`: in
+/// `dst`'s own buffer on CUDA with the fused kernels on (a graph reads it), by replacing it
+/// elsewhere.
+fn put<const D: usize>(dst: &mut Tensor<D>, row: usize, src: Tensor<D>, axis: usize, at: usize) {
     #[cfg(feature = "cuda")]
     if crate::fused::active(&dst.device()) {
-        crate::kernels::assign_into(dst, src, axis, at);
+        crate::kernels::assign_into(&dst.clone().narrow(0, row, 1), src, axis, at);
         return;
     }
     let n = src.dims()[axis];
     let mut ranges: Vec<std::ops::Range<usize>> = dst.dims().iter().map(|&d| 0..d).collect();
+    ranges[0] = row..row + 1;
     ranges[axis] = at..at + n;
     let ranges: [std::ops::Range<usize>; D] = ranges.try_into().expect("rank");
     *dst = dst.clone().slice_assign(ranges, src);
 }
 
 /// [`put`] for int tensors.
-fn put_int<const D: usize>(dst: &mut Tensor<D, Int>, src: Tensor<D, Int>, axis: usize, at: usize) {
+fn put_int<const D: usize>(
+    dst: &mut Tensor<D, Int>,
+    row: usize,
+    src: Tensor<D, Int>,
+    axis: usize,
+    at: usize,
+) {
     #[cfg(feature = "cuda")]
     if crate::fused::active(&dst.device()) {
-        crate::kernels::assign_int_into(dst, src, axis, at);
+        crate::kernels::assign_int_into(&dst.clone().narrow(0, row, 1), src, axis, at);
         return;
     }
     let n = src.dims()[axis];
     let mut ranges: Vec<std::ops::Range<usize>> = dst.dims().iter().map(|&d| 0..d).collect();
+    ranges[0] = row..row + 1;
     ranges[axis] = at..at + n;
     let ranges: [std::ops::Range<usize>; D] = ranges.try_into().expect("rank");
     *dst = dst.clone().slice_assign(ranges, src);
@@ -83,36 +92,35 @@ fn ints<const D: usize>(values: Vec<i32>, shape: [usize; D], device: &Device) ->
     Tensor::from_data(TensorData::new(values, shape), device)
 }
 
-/// Rewrites `rope`'s tables with those of `positions` (in place on CUDA, where a graph reads
-/// them; replaced elsewhere).
+/// Rewrites row `row` of the pooled `rope` tables with those of `positions`.
 fn restage(
     rope: &mut RopeTables,
+    row: usize,
     positions: &[usize],
     head_dim: usize,
     base: f64,
     device: &Device,
 ) {
     let fresh = RopeTables::at(positions, head_dim, base, device);
-    put(&mut rope.cos, fresh.cos, 2, 0);
-    put(&mut rope.sin, fresh.sin, 2, 0);
+    put(&mut rope.cos, row, fresh.cos, 2, 0);
+    put(&mut rope.sin, row, fresh.sin, 2, 0);
 }
 
 /// The recent encoder states' memory keys and values, per layer, in rings of `recent + L`
-/// slots (token t in slot t mod capacity), with the copy keys and the tokens that followed.
+/// slots (token t in slot t mod capacity), with the copy keys and the tokens that followed;
+/// one row per slot of the pool.
 struct Rings {
     generator: Vec<(Tensor<4>, Tensor<4>)>,
     dec: Vec<(Tensor<4>, Tensor<4>)>,
     copy_keys: Tensor<3>,
     next: Tensor<2, Int>,
-    /// Visibility for the memory attention and for the copy head `[1, capacity]`.
+    /// Visibility for the memory attention and for the copy head `[rows, capacity]`.
     seq_bias: Tensor<2>,
     copy_bias: Tensor<2>,
     capacity: usize,
-    /// Tokens projected so far (token t is in its slot when `t < upto`).
-    upto: usize,
 }
 
-/// The per-block inputs, in fixed buffers.
+/// The per-block inputs, in fixed buffers, one row per slot of the pool.
 struct Inputs {
     cond: Tensor<3>,
     retrieved: Tensor<2, Int>,
@@ -134,7 +142,7 @@ struct Inputs {
     draft: Tensor<2, Int>,
 }
 
-/// Tables fixed for the model (one copy per session; a batch uses its first slot's).
+/// Tables fixed for the model.
 struct Consts {
     resampler: Resampler,
     level_ropes: Vec<Rope>,
@@ -149,6 +157,100 @@ struct Consts {
     slots_bias: Tensor<2>,
     /// ln τ `[1, 1]` for parallel mode.
     ln_tau: Tensor<2>,
+}
+
+/// The fast path's device buffers of `rows` slots, each slot's in one row of shared pools
+/// (memory rings, visibility biases, per-block inputs, RoPE tables): a pass over any of the
+/// slots reads them in place, all rows at once, and the rows of slots not in the pass are
+/// computed and ignored (their slot entries keep every softmax finite). A graph captured over
+/// the pool serves every slot set.
+pub struct SlotPool {
+    rows: usize,
+    rings: Rings,
+    inputs: Inputs,
+    consts: Consts,
+    device: Device,
+}
+
+/// A pool shared by its slots' sessions (one thread: the engine's worker).
+pub type SharedPool = std::rc::Rc<std::cell::RefCell<SlotPool>>;
+
+impl SlotPool {
+    pub fn new(model: &HybridLm, rows: usize, device: &Device) -> SharedPool {
+        let h = model.config().clone();
+        let (l, d, hd) = (h.block, model.local_dim, model.head_dim);
+        let capacity = h.recent + l;
+        let ring = |kvh: usize| {
+            (
+                Tensor::<4>::zeros([rows, kvh, capacity, hd], device),
+                Tensor::<4>::zeros([rows, kvh, capacity, hd], device),
+            )
+        };
+        let generator = model.generator_cross().iter().map(|c| ring(c.kv_heads())).collect();
+        let dec = model.decoder_cross().iter().map(|c| ring(c.kv_heads())).collect();
+        let neg = vec![f32::NEG_INFINITY; rows * capacity];
+        let rings = Rings {
+            generator,
+            dec,
+            copy_keys: Tensor::zeros([rows, capacity, h.copy_dim], device),
+            next: Tensor::zeros([rows, capacity], device),
+            seq_bias: floats(neg.clone(), [rows, capacity], device),
+            copy_bias: floats(neg, [rows, capacity], device),
+            capacity,
+        };
+        let rt = h.retrieved_blocks * l;
+        let e = h.slots + rt + (l - 1);
+        let base = model.rope_base;
+        let tables = |n: usize| {
+            let t = RopeTables::at(&vec![0usize; n], hd, base, device);
+            RopeTables { cos: t.cos.repeat_dim(0, rows), sin: t.sin.repeat_dim(0, rows) }
+        };
+        let width = rt.max(1);
+        let inputs = Inputs {
+            cond: Tensor::zeros([rows, 1, model.start_condition(1).dims()[2]], device),
+            retrieved: Tensor::zeros([rows, width], device),
+            retrieved_next: Tensor::zeros([rows, width], device),
+            retrieved_bias: floats(vec![f32::NEG_INFINITY; rows * width], [rows, width], device),
+            known_states: Tensor::zeros([rows, l - 1, d], device),
+            known_tokens: Tensor::zeros([rows, l], device),
+            p: Tensor::zeros([rows, 1], device),
+            extra_rope: tables(e),
+            gen_q: tables(l),
+            dec_q: tables(l),
+            ar_tokens: Tensor::zeros([rows, l], device),
+            draft: Tensor::zeros([rows, l], device),
+        };
+        let (dec_rope, causal) = model.decoder_self(device);
+        let pos: Vec<i32> = (0..l as i32).collect();
+        let consts = Consts {
+            resampler: model.tokenizer().resampler(device),
+            level_ropes: h
+                .levels
+                .iter()
+                .map(|&n| Rope::at(&(0..n).collect::<Vec<_>>(), hd, base, device))
+                .collect(),
+            tok_rope: model.tokenizer().decoder_rope(device),
+            dec_rope,
+            causal,
+            pos: ints(pos.clone(), [1, l], device),
+            known_pos: ints(pos[..l - 1].to_vec(), [1, l - 1], device),
+            rank: ints(pos.iter().map(|p| l as i32 - p).collect(), [1, l], device),
+            slots_bias: Tensor::zeros([1, h.slots], device),
+            ln_tau: floats(vec![(h.tau.max(1e-9)).ln() as f32], [1, 1], device),
+        };
+        std::rc::Rc::new(std::cell::RefCell::new(SlotPool {
+            rows,
+            rings,
+            inputs,
+            consts,
+            device: device.clone(),
+        }))
+    }
+
+    /// Rows (slots) of the pool.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
 }
 
 /// How a block pass judges the draft.
@@ -211,24 +313,49 @@ pub struct DrawSettings {
 }
 
 impl DrawSettings {
-    /// The settings of several slots, row blocks in slot order.
-    fn stack(parts: &[DrawSettings]) -> DrawSettings {
+    /// The settings of every row of a pool of `rows` slots: each slot of `parts` (its row and
+    /// settings) at its row, greedy draws (top-k 1) for the other rows.
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    fn rows(
+        parts: &[(usize, &DrawSettings)],
+        rows: usize,
+        levels: &[usize],
+        l: usize,
+    ) -> DrawSettings {
         #[cfg(feature = "cuda")]
         {
-            let levels = parts.iter().map(|p| p.codes.len()).max().unwrap_or(0);
-            let codes = (0..levels)
-                .map(|k| {
-                    parts.iter().flat_map(|p| p.codes.get(k).cloned().unwrap_or_default()).collect()
-                })
-                .collect();
-            let tokens = parts.iter().flat_map(|p| p.tokens.clone()).collect();
+            use crate::sample::SampleSettings;
+            let fill = |n: usize, get: &dyn Fn(&DrawSettings) -> Option<Vec<SampleSettings>>| {
+                let mut out = Vec::with_capacity(rows * n);
+                for r in 0..rows {
+                    let own = parts.iter().find(|p| p.0 == r).and_then(|p| get(p.1));
+                    match own {
+                        Some(v) if v.len() == n => out.extend(v),
+                        _ => out.extend(std::iter::repeat_n(SampleSettings::GREEDY, n)),
+                    }
+                }
+                out
+            };
+            let sampled_codes = parts.iter().any(|p| !p.1.codes.is_empty());
+            let sampled_tokens = parts.iter().any(|p| !p.1.tokens.is_empty());
+            let codes = if sampled_codes {
+                levels
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &n)| fill(n, &|d| d.codes.get(k).cloned()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let tokens = if sampled_tokens {
+                fill(l, &|d| (!d.tokens.is_empty()).then(|| d.tokens.clone()))
+            } else {
+                Vec::new()
+            };
             DrawSettings { codes, tokens }
         }
         #[cfg(not(feature = "cuda"))]
-        {
-            let _ = parts;
-            DrawSettings {}
-        }
+        DrawSettings {}
     }
 }
 
@@ -270,14 +397,15 @@ impl Samplers {
     }
 }
 
-/// Captured passes per slot set and mode (CUDA), kept by their owner: a [`FastSession`] for
-/// its own passes, the batcher for its slots'.
+/// Captured passes per mode (CUDA) over one [`SlotPool`], kept by the pool's owner: a
+/// [`FastSession`] for its own pool, the batcher for its slots'. A pass reads every row of the
+/// pool, so one graph per mode serves every slot set.
 #[derive(Default)]
 pub struct PassGraphs {
     #[cfg(feature = "cuda")]
-    block: Vec<(Vec<usize>, PassMode, Result<BlockGraph, String>)>,
+    block: Vec<(PassMode, Result<BlockGraph, String>)>,
     #[cfg(feature = "cuda")]
-    ar: Vec<(Vec<usize>, bool, Result<ArGraph, String>)>,
+    ar: Vec<(bool, Result<ArGraph, String>)>,
 }
 
 /// A captured block pass, its samplers and output.
@@ -287,17 +415,13 @@ type BlockGraph = (crate::graph::Captured, Samplers, Tensor<2, Int>);
 #[cfg(feature = "cuda")]
 type ArGraph = (crate::graph::Captured, Samplers, (Tensor<2, Int>, Tensor<3>));
 
-/// Slot sets [`PassGraphs`] keeps per pass kind; the oldest goes first.
-#[cfg(feature = "cuda")]
-const KEPT_GRAPHS: usize = 24;
-
 impl PassGraphs {
     /// Why a pass runs eagerly, if a capture failed.
     pub fn failure(&self) -> Option<String> {
         #[cfg(feature = "cuda")]
         {
-            let block = self.block.iter().find_map(|(_, _, g)| g.as_ref().err().cloned());
-            let ar = self.ar.iter().find_map(|(_, _, g)| g.as_ref().err().cloned());
+            let block = self.block.iter().find_map(|(_, g)| g.as_ref().err().cloned());
+            let ar = self.ar.iter().find_map(|(_, g)| g.as_ref().err().cloned());
             block.or(ar)
         }
         #[cfg(not(feature = "cuda"))]
@@ -305,8 +429,7 @@ impl PassGraphs {
     }
 }
 
-/// The inputs of a pass over a batch of slots: each slot's fixed buffers stacked along the
-/// batch (or, for one slot, its buffers themselves).
+/// The inputs of a pass: the pool's buffers themselves (handles, no copies).
 struct PassInputs {
     b: usize,
     cond: Tensor<3>,
@@ -329,53 +452,29 @@ struct PassInputs {
     copy_bias: Tensor<2>,
 }
 
-fn stack<const D: usize, K: burn::tensor::kind::Basic>(parts: Vec<Tensor<D, K>>) -> Tensor<D, K> {
-    if parts.len() == 1 { parts.into_iter().next().expect("one") } else { Tensor::cat(parts, 0) }
-}
-
 impl PassInputs {
-    fn of(sessions: &[&FastSession]) -> Self {
-        let f =
-            |g: &dyn Fn(&FastSession) -> Tensor<3>| stack(sessions.iter().map(|s| g(s)).collect());
-        let f2 =
-            |g: &dyn Fn(&FastSession) -> Tensor<2>| stack(sessions.iter().map(|s| g(s)).collect());
-        let i2 = |g: &dyn Fn(&FastSession) -> Tensor<2, Int>| {
-            stack(sessions.iter().map(|s| g(s)).collect())
-        };
-        let rings = |g: &dyn Fn(&FastSession) -> &Vec<(Tensor<4>, Tensor<4>)>| {
-            let layers = g(sessions[0]).len();
-            (0..layers)
-                .map(|l| {
-                    let k = stack(sessions.iter().map(|s| g(s)[l].0.clone()).collect());
-                    let v = stack(sessions.iter().map(|s| g(s)[l].1.clone()).collect());
-                    (k, v)
-                })
-                .collect()
-        };
-        let tables = |g: &dyn Fn(&FastSession) -> &RopeTables| {
-            let list: Vec<&RopeTables> = sessions.iter().map(|s| g(s)).collect();
-            RopeTables::stack(&list)
-        };
+    fn of(pool: &SlotPool) -> Self {
+        let (i, r) = (&pool.inputs, &pool.rings);
         PassInputs {
-            b: sessions.len(),
-            cond: f(&|s| s.inputs.cond.clone()),
-            retrieved: i2(&|s| s.inputs.retrieved.clone()),
-            retrieved_next: i2(&|s| s.inputs.retrieved_next.clone()),
-            retrieved_bias: f2(&|s| s.inputs.retrieved_bias.clone()),
-            known_states: f(&|s| s.inputs.known_states.clone()),
-            known_tokens: i2(&|s| s.inputs.known_tokens.clone()),
-            p: i2(&|s| s.inputs.p.clone()),
-            extra_rope: tables(&|s| &s.inputs.extra_rope),
-            gen_q: tables(&|s| &s.inputs.gen_q),
-            dec_q: tables(&|s| &s.inputs.dec_q),
-            ar_tokens: i2(&|s| s.inputs.ar_tokens.clone()),
-            draft: i2(&|s| s.inputs.draft.clone()),
-            generator: rings(&|s| &s.rings.generator),
-            dec: rings(&|s| &s.rings.dec),
-            copy_keys: f(&|s| s.rings.copy_keys.clone()),
-            next: i2(&|s| s.rings.next.clone()),
-            seq_bias: f2(&|s| s.rings.seq_bias.clone()),
-            copy_bias: f2(&|s| s.rings.copy_bias.clone()),
+            b: pool.rows,
+            cond: i.cond.clone(),
+            retrieved: i.retrieved.clone(),
+            retrieved_next: i.retrieved_next.clone(),
+            retrieved_bias: i.retrieved_bias.clone(),
+            known_states: i.known_states.clone(),
+            known_tokens: i.known_tokens.clone(),
+            p: i.p.clone(),
+            extra_rope: i.extra_rope.clone(),
+            gen_q: i.gen_q.clone(),
+            dec_q: i.dec_q.clone(),
+            ar_tokens: i.ar_tokens.clone(),
+            draft: i.draft.clone(),
+            generator: r.generator.clone(),
+            dec: r.dec.clone(),
+            copy_keys: r.copy_keys.clone(),
+            next: r.next.clone(),
+            seq_bias: r.seq_bias.clone(),
+            copy_bias: r.copy_bias.clone(),
         }
     }
 }
@@ -574,109 +673,111 @@ fn read_results(out: Tensor<2, Int>, l: usize) -> Vec<PassResult> {
         .collect()
 }
 
-/// The block pass over the slots `sessions` (staged with [`FastSession::prepare_pass`]),
-/// identified by `key` for the graphs (a captured graph serves the same slots and mode again),
-/// with their draws' settings: one result per slot.
+/// The block pass over the slots `sessions` (staged with [`FastSession::prepare_pass`], all of
+/// one pool) with their draws' settings: one result per slot. The pass runs over every row of
+/// the pool (a captured graph per mode serves any slot set).
 pub fn block_pass_slots(
     model: &HybridLm,
     sessions: &[&FastSession],
-    key: &[usize],
     mode: PassMode,
     settings: &[DrawSettings],
     graphs: &mut PassGraphs,
 ) -> Vec<PassResult> {
-    let l = model.config().block;
-    let device = sessions[0].device.clone();
-    let settings = DrawSettings::stack(settings);
-    #[cfg(feature = "cuda")]
-    if crate::fused::graphs_active(&device) {
-        if !graphs.block.iter().any(|(k, m, _)| k == key && *m == mode) {
-            if graphs.block.len() >= KEPT_GRAPHS {
-                drop(graphs.block.remove(0));
-            }
-            let samplers = Samplers::new(&model.config().levels, sessions.len(), l, &device);
-            samplers.set(&settings);
-            let consts = &sessions[0].consts;
-            let captured = crate::graph::record(
-                &device,
-                &mut (),
-                2,
-                |_| block_pass(model, consts, &PassInputs::of(sessions), mode, &samplers),
-                |_| {},
-            )
-            .map(|(g, out)| (g, samplers, out));
-            graphs.block.push((key.to_vec(), mode, captured));
-        }
-        if let Some((_, _, Ok((graph, samplers, out)))) =
-            graphs.block.iter().find(|(k, m, _)| k == key && *m == mode)
-        {
-            samplers.set(&settings);
-            // Safety: the graph reads the slots' fixed buffers, their rings, its samplers and
-            // the model's weights, all alive (the replay checks its thread).
-            unsafe { crate::graph::replay(&device, graph, "hybrid block") };
-            return read_results(out.clone(), l);
-        }
-    }
-    let _ = (key, &graphs);
-    let samplers = Samplers::new(&model.config().levels, sessions.len(), l, &device);
-    samplers.set(&settings);
-    read_results(
-        block_pass(model, &sessions[0].consts, &PassInputs::of(sessions), mode, &samplers),
-        l,
-    )
-}
-
-/// The autoregressive pass over the slots `sessions` (staged with [`FastSession::prepare_fill`]):
-/// per slot its tokens `[L]` (argmax or device draw), and the log-probabilities `[B, L, V]`.
-pub fn ar_pass_slots(
-    model: &HybridLm,
-    sessions: &[&FastSession],
-    key: &[usize],
-    sampled: bool,
-    settings: &[DrawSettings],
-    graphs: &mut PassGraphs,
-) -> (Vec<Vec<i32>>, Tensor<3>) {
-    let l = model.config().block;
-    let device = sessions[0].device.clone();
-    let settings = DrawSettings::stack(settings);
-    let read = |ids: Tensor<2, Int>| -> Vec<Vec<i32>> {
-        let v: Vec<i32> = ids.into_data().convert::<i32>().try_to_vec::<i32>().expect("ints");
-        v.chunks(l).map(<[i32]>::to_vec).collect()
+    let h = model.config();
+    let l = h.block;
+    let pool = sessions[0].pool.borrow();
+    let device = pool.device.clone();
+    let parts: Vec<(usize, &DrawSettings)> =
+        sessions.iter().map(|s| s.row).zip(settings.iter()).collect();
+    let settings = DrawSettings::rows(&parts, pool.rows, &h.levels, l);
+    let pick = |all: Vec<PassResult>| -> Vec<PassResult> {
+        sessions.iter().map(|s| all[s.row].clone()).collect()
     };
     #[cfg(feature = "cuda")]
     if crate::fused::graphs_active(&device) {
-        if !graphs.ar.iter().any(|(k, s, _)| k == key && *s == sampled) {
-            if graphs.ar.len() >= KEPT_GRAPHS {
-                drop(graphs.ar.remove(0));
-            }
-            let samplers = Samplers::new(&model.config().levels, sessions.len(), l, &device);
+        if !graphs.block.iter().any(|(m, _)| *m == mode) {
+            let samplers = Samplers::new(&h.levels, pool.rows, l, &device);
             samplers.set(&settings);
-            let consts = &sessions[0].consts;
+            let p = &*pool;
             let captured = crate::graph::record(
                 &device,
                 &mut (),
                 2,
-                |_| ar_pass(model, consts, &PassInputs::of(sessions), sampled, &samplers),
+                |_| block_pass(model, &p.consts, &PassInputs::of(p), mode, &samplers),
                 |_| {},
             )
             .map(|(g, out)| (g, samplers, out));
-            graphs.ar.push((key.to_vec(), sampled, captured));
+            graphs.block.push((mode, captured));
         }
-        if let Some((_, _, Ok((graph, samplers, out)))) =
-            graphs.ar.iter().find(|(k, s, _)| k == key && *s == sampled)
+        if let Some((_, Ok((graph, samplers, out)))) = graphs.block.iter().find(|(m, _)| *m == mode)
+        {
+            samplers.set(&settings);
+            // Safety: the graph reads the pool's buffers, its samplers and the model's weights,
+            // all alive (the replay checks its thread).
+            unsafe { crate::graph::replay(&device, graph, "hybrid block") };
+            return pick(read_results(out.clone(), l));
+        }
+    }
+    let _ = &graphs;
+    let samplers = Samplers::new(&h.levels, pool.rows, l, &device);
+    samplers.set(&settings);
+    pick(read_results(block_pass(model, &pool.consts, &PassInputs::of(&pool), mode, &samplers), l))
+}
+
+/// The autoregressive pass over the slots `sessions` (staged with [`FastSession::prepare_fill`],
+/// all of one pool): per slot its tokens `[L]` (argmax or device draw) and log-probabilities
+/// `[1, L, V]`.
+pub fn ar_pass_slots(
+    model: &HybridLm,
+    sessions: &[&FastSession],
+    sampled: bool,
+    settings: &[DrawSettings],
+    graphs: &mut PassGraphs,
+) -> (Vec<Vec<i32>>, Vec<Tensor<3>>) {
+    let h = model.config();
+    let l = h.block;
+    let pool = sessions[0].pool.borrow();
+    let device = pool.device.clone();
+    let parts: Vec<(usize, &DrawSettings)> =
+        sessions.iter().map(|s| s.row).zip(settings.iter()).collect();
+    let settings = DrawSettings::rows(&parts, pool.rows, &h.levels, l);
+    let pick = |ids: Tensor<2, Int>, logp: Tensor<3>| -> (Vec<Vec<i32>>, Vec<Tensor<3>>) {
+        let v: Vec<i32> = ids.into_data().convert::<i32>().try_to_vec::<i32>().expect("ints");
+        let rows: Vec<Vec<i32>> = v.chunks(l).map(<[i32]>::to_vec).collect();
+        (
+            sessions.iter().map(|s| rows[s.row].clone()).collect(),
+            sessions.iter().map(|s| logp.clone().narrow(0, s.row, 1)).collect(),
+        )
+    };
+    #[cfg(feature = "cuda")]
+    if crate::fused::graphs_active(&device) {
+        if !graphs.ar.iter().any(|(s, _)| *s == sampled) {
+            let samplers = Samplers::new(&h.levels, pool.rows, l, &device);
+            samplers.set(&settings);
+            let p = &*pool;
+            let captured = crate::graph::record(
+                &device,
+                &mut (),
+                2,
+                |_| ar_pass(model, &p.consts, &PassInputs::of(p), sampled, &samplers),
+                |_| {},
+            )
+            .map(|(g, out)| (g, samplers, out));
+            graphs.ar.push((sampled, captured));
+        }
+        if let Some((_, Ok((graph, samplers, out)))) = graphs.ar.iter().find(|(s, _)| *s == sampled)
         {
             samplers.set(&settings);
             // Safety: as for the block graph.
             unsafe { crate::graph::replay(&device, graph, "hybrid ar") };
-            return (read(out.0.clone()), out.1.clone());
+            return pick(out.0.clone(), out.1.clone());
         }
     }
-    let _ = (key, &graphs);
-    let samplers = Samplers::new(&model.config().levels, sessions.len(), l, &device);
+    let _ = &graphs;
+    let samplers = Samplers::new(&h.levels, pool.rows, l, &device);
     samplers.set(&settings);
-    let (ids, logp) =
-        ar_pass(model, &sessions[0].consts, &PassInputs::of(sessions), sampled, &samplers);
-    (read(ids), logp)
+    let (ids, logp) = ar_pass(model, &pool.consts, &PassInputs::of(&pool), sampled, &samplers);
+    pick(ids, logp)
 }
 
 // ---------------------------------------------------------------------- one block, host side
@@ -741,9 +842,12 @@ impl BlockRun {
 /// keeps the tokens, the encoder and backbone caches and the retrieval history.
 pub struct FastSession {
     pub session: HybridSession,
-    rings: Rings,
-    inputs: Inputs,
-    consts: Consts,
+    /// The pool holding this slot's buffers, and its row there.
+    pool: SharedPool,
+    row: usize,
+    /// Tokens projected into this slot's rings so far (token t is in its slot when `t < upto`).
+    upto: usize,
+    block: usize,
     /// Device draws of the request so far (the token draws' counters).
     draws: u32,
     /// This session's own captured passes (as a slot of a batcher, the batcher's are used).
@@ -753,71 +857,32 @@ pub struct FastSession {
 
 impl FastSession {
     pub fn new(model: &HybridLm, max_tokens: usize, device: &Device) -> Self {
-        let h = model.config().clone();
-        let (l, d, hd) = (h.block, model.local_dim, model.head_dim);
-        let capacity = h.recent + l;
-        let ring = |kvh: usize| {
-            (
-                Tensor::<4>::zeros([1, kvh, capacity, hd], device),
-                Tensor::<4>::zeros([1, kvh, capacity, hd], device),
-            )
-        };
-        let generator = model.generator_cross().iter().map(|c| ring(c.kv_heads())).collect();
-        let dec = model.decoder_cross().iter().map(|c| ring(c.kv_heads())).collect();
-        let neg = vec![f32::NEG_INFINITY; capacity];
-        let rings = Rings {
-            generator,
-            dec,
-            copy_keys: Tensor::zeros([1, capacity, h.copy_dim], device),
-            next: Tensor::zeros([1, capacity], device),
-            seq_bias: floats(neg.clone(), [1, capacity], device),
-            copy_bias: floats(neg, [1, capacity], device),
-            capacity,
-            upto: 0,
-        };
-        let rt = h.retrieved_blocks * l;
-        let e = h.slots + rt + (l - 1);
-        let base = model.rope_base;
-        let inputs = Inputs {
-            cond: Tensor::zeros([1, 1, model.start_condition(1).dims()[2]], device),
-            retrieved: Tensor::zeros([1, rt.max(1)], device),
-            retrieved_next: Tensor::zeros([1, rt.max(1)], device),
-            retrieved_bias: floats(vec![f32::NEG_INFINITY; rt.max(1)], [1, rt.max(1)], device),
-            known_states: Tensor::zeros([1, l - 1, d], device),
-            known_tokens: Tensor::zeros([1, l], device),
-            p: Tensor::zeros([1, 1], device),
-            extra_rope: RopeTables::at(&vec![0usize; e], hd, base, device),
-            gen_q: RopeTables::at(&vec![0; l], hd, base, device),
-            dec_q: RopeTables::at(&(0..l).collect::<Vec<_>>(), hd, base, device),
-            ar_tokens: Tensor::zeros([1, l], device),
-            draft: Tensor::zeros([1, l], device),
-        };
-        let (dec_rope, causal) = model.decoder_self(device);
-        let pos: Vec<i32> = (0..l as i32).collect();
-        let consts = Consts {
-            resampler: model.tokenizer().resampler(device),
-            level_ropes: h
-                .levels
-                .iter()
-                .map(|&n| Rope::at(&(0..n).collect::<Vec<_>>(), hd, base, device))
-                .collect(),
-            tok_rope: model.tokenizer().decoder_rope(device),
-            dec_rope,
-            causal,
-            pos: ints(pos.clone(), [1, l], device),
-            known_pos: ints(pos[..l - 1].to_vec(), [1, l - 1], device),
-            rank: ints(pos.iter().map(|p| l as i32 - p).collect(), [1, l], device),
-            slots_bias: Tensor::zeros([1, h.slots], device),
-            ln_tau: floats(vec![(h.tau.max(1e-9)).ln() as f32], [1, 1], device),
-        };
+        let pool = SlotPool::new(model, 1, device);
+        Self::in_pool(model, pool, 0, HybridSession::new(model, max_tokens, device))
+    }
+
+    /// `slots` sessions over one shared [`SlotPool`] (rows 0..slots) and pooled backbone
+    /// caches ([`HybridSession::slots`]): a batcher's slots.
+    pub fn pooled(model: &HybridLm, slots: usize, max_tokens: usize, device: &Device) -> Vec<Self> {
+        let pool = SlotPool::new(model, slots, device);
+        HybridSession::slots(model, slots, max_tokens, device)
+            .into_iter()
+            .enumerate()
+            .map(|(row, session)| Self::in_pool(model, pool.clone(), row, session))
+            .collect()
+    }
+
+    fn in_pool(model: &HybridLm, pool: SharedPool, row: usize, session: HybridSession) -> Self {
+        let device = pool.borrow().device.clone();
         Self {
-            session: HybridSession::new(model, max_tokens, device),
-            rings,
-            inputs,
-            consts,
+            session,
+            pool,
+            row,
+            upto: 0,
+            block: model.config().block,
             draws: 0,
             graphs: PassGraphs::default(),
-            device: device.clone(),
+            device,
         }
     }
 
@@ -839,7 +904,7 @@ impl FastSession {
     /// held encoder states at the next block (slots written since may hold later tokens).
     pub fn restore(&mut self, snapshot: &super::decode::HybridSnapshot) {
         self.session.restore(snapshot);
-        self.rings.upto = self.session.states_start;
+        self.upto = self.session.states_start;
     }
 
     /// This session made a copy of `src` (another session of the same model and size: a
@@ -847,7 +912,7 @@ impl FastSession {
     /// states at the next block.
     pub fn copy_from(&mut self, src: &FastSession) {
         self.session.copy_from(&src.session);
-        self.rings.upto = self.session.states_start;
+        self.upto = self.session.states_start;
         self.draws = 0;
     }
 
@@ -855,7 +920,7 @@ impl FastSession {
     /// contents are hidden by the next block's staged visibility.
     pub fn reset(&mut self, model: &HybridLm) {
         self.session.reset(model);
-        self.rings.upto = 0;
+        self.upto = 0;
     }
 
     /// Starts a new request's draws (seeded by `seed`).
@@ -869,13 +934,15 @@ impl FastSession {
     /// Projects the encoded states not yet in the rings (those still held) into their slots.
     fn sync_rings(&mut self, model: &HybridLm) {
         let s = &self.session;
-        let from = self.rings.upto.max(s.states_start);
+        let mut pool = self.pool.borrow_mut();
+        let row = self.row;
+        let from = self.upto.max(s.states_start);
         let to = s.encoded;
-        let cap = self.rings.capacity;
+        let cap = pool.rings.capacity;
         // Only the last `capacity` tokens survive in the ring.
         let from = from.max(to.saturating_sub(cap));
         if to <= from {
-            self.rings.upto = self.rings.upto.max(to);
+            self.upto = self.upto.max(to);
             return;
         }
         let states = s.states(from, to).expect("held states");
@@ -893,20 +960,21 @@ impl FastSession {
         }
         let write = |ring: &mut (Tensor<4>, Tensor<4>), kv: (Tensor<4>, Tensor<4>)| {
             for &(off, slot, len) in &pieces {
-                put(&mut ring.0, kv.0.clone().narrow(2, off, len), 2, slot);
-                put(&mut ring.1, kv.1.clone().narrow(2, off, len), 2, slot);
+                put(&mut ring.0, row, kv.0.clone().narrow(2, off, len), 2, slot);
+                put(&mut ring.1, row, kv.1.clone().narrow(2, off, len), 2, slot);
             }
         };
-        for (ring, cross) in self.rings.generator.iter_mut().zip(model.generator_cross()) {
+        let rings = &mut pool.rings;
+        for (ring, cross) in rings.generator.iter_mut().zip(model.generator_cross()) {
             write(ring, cross.project_rows(states.clone(), &rope));
         }
-        for (ring, cross) in self.rings.dec.iter_mut().zip(model.decoder_cross()) {
+        for (ring, cross) in rings.dec.iter_mut().zip(model.decoder_cross()) {
             write(ring, cross.project_rows(states.clone(), &rope));
         }
         for &(off, slot, len) in &pieces {
-            put(&mut self.rings.copy_keys, copy.clone().narrow(1, off, len), 1, slot);
+            put(&mut rings.copy_keys, row, copy.clone().narrow(1, off, len), 1, slot);
         }
-        self.rings.upto = to;
+        self.upto = to;
     }
 
     /// Stages the open block's inputs: ring visibility, the condition, the retrieved tokens,
@@ -917,10 +985,11 @@ impl FastSession {
         let (l, hd, base) = (h.block, model.head_dim, model.rope_base);
         let device = self.device.clone();
         let start = self.session.blocks() * l;
-        let cap = self.rings.capacity;
+        let row = self.row;
+        let cap = self.pool.borrow().rings.capacity;
         let tokens = self.session.tokens().to_vec();
         // Ring visibility: slot s holds the latest projected token t = s mod cap.
-        let upto = self.rings.upto;
+        let upto = self.upto;
         let (mut seq, mut copy, mut next) =
             (vec![f32::NEG_INFINITY; cap], vec![f32::NEG_INFINITY; cap], vec![0i32; cap]);
         for t in upto.saturating_sub(cap)..upto {
@@ -930,14 +999,17 @@ impl FastSession {
             copy[slot] = if visible && t + 1 < start { 0.0 } else { f32::NEG_INFINITY };
             next[slot] = tokens.get(t + 1).copied().unwrap_or(0);
         }
-        put(&mut self.rings.seq_bias, floats(seq, [1, cap], &device), 1, 0);
-        put(&mut self.rings.copy_bias, floats(copy, [1, cap], &device), 1, 0);
-        put_int(&mut self.rings.next, ints(next, [1, cap], &device), 1, 0);
+        {
+            let mut pool = self.pool.borrow_mut();
+            put(&mut pool.rings.seq_bias, row, floats(seq, [1, cap], &device), 1, 0);
+            put(&mut pool.rings.copy_bias, row, floats(copy, [1, cap], &device), 1, 0);
+            put_int(&mut pool.rings.next, row, ints(next, [1, cap], &device), 1, 0);
+        }
         // The condition and the retrieved blocks.
         let cond = self.session.condition();
         let cond_host: Vec<f32> =
             cond.clone().into_data().convert::<f32>().try_to_vec::<f32>().expect("f32");
-        put(&mut self.inputs.cond, cond, 2, 0);
+        put(&mut self.pool.borrow_mut().inputs.cond, row, cond, 2, 0);
         let rt = h.retrieved_blocks * l;
         if rt > 0 {
             let picked =
@@ -948,16 +1020,20 @@ impl FastSession {
                 (0..rt).map(|i| if i < have { 0.0 } else { f32::NEG_INFINITY }).collect();
             ids.resize(rt, 0);
             following.resize(rt, 0);
-            put_int(&mut self.inputs.retrieved, ints(ids, [1, rt], &device), 1, 0);
-            put_int(&mut self.inputs.retrieved_next, ints(following, [1, rt], &device), 1, 0);
-            put(&mut self.inputs.retrieved_bias, floats(bias, [1, rt], &device), 1, 0);
+            let mut pool = self.pool.borrow_mut();
+            put_int(&mut pool.inputs.retrieved, row, ints(ids, [1, rt], &device), 1, 0);
+            put_int(&mut pool.inputs.retrieved_next, row, ints(following, [1, rt], &device), 1, 0);
+            put(&mut pool.inputs.retrieved_bias, row, floats(bias, [1, rt], &device), 1, 0);
         }
         self.stage_known(model, fixed);
         let e_pos: Vec<usize> =
             std::iter::repeat_n(start, h.slots + rt).chain((0..l - 1).map(|i| start + i)).collect();
-        restage(&mut self.inputs.extra_rope, &e_pos, hd, base, &device);
-        restage(&mut self.inputs.gen_q, &vec![start; l], hd, base, &device);
-        restage(&mut self.inputs.dec_q, &(start..start + l).collect::<Vec<_>>(), hd, base, &device);
+        let mut pool = self.pool.borrow_mut();
+        let inputs = &mut pool.inputs;
+        restage(&mut inputs.extra_rope, row, &e_pos, hd, base, &device);
+        restage(&mut inputs.gen_q, row, &vec![start; l], hd, base, &device);
+        let dec_pos: Vec<usize> = (start..start + l).collect();
+        restage(&mut inputs.dec_q, row, &dec_pos, hd, base, &device);
     }
 
     /// Stages the known prefix `fixed`: its states, tokens and length.
@@ -965,11 +1041,13 @@ impl FastSession {
         let l = model.config().block;
         let device = self.device.clone();
         let states = self.session.known_states(model, fixed);
-        put(&mut self.inputs.known_states, states, 1, 0);
+        let row = self.row;
+        let mut pool = self.pool.borrow_mut();
+        put(&mut pool.inputs.known_states, row, states, 1, 0);
         let mut known = fixed.to_vec();
         known.resize(l, 0);
-        put_int(&mut self.inputs.known_tokens, ints(known, [1, l], &device), 1, 0);
-        put_int(&mut self.inputs.p, ints(vec![fixed.len() as i32], [1, 1], &device), 1, 0);
+        put_int(&mut pool.inputs.known_tokens, row, ints(known, [1, l], &device), 1, 0);
+        put_int(&mut pool.inputs.p, row, ints(vec![fixed.len() as i32], [1, 1], &device), 1, 0);
     }
 
     /// The token draws' settings of a pass of `L` rows (counters advance), and the code draws'
@@ -1152,7 +1230,14 @@ impl FastSession {
             self.session.verified_span = true;
             // One more check of the same draft, in verified mode.
             let device = self.device.clone();
-            put_int(&mut self.inputs.draft, ints(result.draft.clone(), [1, l], &device), 1, 0);
+            let row = self.row;
+            put_int(
+                &mut self.pool.borrow_mut().inputs.draft,
+                row,
+                ints(result.draft.clone(), [1, l], &device),
+                1,
+                0,
+            );
             run.recheck = true;
             BlockPhase::Pass
         } else if cut.is_none() {
@@ -1177,7 +1262,14 @@ impl FastSession {
         let mut inputs = run.fixed.clone();
         inputs.resize(l, 0);
         let device = self.device.clone();
-        put_int(&mut self.inputs.ar_tokens, ints(inputs, [1, l], &device), 1, 0);
+        let row = self.row;
+        put_int(
+            &mut self.pool.borrow_mut().inputs.ar_tokens,
+            row,
+            ints(inputs, [1, l], &device),
+            1,
+            0,
+        );
         self.draw_settings(model, opts, false, run.fill_sampled(opts))
     }
 
@@ -1227,7 +1319,7 @@ impl FastSession {
         if opts.stop.contains(&token) || run.fixed.len() >= run.known + run.limit {
             run.stopped = true;
         }
-        if run.stopped || run.fixed.len() >= self.consts.pos.dims()[1] {
+        if run.stopped || run.fixed.len() >= self.block {
             run.phase = BlockPhase::Done;
         }
     }
@@ -1237,6 +1329,28 @@ impl FastSession {
         let emitted = run.fixed[run.known..].to_vec();
         self.session.close_block(model, run.start, &emitted, run.stopped, run.close_span);
         BlockOut { tokens: emitted, stopped: run.stopped, stats: run.stats }
+    }
+
+    /// [`Self::end_block`] for several sessions at once: the backbone steps of the blocks they
+    /// complete run as one batched forward ([`HybridSession::close_blocks`]).
+    pub fn end_blocks(
+        model: &HybridLm,
+        sessions: &mut [&mut FastSession],
+        runs: Vec<BlockRun>,
+    ) -> Vec<BlockOut> {
+        let closes: Vec<(usize, Vec<i32>, bool, bool)> = runs
+            .iter()
+            .map(|r| (r.start, r.fixed[r.known..].to_vec(), r.stopped, r.close_span))
+            .collect();
+        {
+            let mut inner: Vec<&mut HybridSession> =
+                sessions.iter_mut().map(|s| &mut s.session).collect();
+            HybridSession::close_blocks(model, &mut inner, &closes);
+        }
+        runs.into_iter()
+            .zip(closes)
+            .map(|(run, (_, tokens, stopped, _))| BlockOut { tokens, stopped, stats: run.stats })
+            .collect()
     }
 
     // ------------------------------------------------------------------ one slot
@@ -1261,19 +1375,19 @@ impl FastSession {
             match run.phase {
                 BlockPhase::Pass => {
                     let (mode, settings) = self.prepare_pass(model, &run, opts);
-                    let result =
-                        block_pass_slots(model, &[&*self], &[], mode, &[settings], &mut graphs)
-                            .pop()
-                            .expect("one row");
+                    let result = block_pass_slots(model, &[&*self], mode, &[settings], &mut graphs)
+                        .pop()
+                        .expect("one row");
                     self.apply_pass(model, &mut run, result, opts, hooks);
                 }
                 BlockPhase::Fill => {
                     let settings = self.prepare_fill(model, &run, opts);
                     let sampled = run.fill_sampled(opts);
                     let (ids, logp) =
-                        ar_pass_slots(model, &[&*self], &[], sampled, &[settings], &mut graphs);
+                        ar_pass_slots(model, &[&*self], sampled, &[settings], &mut graphs);
                     let i = run.fixed.len();
                     let drawn = ids[0][i];
+                    let logp = logp[0].clone();
                     let mut row = || -> Vec<f32> {
                         logp.clone()
                             .narrow(1, i, 1)
