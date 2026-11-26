@@ -26,8 +26,10 @@ pub mod train;
 pub mod vq;
 
 pub use decode::{BlockOut, BlockStats, DecodeOptions, Hooks, HybridSession, HybridSnapshot};
+#[cfg(feature = "cuda")]
+pub(crate) use fast::sample_settings;
 pub use fast::{
-    BlockPhase, BlockRun, DrawSettings, FastSession, PassGraphs, PassMode, PassResult,
+    BlockPhase, BlockRun, DrawRow, DrawSettings, FastSession, PassGraphs, PassMode, PassResult,
     ar_pass_slots, block_pass_slots,
 };
 pub use memory::{Memory, RopeTables};

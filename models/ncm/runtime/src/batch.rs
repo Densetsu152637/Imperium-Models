@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
+use ncm_model::exec::{BurnBackend, BurnCaches, BurnModel};
 use ncm_model::hybrid::{
     BlockPhase, BlockRun, DecodeOptions, DrawSettings, FastSession, HybridLm, HybridSession,
     HybridSnapshot, PassGraphs, PassMode, ar_pass_slots, block_pass_slots,
@@ -54,8 +55,8 @@ use ncm_model::{LayerCache, NcmCache, NcmLm, TokenLm};
 
 use crate::constrain::Constraint;
 use crate::engine::{
-    Core, DecodePath, EngineError, Event, Finish, GenStats, HybridAcceptance, Job, Kept,
-    MAX_EMPTY_CONCEPTS, State, panic_message, read_ids, read_logits,
+    BatchCore, Core, DecodePath, EngineError, Event, Finish, GenStats, HybridAcceptance, Job, Kept,
+    MAX_EMPTY_CONCEPTS, panic_message, read_ids, read_logits,
 };
 use crate::sampling::{Sampler, argmax};
 use crate::vocab::Specials;
@@ -199,7 +200,7 @@ struct Waiting {
 
 /// The model, its slots and the queue; owns the worker thread's state.
 pub(crate) struct Batcher {
-    core: Core,
+    core: BatchCore,
     model: Model,
     slots: Vec<Slot>,
     queue: VecDeque<Waiting>,
@@ -227,52 +228,55 @@ enum Model {
 impl Batcher {
     /// `count` slots over `core`'s model: the core's own caches become slot 0, the rest are
     /// allocated for the same context.
-    pub(crate) fn new(mut core: Core, count: usize, report: Arc<Mutex<SlotsReport>>) -> Self {
-        // The hybrid: one fast decode session per slot (the core's is the first).
-        if let Some((model, first)) = core.take_hybrid() {
-            let device = core.device.clone();
-            let capacity = core.capacity;
-            // One pool of device buffers (rows per slot) and pooled backbone caches.
-            let sessions = if count <= 1 {
-                vec![first]
-            } else {
-                drop(first);
-                FastSession::pooled(&model, count, capacity, &device)
-            };
-            let slots = sessions
-                .into_iter()
-                .map(|session| Slot {
-                    caches: Caches::Hybrid(Box::new(session)),
-                    kept: Vec::new(),
-                    last_used: 0,
-                    active: None,
-                })
-                .collect();
-            return Self {
-                core,
-                model: Model::Hybrid(model),
-                slots,
-                queue: VecDeque::new(),
-                report,
-                clock: 0,
-                next_prefill: 0,
-                #[cfg(feature = "cuda")]
-                tok_graphs: Default::default(),
-                #[cfg(feature = "cuda")]
-                ncm_graphs: Default::default(),
-                hybrid_graphs: PassGraphs::default(),
-            };
-        }
-        let state = std::mem::replace(
-            &mut *core.state.lock().unwrap_or_else(|p| p.into_inner()),
-            State::Empty,
-        );
+    pub(crate) fn new(
+        core: Core<BurnBackend>,
+        count: usize,
+        report: Arc<Mutex<SlotsReport>>,
+    ) -> Self {
+        let (core, model, first) = core.into_batcher_parts();
         let device = core.device.clone();
         let capacity = core.capacity;
-        let (model, first) = match state {
-            State::Tok { model, caches, .. } => (Model::Tok(model), Caches::Tok(caches)),
-            State::Ncm { model, cache, .. } => (Model::Ncm(model), Caches::Ncm(cache)),
-            State::Empty => unreachable!("a built core has a model"),
+        let (model, first) = match (model, first) {
+            // The hybrid: one fast decode session per slot (the core's is the first).
+            (BurnModel::Hybrid(model), BurnCaches::Hybrid(first)) => {
+                // One pool of device buffers (rows per slot) and pooled backbone caches.
+                let sessions = if count <= 1 {
+                    vec![*first]
+                } else {
+                    drop(first);
+                    FastSession::pooled(&model, count, capacity, &device)
+                };
+                let slots = sessions
+                    .into_iter()
+                    .map(|session| Slot {
+                        caches: Caches::Hybrid(Box::new(session)),
+                        kept: Vec::new(),
+                        last_used: 0,
+                        active: None,
+                    })
+                    .collect();
+                return Self {
+                    core,
+                    model: Model::Hybrid(model),
+                    slots,
+                    queue: VecDeque::new(),
+                    report,
+                    clock: 0,
+                    next_prefill: 0,
+                    #[cfg(feature = "cuda")]
+                    tok_graphs: Default::default(),
+                    #[cfg(feature = "cuda")]
+                    ncm_graphs: Default::default(),
+                    hybrid_graphs: PassGraphs::default(),
+                };
+            }
+            (BurnModel::Tok(model), BurnCaches::Tok(caches)) => {
+                (Model::Tok(model), Caches::Tok(caches))
+            }
+            (BurnModel::Ncm(model), BurnCaches::Ncm(cache)) => {
+                (Model::Ncm(model), Caches::Ncm(cache))
+            }
+            _ => unreachable!("a backend's caches match its model"),
         };
         let hybrid_graphs = PassGraphs::default();
         // With several slots, all of them get caches allocated together (on CUDA the retrieval

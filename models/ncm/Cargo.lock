@@ -4398,6 +4398,7 @@ dependencies = [
  "burn",
  "clap",
  "futures-util",
+ "ncm-exec",
  "ncm-model",
  "reqwest",
  "serde",

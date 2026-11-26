@@ -12,6 +12,7 @@ pub mod cache;
 pub mod chat;
 pub mod config;
 pub mod delta;
+pub mod exec;
 pub mod fused;
 pub(crate) mod graph;
 pub mod hybrid;

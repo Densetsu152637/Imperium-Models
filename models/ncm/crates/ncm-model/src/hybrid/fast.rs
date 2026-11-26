@@ -40,11 +40,14 @@
 
 use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 
-use super::decode::{BlockOut, BlockStats, DecodeOptions, Hooks, HybridSession};
+use super::decode::HybridSession;
 use super::memory::RopeTables;
 use super::model::{FastMemory, HybridLm, retrieved_tokens};
 use super::vq::Resampler;
 use crate::layers::Rope;
+use ncm_exec::hybrid::{BlockClose, BlockLogic};
+use ncm_exec::hybrid::{BlockOut, BlockStats, DecodeOptions, Hooks};
+pub use ncm_exec::hybrid::{BlockPhase, DrawRow, DrawSettings, PassMode, PassResult};
 
 /// Writes `src` into row `row` of the pooled `dst` (axis 0), at offset `at` along `axis`: in
 /// `dst`'s own buffer on CUDA with the fused kernels on (a graph reads it), by replacing it
@@ -253,109 +256,15 @@ impl SlotPool {
     }
 }
 
-/// How a block pass judges the draft.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PassMode {
-    /// Against the autoregressive path (no ẑ), greedy.
-    Verified,
-    /// Against the autoregressive path, its tokens drawn on the device (speculative sampling,
-    /// CUDA).
-    VerifiedSampled,
-    /// The staged draft checked again against the autoregressive path, no generator (after a
-    /// mixed-block switch), greedy or sampled.
-    Recheck,
-    RecheckSampled,
-    /// With ẑ, greedy codes.
-    Parallel,
-    /// With ẑ, codes sampled on the device (CUDA).
-    ParallelSampled,
-}
-
-impl PassMode {
-    fn verified(self) -> bool {
-        matches!(
-            self,
-            Self::Verified | Self::VerifiedSampled | Self::Recheck | Self::RecheckSampled
-        )
-    }
-
-    fn sampled_tokens(self) -> bool {
-        matches!(self, Self::VerifiedSampled | Self::RecheckSampled)
-    }
-
-    fn sampled_codes(self) -> bool {
-        self == Self::ParallelSampled
-    }
-
-    fn generates(self) -> bool {
-        !matches!(self, Self::Recheck | Self::RecheckSampled)
-    }
-}
-
-/// What a block pass reports for one row.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PassResult {
-    /// The first rejected position at or after the known prefix, if any.
-    pub rejected: Option<usize>,
-    /// The pass's token per position.
-    pub ids: Vec<i32>,
-    pub draft: Vec<i32>,
-}
-
-/// The device draws' settings of one pass, one per row (CUDA): per level `ℓ_k` code rows, and
-/// L token rows. Empty for greedy passes.
-#[derive(Clone, Debug, Default)]
-pub struct DrawSettings {
-    #[cfg(feature = "cuda")]
-    codes: Vec<Vec<crate::sample::SampleSettings>>,
-    #[cfg(feature = "cuda")]
-    tokens: Vec<crate::sample::SampleSettings>,
-}
-
-impl DrawSettings {
-    /// The settings of every row of a pool of `rows` slots: each slot of `parts` (its row and
-    /// settings) at its row, greedy draws (top-k 1) for the other rows.
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-    fn rows(
-        parts: &[(usize, &DrawSettings)],
-        rows: usize,
-        levels: &[usize],
-        l: usize,
-    ) -> DrawSettings {
-        #[cfg(feature = "cuda")]
-        {
-            use crate::sample::SampleSettings;
-            let fill = |n: usize, get: &dyn Fn(&DrawSettings) -> Option<Vec<SampleSettings>>| {
-                let mut out = Vec::with_capacity(rows * n);
-                for r in 0..rows {
-                    let own = parts.iter().find(|p| p.0 == r).and_then(|p| get(p.1));
-                    match own {
-                        Some(v) if v.len() == n => out.extend(v),
-                        _ => out.extend(std::iter::repeat_n(SampleSettings::GREEDY, n)),
-                    }
-                }
-                out
-            };
-            let sampled_codes = parts.iter().any(|p| !p.1.codes.is_empty());
-            let sampled_tokens = parts.iter().any(|p| !p.1.tokens.is_empty());
-            let codes = if sampled_codes {
-                levels
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &n)| fill(n, &|d| d.codes.get(k).cloned()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let tokens = if sampled_tokens {
-                fill(l, &|d| (!d.tokens.is_empty()).then(|| d.tokens.clone()))
-            } else {
-                Vec::new()
-            };
-            DrawSettings { codes, tokens }
-        }
-        #[cfg(not(feature = "cuda"))]
-        DrawSettings {}
+/// The device sampler's settings of a backend-neutral draw row.
+#[cfg(feature = "cuda")]
+pub(crate) fn sample_settings(r: &DrawRow) -> crate::sample::SampleSettings {
+    crate::sample::SampleSettings {
+        temperature: r.temperature,
+        top_k: r.top_k,
+        top_p: r.top_p,
+        seed: r.seed,
+        counter: r.counter,
     }
 }
 
@@ -385,13 +294,16 @@ impl Samplers {
     fn set(&self, settings: &DrawSettings) {
         #[cfg(feature = "cuda")]
         if crate::fused::active(&self.tokens.device()) {
+            let rows = |s: &[DrawRow]| -> Vec<crate::sample::SampleSettings> {
+                s.iter().map(sample_settings).collect()
+            };
             for (p, s) in self.codes.iter().zip(&settings.codes) {
                 if !s.is_empty() {
-                    p.set_rows(s);
+                    p.set_rows(&rows(s));
                 }
             }
             if !settings.tokens.is_empty() {
-                self.tokens.set_rows(&settings.tokens);
+                self.tokens.set_rows(&rows(&settings.tokens));
             }
         }
     }
@@ -786,59 +698,31 @@ pub fn ar_pass_slots(
 
 // ---------------------------------------------------------------------- one block, host side
 
-/// Where a block's decode stands ([`FastSession::begin_block`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockPhase {
-    /// A block pass is due (first, re-decode or recheck).
-    Pass,
-    /// The autoregressive fill: one token per pass.
-    Fill,
-    /// The block is decoded ([`FastSession::end_block`]).
-    Done,
-}
-
-/// The host state of one block's decode on the fast path.
+/// The host state of one block's decode on the fast path: the backend-neutral
+/// [`BlockLogic`] (`Deref`s to it: `phase()`, `mode()`, `stats`, ...).
 #[derive(Clone, Debug)]
 pub struct BlockRun {
-    start: usize,
-    known: usize,
-    limit: usize,
-    fixed: Vec<i32>,
-    pub stats: BlockStats,
-    verified: bool,
-    recheck: bool,
-    redecode: bool,
-    passes: usize,
-    stopped: bool,
-    close_span: bool,
-    phase: BlockPhase,
+    logic: BlockLogic,
+}
+
+impl std::ops::Deref for BlockRun {
+    type Target = BlockLogic;
+
+    fn deref(&self) -> &BlockLogic {
+        &self.logic
+    }
+}
+
+impl std::ops::DerefMut for BlockRun {
+    fn deref_mut(&mut self) -> &mut BlockLogic {
+        &mut self.logic
+    }
 }
 
 impl BlockRun {
-    pub fn phase(&self) -> BlockPhase {
-        self.phase
-    }
-
-    /// The block position the next fill pass writes.
-    pub fn next_position(&self) -> usize {
-        self.fixed.len()
-    }
-
-    /// The pass mode due (in [`BlockPhase::Pass`]).
-    pub fn mode(&self, opts: &DecodeOptions) -> PassMode {
-        match (self.recheck, self.verified, opts.temperature > 0.0) {
-            (true, _, false) => PassMode::Recheck,
-            (true, _, true) => PassMode::RecheckSampled,
-            (false, true, false) => PassMode::Verified,
-            (false, true, true) => PassMode::VerifiedSampled,
-            (false, false, false) => PassMode::Parallel,
-            (false, false, true) => PassMode::ParallelSampled,
-        }
-    }
-
     /// Whether the fill draws its tokens on the device.
     pub fn fill_sampled(&self, opts: &DecodeOptions) -> bool {
-        opts.temperature > 0.0 && cfg!(feature = "cuda")
+        self.logic.fill_sampled(opts, cfg!(feature = "cuda"))
     }
 }
 
@@ -1068,8 +952,7 @@ impl FastSession {
         let l = h.block;
         #[cfg(feature = "cuda")]
         {
-            use crate::sample::SampleSettings;
-            let row = |t: f64, counter: u32| SampleSettings {
+            let row = |t: f64, counter: u32| DrawRow {
                 temperature: t as f32,
                 top_k: opts.top_k,
                 top_p: opts.top_p as f32,
@@ -1125,22 +1008,9 @@ impl FastSession {
         let l = model.config().block;
         let start = self.session.blocks() * l;
         let fixed: Vec<i32> = self.session.tokens()[start..].to_vec();
-        let known = fixed.len();
         self.stage(model, &fixed);
-        BlockRun {
-            start,
-            known,
-            limit,
-            fixed,
-            stats: BlockStats { known, ..BlockStats::default() },
-            verified: opts.verified || self.session.verified_span,
-            recheck: false,
-            redecode: false,
-            passes: 0,
-            stopped: false,
-            close_span: false,
-            phase: if opts.ar_only { BlockPhase::Fill } else { BlockPhase::Pass },
-        }
+        let verified = opts.verified || self.session.verified_span;
+        BlockRun { logic: BlockLogic::begin(start, fixed, limit, verified, opts.ar_only) }
     }
 
     /// Stages a due pass (a re-decode's or recheck's known prefix) and returns its mode and
@@ -1151,8 +1021,8 @@ impl FastSession {
         run: &BlockRun,
         opts: &DecodeOptions,
     ) -> (PassMode, DrawSettings) {
-        if run.redecode || run.recheck {
-            let fixed = run.fixed.clone();
+        if run.restage_known() {
+            let fixed = run.fixed().to_vec();
             self.stage_known(model, &fixed);
         }
         let mode = run.mode(opts);
@@ -1162,7 +1032,7 @@ impl FastSession {
 
     /// Applies a block pass's result (module docs; decoding step 5): accepted tokens, the
     /// rejected position's token, stops, a mixed-block switch, the constraint scan, then a
-    /// re-decode, a recheck, the fill or the block's end.
+    /// re-decode, a recheck, the fill or the block's end ([`BlockLogic::apply_pass`]).
     pub fn apply_pass(
         &mut self,
         model: &HybridLm,
@@ -1173,86 +1043,16 @@ impl FastSession {
     ) {
         let h = model.config();
         let l = h.block;
-        let redecode_min = opts.redecode_min.unwrap_or(h.redecode_min);
-        let mode = run.mode(opts);
-        run.recheck = false;
-        run.redecode = false;
-        run.stats.generator_runs += usize::from(mode.generates());
-        run.stats.check_passes += 1;
-        let p = run.fixed.len();
-        let mut cut = match hooks.accept.as_mut() {
-            Some(f) => (p..l).find(|&i| !f(run.passes, i)),
-            None => result.rejected,
-        };
-        if cut.is_some_and(|c| c < p) {
-            cut = Some(p);
-        }
-        let accepted = cut.unwrap_or(l) - p;
-        match run.passes {
-            0 => run.stats.first_accepted = Some(accepted),
-            1 => run.stats.second_accepted = Some(accepted),
-            _ => {}
-        }
-        run.passes += 1;
-        let mut emitted: Vec<i32> = result.draft[p..p + accepted].to_vec();
-        if let Some(c) = cut {
-            emitted.push(result.ids[c]);
-        }
-        emitted.truncate((run.known + run.limit).saturating_sub(run.fixed.len()));
-        let mut keep = emitted.len();
-        if let Some(s) = emitted.iter().position(|t| opts.stop.contains(t)) {
-            keep = s + 1;
-            run.stopped = true;
-        }
-        let switch = (!run.verified)
-            .then(|| emitted[..keep].iter().position(|t| opts.switch_on.contains(t)))
-            .flatten();
-        if let Some(s) = switch {
-            keep = s + 1;
-            run.stopped = false;
-        }
-        emitted.truncate(keep);
-        let constrained = super::decode::scan_cut(hooks, &mut emitted);
-        if constrained {
-            run.stopped = false;
-        }
-        if emitted.iter().any(|t| opts.switch_off.contains(t)) {
-            run.close_span = true;
-        }
-        run.fixed.extend_from_slice(&emitted);
-        if run.fixed.len() >= run.known + run.limit {
-            run.stopped = true;
-        }
-        run.phase = if run.stopped || run.fixed.len() >= l {
-            BlockPhase::Done
-        } else if constrained {
-            // The grammar cut the block: the rest on the autoregressive path.
-            BlockPhase::Fill
-        } else if let Some(s) = switch {
-            run.stats.switched = Some(p + s);
-            run.verified = true;
+        let effects = run.logic.apply_pass(l, h.redecode_min, result, opts, hooks);
+        if effects.verified_span {
             self.session.verified_span = true;
-            // One more check of the same draft, in verified mode.
+        }
+        if let Some(draft) = effects.stage_draft {
             let device = self.device.clone();
             let row = self.row;
-            put_int(
-                &mut self.pool.borrow_mut().inputs.draft,
-                row,
-                ints(result.draft.clone(), [1, l], &device),
-                1,
-                0,
-            );
-            run.recheck = true;
-            BlockPhase::Pass
-        } else if cut.is_none() {
-            BlockPhase::Pass
-        } else if !run.stats.redecoded && l - run.fixed.len() >= redecode_min {
-            run.stats.redecoded = true;
-            run.redecode = true;
-            BlockPhase::Pass
-        } else {
-            BlockPhase::Fill
-        };
+            let draft = ints(draft, [1, l], &device);
+            put_int(&mut self.pool.borrow_mut().inputs.draft, row, draft, 1, 0);
+        }
     }
 
     /// Stages the fill's next pass (the block's fixed tokens) and returns the draws' settings.
@@ -1263,7 +1063,7 @@ impl FastSession {
         opts: &DecodeOptions,
     ) -> DrawSettings {
         let l = model.config().block;
-        let mut inputs = run.fixed.clone();
+        let mut inputs = run.fixed().to_vec();
         inputs.resize(l, 0);
         let device = self.device.clone();
         let row = self.row;
@@ -1279,7 +1079,7 @@ impl FastSession {
 
     /// Applies one fill pass: the token at the next position, from the pass's token `drawn`
     /// (argmax or device draw) or, when the host must choose (a grammar pick, a host draw, an
-    /// observer), from its log-probabilities `row()`.
+    /// observer), from its log-probabilities `row()` ([`BlockLogic::apply_fill`]).
     pub fn apply_fill(
         &mut self,
         run: &mut BlockRun,
@@ -1288,51 +1088,32 @@ impl FastSession {
         opts: &DecodeOptions,
         hooks: &mut Hooks,
     ) {
-        let i = run.fixed.len();
-        let host_draw = opts.temperature > 0.0 && !run.fill_sampled(opts);
-        let token = if host_draw || hooks.ar_rows.is_some() || hooks.pick.is_some() {
-            let row = row();
-            if let Some(f) = hooks.ar_rows.as_mut() {
-                f(&run.fixed, i, &row);
-            }
-            if let Some(pick) = hooks.pick.as_mut() {
-                pick(&row)
-            } else if host_draw {
-                let mut uniform = || self.session.uniform();
-                super::decode::sample_row(
-                    &row,
-                    opts.temperature,
-                    opts.top_p,
-                    opts.top_k,
-                    &mut uniform,
-                ) as i32
-            } else {
-                drawn
-            }
-        } else {
-            drawn
+        let block = self.block;
+        let session = &mut self.session;
+        let mut host_draw = |row: &[f32]| {
+            let mut uniform = || session.uniform();
+            super::decode::sample_row(row, opts.temperature, opts.top_p, opts.top_k, &mut uniform)
+                as i32
         };
-        run.stats.ar_tokens += 1;
-        run.fixed.push(token);
-        if opts.switch_on.contains(&token) {
+        let effects = run.logic.apply_fill(
+            block,
+            drawn,
+            row,
+            &mut host_draw,
+            opts,
+            hooks,
+            cfg!(feature = "cuda"),
+        );
+        if effects.verified_span {
             self.session.verified_span = true;
-        }
-        if opts.switch_off.contains(&token) {
-            run.close_span = true;
-        }
-        if opts.stop.contains(&token) || run.fixed.len() >= run.known + run.limit {
-            run.stopped = true;
-        }
-        if run.stopped || run.fixed.len() >= self.block {
-            run.phase = BlockPhase::Done;
         }
     }
 
     /// Ends the block: encodes what was written and steps the backbone over a complete block.
     pub fn end_block(&mut self, model: &HybridLm, run: BlockRun) -> BlockOut {
-        let emitted = run.fixed[run.known..].to_vec();
-        self.session.close_block(model, run.start, &emitted, run.stopped, run.close_span);
-        BlockOut { tokens: emitted, stopped: run.stopped, stats: run.stats }
+        let BlockClose { start, emitted, stopped, close_span } = run.logic.close();
+        self.session.close_block(model, start, &emitted, stopped, close_span);
+        run.logic.into_out()
     }
 
     /// [`Self::end_block`] for several sessions at once: the backbone steps of the blocks they
@@ -1344,20 +1125,67 @@ impl FastSession {
     ) -> Vec<BlockOut> {
         let closes: Vec<(usize, Vec<i32>, bool, bool)> = runs
             .iter()
-            .map(|r| (r.start, r.fixed[r.known..].to_vec(), r.stopped, r.close_span))
+            .map(|r| {
+                let c = r.logic.close();
+                (c.start, c.emitted, c.stopped, c.close_span)
+            })
             .collect();
         {
             let mut inner: Vec<&mut HybridSession> =
                 sessions.iter_mut().map(|s| &mut s.session).collect();
             HybridSession::close_blocks(model, &mut inner, &closes);
         }
-        runs.into_iter()
-            .zip(closes)
-            .map(|(run, (_, tokens, stopped, _))| BlockOut { tokens, stopped, stats: run.stats })
-            .collect()
+        runs.into_iter().map(|run| run.logic.into_out()).collect()
     }
 
     // ------------------------------------------------------------------ one slot
+
+    /// Runs the due block pass of this session alone (on its own captured passes) and applies
+    /// it. Returns what the pass read back.
+    pub fn pass_once(
+        &mut self,
+        model: &HybridLm,
+        run: &mut BlockRun,
+        opts: &DecodeOptions,
+        hooks: &mut Hooks,
+    ) -> PassResult {
+        let mut graphs = std::mem::take(&mut self.graphs);
+        let (mode, settings) = self.prepare_pass(model, run, opts);
+        let result = block_pass_slots(model, &[&*self], mode, &[settings], &mut graphs)
+            .pop()
+            .expect("one row");
+        self.graphs = graphs;
+        self.apply_pass(model, run, result.clone(), opts, hooks);
+        result
+    }
+
+    /// Runs one fill pass of this session alone and applies it; returns the token written.
+    pub fn fill_once(
+        &mut self,
+        model: &HybridLm,
+        run: &mut BlockRun,
+        opts: &DecodeOptions,
+        hooks: &mut Hooks,
+    ) -> i32 {
+        let mut graphs = std::mem::take(&mut self.graphs);
+        let settings = self.prepare_fill(model, run, opts);
+        let sampled = run.fill_sampled(opts);
+        let (ids, logp) = ar_pass_slots(model, &[&*self], sampled, &[settings], &mut graphs);
+        self.graphs = graphs;
+        let i = run.next_position();
+        let drawn = ids[0][i];
+        let logp = logp[0].clone();
+        let mut row = || -> Vec<f32> {
+            logp.clone()
+                .narrow(1, i, 1)
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .expect("f32")
+        };
+        self.apply_fill(run, drawn, &mut row, opts, hooks);
+        *run.fixed().last().expect("a token was written")
+    }
 
     /// Decodes the open block, at most `limit` tokens, as [`HybridSession::decode_block`] does
     /// (same steps, same results at temperature 0 up to rounding), on the fast passes. Only the
@@ -1374,38 +1202,17 @@ impl FastSession {
             return self.session.decode_block(model, limit, opts, hooks);
         }
         let mut run = self.begin_block(model, limit, opts);
-        let mut graphs = std::mem::take(&mut self.graphs);
         loop {
-            match run.phase {
+            match run.phase() {
                 BlockPhase::Pass => {
-                    let (mode, settings) = self.prepare_pass(model, &run, opts);
-                    let result = block_pass_slots(model, &[&*self], mode, &[settings], &mut graphs)
-                        .pop()
-                        .expect("one row");
-                    self.apply_pass(model, &mut run, result, opts, hooks);
+                    self.pass_once(model, &mut run, opts, hooks);
                 }
                 BlockPhase::Fill => {
-                    let settings = self.prepare_fill(model, &run, opts);
-                    let sampled = run.fill_sampled(opts);
-                    let (ids, logp) =
-                        ar_pass_slots(model, &[&*self], sampled, &[settings], &mut graphs);
-                    let i = run.fixed.len();
-                    let drawn = ids[0][i];
-                    let logp = logp[0].clone();
-                    let mut row = || -> Vec<f32> {
-                        logp.clone()
-                            .narrow(1, i, 1)
-                            .into_data()
-                            .convert::<f32>()
-                            .try_to_vec::<f32>()
-                            .expect("f32")
-                    };
-                    self.apply_fill(&mut run, drawn, &mut row, opts, hooks);
+                    self.fill_once(model, &mut run, opts, hooks);
                 }
                 BlockPhase::Done => break,
             }
         }
-        self.graphs = graphs;
         self.end_block(model, run)
     }
 

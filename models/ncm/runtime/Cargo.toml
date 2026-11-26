@@ -20,6 +20,7 @@ cuda = ["burn/cuda", "ncm-model/cuda"]
 
 [dependencies]
 ncm-model = { path = "../crates/ncm-model" }
+ncm-exec = { path = "../crates/ncm-exec" }
 burn = { workspace = true, features = ["flex"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
