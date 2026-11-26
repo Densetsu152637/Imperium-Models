@@ -1528,19 +1528,23 @@ impl Stack {
         if crate::fused::active(device) && slots > 1 {
             let position = Tensor::<1, burn::tensor::Int>::zeros([slots], device)
                 .cast(burn::tensor::IntDType::I32);
-            let position_id = crate::retrieval::fresh_id();
+            // Each slot's own position buffer, shared by its retrieval layers (a narrowed row of
+            // `position` would be a copy per layer, not a view, so a graph staging one layer's
+            // would leave the others stale).
+            let rows: Vec<(Tensor<1, burn::tensor::Int>, u64)> = (0..slots)
+                .map(|_| {
+                    let p = Tensor::<1, burn::tensor::Int>::zeros([1], device)
+                        .cast(burn::tensor::IntDType::I32);
+                    (p, crate::retrieval::fresh_id())
+                })
+                .collect();
             let mut sets: Vec<Vec<LayerCache>> = (0..slots).map(|_| Vec::new()).collect();
             for block in &self.blocks {
                 match &block.attn {
                     Mixer::Retrieval(ret) => {
-                        let rows = ret.make_slot_caches(
-                            slots,
-                            max_positions,
-                            &position,
-                            position_id,
-                            device,
-                        );
-                        for (set, cache) in sets.iter_mut().zip(rows) {
+                        let caches =
+                            ret.make_slot_caches(slots, max_positions, &position, &rows, device);
+                        for (set, cache) in sets.iter_mut().zip(caches) {
                             set.push(LayerCache::Latent(cache));
                         }
                     }

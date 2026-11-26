@@ -308,12 +308,13 @@ impl LatentCache {
             return true;
         };
         let keys = |k: &IndexKeys| match k {
-            IndexKeys::Float(t) => buffer_id(t),
-            IndexKeys::Int8 { codes, .. } => int_buffer_id(codes),
+            IndexKeys::Float(t) => (buffer_id(t), None),
+            IndexKeys::Int8 { codes, scales } => (int_buffer_id(codes), buffer_id(scales)),
         };
         buffer_id(&pool.kv) == self.kv.as_ref().and_then(buffer_id)
-            && self.keys.as_ref().and_then(keys) == keys(&pool.keys)
-            && int_buffer_id(&self.position) == int_buffer_id(&pool.position)
+            && self.keys.as_ref().map(keys) == Some(keys(&pool.keys))
+            && int_buffer_id(&self.position).is_some()
+            && int_buffer_id(&pool.position).is_some()
     }
 
     /// Debug builds: panics when a pooled cache no longer aliases its pool.
@@ -487,9 +488,11 @@ impl SparseRetrieval {
         LatentCache::new(batch, width, self.index_dim, int8, max_positions, device)
     }
 
-    /// `rows` slot caches (each for batch 1) whose buffers are rows of shared ones, with the
-    /// next positions in `position` (`[rows]`, i32, row i for slot i; a stack's retrieval
-    /// layers share it). Each behaves as [`Self::make_cache`]'s; a batched step over all of
+    /// `rows` slot caches (each for batch 1) whose buffers are rows of shared ones: the batched
+    /// kernels read the next positions from `position` (`[rows]`, i32, row i for slot i; a
+    /// stack's retrieval layers share it), a slot's own steps from its `row_positions` buffer
+    /// (`[1]` and its id, shared by the slot's retrieval layers), which [`Self::decode_rows`]
+    /// copies into `position`. Each behaves as [`Self::make_cache`]'s; a batched step over all of
     /// them in row order decodes in one set of launches ([`Self::decode_rows`]).
     #[cfg(feature = "cuda")]
     pub(crate) fn make_slot_caches(
@@ -497,18 +500,23 @@ impl SparseRetrieval {
         rows: usize,
         max_positions: usize,
         position: &Tensor<1, Int>,
-        position_id: u64,
+        row_positions: &[(Tensor<1, Int>, u64)],
         device: &Device,
     ) -> Vec<LatentCache> {
-        let pool = self.make_cache(max_positions, rows, device);
+        // Rows of the shared buffers are views only at 512-byte aligned offsets (a narrowed row
+        // elsewhere is a copy): the pool's capacity is padded so every row of every buffer
+        // starts aligned (the per-position scales of 8-bit keys are the narrowest, 2 or 4
+        // bytes a position).
+        let capacity = max_positions.next_multiple_of(256);
+        let pool = self.make_cache(capacity, rows, device);
         let (kv, keys) = (pool.kv.expect("cache"), pool.keys.expect("cache"));
         let id = next_id();
         (0..rows)
             .map(|row| LatentCache {
                 kv: Some(kv.clone().narrow(0, row, 1)),
                 keys: Some(keys.row(row)),
-                position: position.clone().narrow(0, row, 1),
-                position_id,
+                position: row_positions[row].0.clone(),
+                position_id: row_positions[row].1,
                 pooled: Some(PoolRow {
                     id,
                     row,
@@ -517,7 +525,7 @@ impl SparseRetrieval {
                     keys: keys.clone(),
                     position: position.clone(),
                 }),
-                capacity: max_positions,
+                capacity,
                 length: 0,
                 itemsize: pool.itemsize,
             })
@@ -580,10 +588,20 @@ impl SparseRetrieval {
             let pos = Tensor::<1, Int>::from_data(pos, &device).cast(IntDType::I32);
             crate::kernels::assign_int_into(&pool.position, pos, 0, 0);
         } else {
+            // In a capture: each active slot's own position buffer (staged per replay by its
+            // StackStep) copied into its row, the idle rows marked.
             for (r, slot) in slot_of.iter().enumerate() {
-                if slot.is_none() {
-                    let idle = Tensor::<1, Int>::full([1], -1, &device).cast(IntDType::I32);
-                    crate::kernels::assign_int_into(&pool.position, idle, 0, r);
+                match slot {
+                    Some(i) => crate::kernels::assign_int_into(
+                        &pool.position,
+                        caches[*i].position.clone(),
+                        0,
+                        r,
+                    ),
+                    None => {
+                        let idle = Tensor::<1, Int>::full([1], -1, &device).cast(IntDType::I32);
+                        crate::kernels::assign_int_into(&pool.position, idle, 0, r);
+                    }
                 }
             }
         }
