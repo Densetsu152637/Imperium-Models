@@ -71,6 +71,12 @@ fn gemv_matches_cpu_f32() {
 }
 
 #[test]
+fn gemm_small_matches_cpu_f32() {
+    let (device, _lock) = setup(DTYPE);
+    gemm_small_matches(&device, TOL);
+}
+
+#[test]
 fn graphed_speculation_matches_eager_f32() {
     let (device, _lock) = setup(DTYPE);
     graphed_speculation_matches(&device, true, None);

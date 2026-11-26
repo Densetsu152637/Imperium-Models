@@ -116,7 +116,8 @@ pub fn add_rms_norm<const D: usize>(
 
 /// `x W` for a dense weight `w` `[K, N]` (row-major, or the transpose of a row-major `[N, K]`):
 /// on CUDA with the fused kernels on, inputs of at most eight rows (decode steps) take the
-/// matrix-vector kernels ([`crate::kernels::gemv`]); everything else Burn's matmul. Dense
+/// matrix-vector kernels ([`crate::kernels::gemv`]), up to 64 rows the small-M GEMM
+/// ([`crate::kernels::gemm_small`]); everything else Burn's matmul. Dense
 /// [`crate::quant::QLinear`] layers and the tied output head multiply through it.
 pub fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
     #[cfg(feature = "cuda")]
@@ -124,6 +125,10 @@ pub fn linear<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
         let rows = x.dims()[..D - 1].iter().product::<usize>();
         if crate::kernels::gemv_rows_ok(rows) {
             return crate::kernels::gemv(x, w);
+        }
+        // Past the GEMV kernels' rows, the small-M GEMM up to 64.
+        if crate::kernels::gemm_small_rows_ok(rows) {
+            return crate::kernels::gemm_small(x, w);
         }
     }
     burn::tensor::module::linear(x, w, None)

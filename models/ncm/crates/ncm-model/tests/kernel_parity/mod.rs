@@ -87,6 +87,36 @@ pub fn gemv_matches(device: &Device, tol: f32) {
     }
 }
 
+/// The small-M GEMM against an f32 CPU matmul: 9 to 64 rows, split and unsplit `K`, ragged
+/// widths, a row-major and a transposed (tied-embedding) weight.
+pub fn gemm_small_matches(device: &Device, tol: f32) {
+    device.seed(5);
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (rows, k, n, transposed) in [
+        (9, 512, 1536, false),
+        (16, 2048, 6784, false),
+        (32, 2240, 1024, false),
+        (64, 1024, 4112, false),
+        (17, 37, 70, false),
+        (40, 512, 32000, true),
+        (12, 64, 300, true),
+    ] {
+        let x = Tensor::<3>::random([1, rows, k], normal, device);
+        let (got, want) = if transposed {
+            let emb = Tensor::<2>::random([n, k], normal, device);
+            let got = values(ncm_model::kernels::gemm_small(x.clone(), emb.clone().transpose()));
+            (got, values(to_cpu(&x).matmul(to_cpu(&emb).transpose().unsqueeze::<3>())))
+        } else {
+            let w = Tensor::<2>::random([k, n], normal, device);
+            let got = values(ncm_model::kernels::gemm_small(x.clone(), w.clone()));
+            (got, values(to_cpu(&x).matmul(to_cpu(&w).unsqueeze::<3>())))
+        };
+        let err = rel_error(&got, &want);
+        eprintln!("gemm_small {rows}x{k}x{n} (transposed {transposed}): error {err:.2e}");
+        assert!(err <= tol, "gemm_small {rows}x{k}x{n}: error {err:.2e}");
+    }
+}
+
 /// The fused MLP half ([`ncm_model::layers::Mlp::residual_step`]: add, norm, gate/up GEMV with
 /// SwiGLU, down GEMV with the residual add) against the same block run unfused on the CUDA
 /// path (`fused::set_fused_mlp(false)`) and on the CPU in f32: the models' widths, one and

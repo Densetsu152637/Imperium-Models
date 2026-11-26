@@ -301,3 +301,115 @@ pub(crate) fn gemv_vec_kernel<F: Float, L: Size>(
         }
     }
 }
+
+/// Output columns per cube of [`gemm_small_kernel`].
+pub(crate) const GEMM_COLS: usize = 64;
+/// `K` per staged tile of [`gemm_small_kernel`].
+pub(crate) const GEMM_K: usize = 32;
+/// Row groups of [`gemm_small_kernel`]: unit `u` owns column `u % GEMM_COLS` of rows
+/// `u / GEMM_COLS + GEMM_GROUPS i`.
+pub(crate) const GEMM_GROUPS: usize = CUBE / GEMM_COLS;
+/// Most rows [`gemm_small_kernel`] takes (the step sizes between the GEMV kernels' eight rows and
+/// a prefill chunk: batched slot steps, verify passes, small prefill pieces).
+pub(crate) const GEMM_ROWS: usize = 64;
+
+/// Small-M GEMM `y = x W` for `x` `[m, K]` (`m <= GEMM_ROWS`) and `W` `[K, N]` read through its
+/// strides (row-major, or with `kmajor` the transpose of a row-major `[N, K]`). Cube
+/// `(tile, split)`: columns `tile * GEMM_COLS ..` of every row over `K` in
+/// `split * k_split ..`, staging `GEMM_K`-deep tiles of `x` and `W` in shared memory (each
+/// weight value read once per cube, coalesced either way round), every unit accumulating its
+/// column of `rows_per` rows in registers. With one split it writes `y` `[m, N]` at the run
+/// dtype, otherwise f32 partials `part` `[splits, m, N]` for [`gemv_sum_kernel`].
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_small_kernel<F: Float>(
+    x: &Tensor<F>,
+    w: &Tensor<F>,
+    y: &mut Tensor<F>,
+    part: &mut Tensor<f32>,
+    m: usize,
+    k: usize,
+    n: usize,
+    k_split: usize,
+    #[comptime] rows_per: usize,
+    #[comptime] kmajor: bool,
+    #[comptime] split: bool,
+    #[define(F)] _dtype: ElemType,
+) {
+    let tid = UNIT_POS as usize;
+    let c = tid % GEMM_COLS;
+    let g = tid / GEMM_COLS;
+    let n0 = CUBE_POS_X as usize * GEMM_COLS;
+    let col = n0 + c;
+    let s = CUBE_POS_Y as usize;
+    let k_start = s * k_split;
+    let k_end = select(k_start + k_split < k, k_start + k_split, k);
+    let mut xs = Shared::<[f32]>::new_slice(comptime!(GEMM_ROWS * (GEMM_K + 1)));
+    let mut ws = Shared::<[f32]>::new_slice(comptime!(GEMM_K * GEMM_COLS));
+    let (x0, x1) = (x.stride(0), x.stride(1));
+    let (w0, w1) = (w.stride(0), w.stride(1));
+    let mut acc = Array::<f32>::new(rows_per);
+    #[unroll]
+    for i in 0..rows_per {
+        acc[i] = 0.0;
+    }
+    let mut kb = k_start;
+    while kb < k_end {
+        // x tile `[m, GEMM_K]` (padded by one per row against bank conflicts), zeros past K.
+        let mut i = tid;
+        while i < m * GEMM_K {
+            let (r, kk) = (i / GEMM_K, i % GEMM_K);
+            let at = kb + kk;
+            let mut v = 0.0f32;
+            if at < k_end {
+                v = f32::cast_from(x[r * x0 + at * x1]);
+            }
+            xs[r * (GEMM_K + 1) + kk] = v;
+            i += CUBE;
+        }
+        // W tile `[GEMM_K, GEMM_COLS]`, read along whichever axis is contiguous.
+        let mut i = tid;
+        while i < GEMM_K * GEMM_COLS {
+            let mut kk = i / GEMM_COLS;
+            let mut cc = i % GEMM_COLS;
+            if comptime!(kmajor) {
+                kk = i % GEMM_K;
+                cc = i / GEMM_K;
+            }
+            let (at, cn) = (kb + kk, n0 + cc);
+            let mut v = 0.0f32;
+            if at < k_end && cn < n {
+                v = f32::cast_from(w[at * w0 + cn * w1]);
+            }
+            ws[kk * GEMM_COLS + cc] = v;
+            i += CUBE;
+        }
+        sync_cube();
+        #[unroll]
+        for kk in 0..GEMM_K {
+            let wv = ws[kk * GEMM_COLS + c];
+            #[unroll]
+            for i in 0..rows_per {
+                let r = g + i * GEMM_GROUPS;
+                if r < m {
+                    acc[i] += xs[r * (GEMM_K + 1) + kk] * wv;
+                }
+            }
+        }
+        sync_cube();
+        kb += GEMM_K;
+    }
+    if col < n {
+        #[unroll]
+        for i in 0..rows_per {
+            let r = g + i * GEMM_GROUPS;
+            if r < m {
+                if comptime!(split) {
+                    part[s * m * n + r * n + col] = acc[i];
+                } else {
+                    y[r * n + col] = F::cast_from(acc[i]);
+                }
+            }
+        }
+    }
+}

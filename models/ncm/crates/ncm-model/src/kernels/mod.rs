@@ -156,6 +156,9 @@ pub trait NcmKernels: Backend {
         counters: IntTensor<Self>,
     ) -> FloatTensor<Self>;
 
+    /// See [`gemm_small`]: `x` `[m, K]` with `m <= gemv::GEMM_ROWS`, `w` `[K, N]`.
+    fn ncm_gemm_small(x: FloatTensor<Self>, w: FloatTensor<Self>) -> FloatTensor<Self>;
+
     /// See [`qmatmul`]; `x` `[rows, d_in]` with `rows <= GEMV_ROWS`.
     fn ncm_qgemv(
         x: FloatTensor<Self>,
@@ -307,6 +310,59 @@ pub trait NcmKernels: Backend {
 }
 
 impl NcmKernels for CubeBackend {
+    fn ncm_gemm_small(x: CubeTensor, w: CubeTensor) -> CubeTensor {
+        use gemv::{CUBE, GEMM_COLS, GEMM_GROUPS, GEMM_K};
+        let [m, k] = x.meta.shape().dims::<2>();
+        let [_, n] = w.meta.shape().dims::<2>();
+        let y = empty_like(&x, vec![m, n]);
+        let dtype = elem(x.dtype);
+        let client = x.client.clone();
+        let strides = w.meta.strides().to_vec();
+        let kmajor = strides[1] != 1 && strides[0] == 1;
+        // Registers per unit: its column of every GEMM_GROUPS-th row, in steps of four so few
+        // variants compile.
+        let rows_per = m.div_ceil(GEMM_GROUPS).next_multiple_of(4).max(4);
+        // Split K until about two cubes per SM are reading (splits of at least 256).
+        let tiles = n.div_ceil(GEMM_COLS);
+        let splits = 168usize.div_ceil(tiles).clamp(1, k.div_ceil(256).max(1));
+        let k_split = k.div_ceil(splits).next_multiple_of(GEMM_K);
+        let splits = k.div_ceil(k_split);
+        let part = scratch(&x, vec![if splits > 1 { splits * m * n } else { 1 }], DType::F32);
+        unsafe {
+            gemv::gemm_small_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(tiles as u32, splits as u32, 1),
+                CubeDim::new_1d(CUBE as u32),
+                x.into_tensor_arg(),
+                w.into_tensor_arg(),
+                y.clone().into_tensor_arg(),
+                part.clone().into_tensor_arg(),
+                m,
+                k,
+                n,
+                k_split,
+                rows_per,
+                kmajor,
+                splits > 1,
+                dtype,
+            );
+            if splits > 1 {
+                let count = m * n;
+                gemv::gemv_sum_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(count.div_ceil(CUBE) as u32, 1, 1),
+                    CubeDim::new_1d(CUBE as u32),
+                    part.into_tensor_arg(),
+                    y.clone().into_tensor_arg(),
+                    count,
+                    splits,
+                    dtype,
+                );
+            }
+        }
+        y
+    }
+
     fn ncm_gemv(x: CubeTensor, w: CubeTensor, counters: CubeTensor) -> CubeTensor {
         use gemv::{COLS, CUBE};
         let [rows, k] = x.meta.shape().dims::<2>();
@@ -1331,6 +1387,28 @@ pub fn gemv<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
 /// Whether [`gemv`] takes an input of `rows` rows.
 pub fn gemv_rows_ok(rows: usize) -> bool {
     rows <= gemv::MAX_ROWS
+}
+
+/// `x W` for `x` `[.., K]` with at most [`gemm_small_rows_ok`] rows in all and `w` `[K, N]`
+/// (row-major, or the transpose of a row-major `[N, K]`): the small-M tiled GEMM for steps too
+/// big for the GEMV kernels and too small for a full GEMM to read the weight efficiently
+/// (batched slot steps, verify passes, short prefill pieces).
+pub fn gemm_small<const D: usize>(x: Tensor<D>, w: Tensor<2>) -> Tensor<D> {
+    let mut shape = x.dims();
+    let k = shape[D - 1];
+    let rows = shape.iter().product::<usize>() / k;
+    debug_assert!(gemm_small_rows_ok(rows), "gemm_small takes 1 ..= {} rows", gemv::GEMM_ROWS);
+    shape[D - 1] = w.dims()[1];
+    let y = <Dispatch as NcmKernels>::ncm_gemm_small(
+        x.reshape([rows, k]).into_dispatch(),
+        w.into_dispatch(),
+    );
+    Tensor::<2>::from_dispatch(y).reshape(shape)
+}
+
+/// Whether [`gemm_small`] takes an input of `rows` rows.
+pub fn gemm_small_rows_ok(rows: usize) -> bool {
+    (1..=gemv::GEMM_ROWS).contains(&rows)
 }
 
 /// `x` `[M, d_in]` times a quantised weight (`qweight` `[d_out, words]` i32, `scales`
