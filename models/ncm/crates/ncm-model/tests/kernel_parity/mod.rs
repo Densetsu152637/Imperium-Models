@@ -1204,6 +1204,19 @@ pub fn pooled_slot_steps_match(device: &Device, tol: f32) {
         separate.iter_mut().map(|c| c.as_mut_slice()).collect();
     let want = values(model.step_slots(token, &mut rows));
     assert_close("pooled step after the subset", &got, &want, &want, tol);
+    // Several new positions per slot in one pooled launch set (a verify-sized step), causal
+    // within each slot's rows, then a one-token step on top.
+    for (t, seed) in [(5usize, 7usize), (1, 2)] {
+        let ids: Vec<i32> = (0..3 * t).map(|j| ((j * seed + 1) % cfg.vocab_size) as i32).collect();
+        let tokens = Tensor::<2, Int>::from_data(TensorData::new(ids, [3, t]), device);
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            pooled.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let got = values(model.prefill_slots(tokens.clone(), &mut rows, t));
+        let mut rows: Vec<&mut [ncm_model::LayerCache]> =
+            separate.iter_mut().map(|c| c.as_mut_slice()).collect();
+        let want = values(model.prefill_slots(tokens, &mut rows, t));
+        assert_close(&format!("pooled {t}-token step"), &got, &want, &want, tol);
+    }
 }
 
 /// The NCM's batched concept-step graph ([`ncm_model::ncm::GraphedNcmSlots`], greedy) gives

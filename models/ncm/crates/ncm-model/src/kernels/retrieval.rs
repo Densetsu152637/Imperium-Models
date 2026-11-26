@@ -1,4 +1,4 @@
-//! Fused one-token sparse retrieval decode (`SparseRetrieval::attend_selected` and the dense
+//! Fused sparse retrieval decode of one or a few new positions per stream (`SparseRetrieval::attend_selected` and the dense
 //! case of `attend_latent`), in four kernels launched back to back:
 //!
 //! 1. [`ret_prep_kernel`]: QK-norms, partial RoPE, the absorbed query `q_nope W_uk^T` (with the
@@ -130,19 +130,20 @@ fn index_key<F: Float>(
     }
 }
 
-/// The next position of batch row `b`: `position` holds one per row (separate streams, slot
-/// batching) or one for every row.
+/// The position of query row `b`: query rows come `per` to a cache row (the `per` new
+/// positions of one stream, in order), and `position` holds the first new position of each
+/// cache row (separate streams, slot batching) or one for every row.
 #[cube]
-fn row_position(position: &Tensor<i32>, b: usize) -> usize {
-    let i = select(position.shape(0) > 1, b, 0usize);
-    usize::cast_from(position[i * position.stride(0)])
+fn row_position(position: &Tensor<i32>, b: usize, per: usize) -> usize {
+    let i = select(position.shape(0) > 1, b / per, 0usize);
+    usize::cast_from(position[i * position.stride(0)]) + b % per
 }
 
-/// Whether batch row `b` takes part in this step: a negative position marks an idle row of a
-/// slot pool (it neither reads nor writes; its output rows are left unset).
+/// Whether query row `b` takes part in this step: a negative position marks an idle cache row
+/// of a slot pool (its query rows neither read nor write; their output rows are left unset).
 #[cube]
-fn row_active(position: &Tensor<i32>, b: usize) -> bool {
-    let i = select(position.shape(0) > 1, b, 0usize);
+fn row_active(position: &Tensor<i32>, b: usize, per: usize) -> bool {
+    let i = select(position.shape(0) > 1, b / per, 0usize);
     position[i * position.stride(0)] >= 0
 }
 
@@ -187,6 +188,7 @@ pub(crate) fn ret_prep_kernel<F: Float>(
     codes: &mut Tensor<i8>,
     scales: &mut Tensor<F>,
     position: &Tensor<i32>,
+    per: usize,
     batch: usize,
     scale: f32,
     eps: f32,
@@ -212,7 +214,7 @@ pub(crate) fn ret_prep_kernel<F: Float>(
     let ps = p.stride(2);
     if cube_id < heads * batch * PREP_SLICES {
         let b = cube_id / (heads * PREP_SLICES);
-        if !row_active(position, b) {
+        if !row_active(position, b, per) {
             terminate!();
         }
         let hh = (cube_id / PREP_SLICES) % heads;
@@ -270,13 +272,13 @@ pub(crate) fn ret_prep_kernel<F: Float>(
         let entry = cube_id - heads * batch * PREP_SLICES;
         let b = entry / 3;
         let part = entry % 3;
-        if !row_active(position, b) {
+        if !row_active(position, b, per) {
             terminate!();
         }
-        let pos = row_position(position, b);
+        let pos = row_position(position, b, per);
         let row = b * p.stride(0);
         let (k0, k1, k2) = (kv.stride(0), kv.stride(1), kv.stride(2));
-        let at = b * k0 + pos * k1;
+        let at = (b / per) * k0 + pos * k1;
         // Latent: RMSNorm, stored as is.
         let lat = row + heads * qd * ps;
         if part == 0 {
@@ -342,7 +344,7 @@ pub(crate) fn ret_prep_kernel<F: Float>(
                 let top = cube_max(&mut red, top);
                 let step = f32::cast_from(F::cast_from(top / 127.0f32));
                 let step = select(step > 1.0e-30f32, step, 1.0e-30f32);
-                let cat = b * codes.stride(0) + pos * codes.stride(1);
+                let cat = (b / per) * codes.stride(0) + pos * codes.stride(1);
                 let cs2 = codes.stride(2);
                 let mut i = tid;
                 while i < index_dim {
@@ -356,12 +358,12 @@ pub(crate) fn ret_prep_kernel<F: Float>(
                     codes[cat + i * cs2] = i8::cast_from(code);
                     i += CUBE;
                 }
-                let sat = b * scales.stride(0) + pos * scales.stride(1);
+                let sat = (b / per) * scales.stride(0) + pos * scales.stride(1);
                 if tid == 0 {
                     scales[sat] = F::cast_from(step);
                 }
             } else {
-                let kat = b * keys.stride(0) + pos * keys.stride(1);
+                let kat = (b / per) * keys.stride(0) + pos * keys.stride(1);
                 let ks2 = keys.stride(2);
                 let mut i = tid;
                 while i < index_dim {
@@ -387,6 +389,7 @@ pub(crate) fn ret_index_kernel<F: Float>(
     scales: &Tensor<F>,
     scores: &mut Tensor<f32>,
     position: &Tensor<i32>,
+    per: usize,
     blocks: usize,
     w_scale: f32,
     #[comptime] index_heads: usize,
@@ -399,11 +402,11 @@ pub(crate) fn ret_index_kernel<F: Float>(
 ) {
     let b = CUBE_POS / blocks;
     let blk = CUBE_POS % blocks;
-    if !row_active(position, b) {
+    if !row_active(position, b, per) {
         terminate!();
     }
     // Uniform over the cube: blocks past the candidates are left alone.
-    if blk >= candidate_blocks(row_position(position, b), block, local) {
+    if blk >= candidate_blocks(row_position(position, b, per), block, local) {
         terminate!();
     }
     let tid = UNIT_POS as usize;
@@ -433,10 +436,10 @@ pub(crate) fn ret_index_kernel<F: Float>(
         let position = blk * block + s;
         let at = select(
             int8,
-            b * codes.stride(0) + position * codes.stride(1),
-            b * keys.stride(0) + position * keys.stride(1),
+            (b / per) * codes.stride(0) + position * codes.stride(1),
+            (b / per) * keys.stride(0) + position * keys.stride(1),
         );
-        let scale_at = b * scales.stride(0) + position * scales.stride(1);
+        let scale_at = (b / per) * scales.stride(0) + position * scales.stride(1);
         let mut dots = Array::<f32>::new(index_heads);
         #[unroll]
         for j in 0..index_heads {
@@ -492,6 +495,7 @@ pub(crate) fn ret_topk_kernel(
     scores: &Tensor<f32>,
     picked: &mut Tensor<u32>,
     position: &Tensor<i32>,
+    per: usize,
     blocks: usize,
     k: usize,
     #[comptime] block: usize,
@@ -499,10 +503,10 @@ pub(crate) fn ret_topk_kernel(
 ) {
     let b = CUBE_POS;
     let row = b * blocks;
-    if !row_active(position, b) {
+    if !row_active(position, b, per) {
         terminate!();
     }
-    let n = candidate_blocks(row_position(position, b), block, local);
+    let n = candidate_blocks(row_position(position, b, per), block, local);
     if n <= k {
         terminate!();
     }
@@ -624,6 +628,7 @@ pub(crate) fn ret_attend_kernel<F: Float>(
     part_sum: &mut Tensor<f32>,
     part_acc: &mut Tensor<f32>,
     position: &Tensor<i32>,
+    per: usize,
     chunks: usize,
     tiles: usize,
     k: usize,
@@ -638,17 +643,17 @@ pub(crate) fn ret_attend_kernel<F: Float>(
 ) {
     let groups = comptime!(heads / hg);
     let width = comptime!(latent + dr);
-    let per = comptime!(CHUNK / PLANES);
+    let spp = comptime!(CHUNK / PLANES); // Slots per plane.
     let steps = comptime!(width.div_ceil(LANES));
     let cols = comptime!(latent.div_ceil(CUBE));
     let b = CUBE_POS / (chunks * groups);
-    if !row_active(position, b) {
+    if !row_active(position, b, per) {
         terminate!();
     }
     let rest = CUBE_POS % (chunks * groups);
     let chunk = rest / groups;
     let h0 = (rest % groups) * hg;
-    let pos = row_position(position, b);
+    let pos = row_position(position, b, per);
     let mut sparse = candidate_blocks(pos, block, local) > k;
     if dense {
         sparse = false;
@@ -686,7 +691,7 @@ pub(crate) fn ret_attend_kernel<F: Float>(
         acc[a] = 0.0f32;
     }
     let (k0, k1, k2) = (kv.stride(0), kv.stride(1), kv.stride(2));
-    let row0 = b * k0;
+    let row0 = (b / per) * k0;
     let first = chunk * tiles * CHUNK;
     // Tiles past the step's slots are skipped (uniform over the cube).
     let mut t = 0usize;
@@ -714,14 +719,14 @@ pub(crate) fn ret_attend_kernel<F: Float>(
             ok[tid] = select(visible, 1u32, 0u32);
         }
         sync_cube();
-        let mut rows = Array::<usize>::new(per);
+        let mut rows = Array::<usize>::new(spp);
         #[unroll]
-        for j in 0..per {
-            rows[j] = row0 + usize::cast_from(at[plane * per + j]) * k1;
+        for j in 0..spp {
+            rows[j] = row0 + usize::cast_from(at[plane * spp + j]) * k1;
         }
-        let mut part = Array::<f32>::new(comptime!(per * hg));
+        let mut part = Array::<f32>::new(comptime!(spp * hg));
         #[unroll]
-        for a in 0..per * hg {
+        for a in 0..spp * hg {
             part[a] = 0.0f32;
         }
         #[unroll]
@@ -734,7 +739,7 @@ pub(crate) fn ret_attend_kernel<F: Float>(
                     qv[h] = q_sh[h * width + d];
                 }
                 #[unroll]
-                for j in 0..per {
+                for j in 0..spp {
                     let x = f32::cast_from(kv[rows[j] + d * k2]);
                     #[unroll]
                     for h in 0..hg {
@@ -744,8 +749,8 @@ pub(crate) fn ret_attend_kernel<F: Float>(
             }
         }
         #[unroll]
-        for j in 0..per {
-            let s = plane * per + j;
+        for j in 0..spp {
+            let s = plane * spp + j;
             #[unroll]
             for h in 0..hg {
                 let total = plane_sum(part[j * hg + h]);
@@ -830,6 +835,7 @@ pub(crate) fn ret_combine_kernel<F: Float>(
     part_acc: &Tensor<f32>,
     out: &mut Tensor<F>,
     position: &Tensor<i32>,
+    per: usize,
     chunks: usize,
     #[comptime] heads: usize,
     #[comptime] dv: usize,
@@ -844,7 +850,7 @@ pub(crate) fn ret_combine_kernel<F: Float>(
     let tile = CUBE_POS % tiles;
     let b = bh / heads;
     let hh = bh % heads;
-    if !row_active(position, b) {
+    if !row_active(position, b, per) {
         terminate!();
     }
     let tid = UNIT_POS as usize;

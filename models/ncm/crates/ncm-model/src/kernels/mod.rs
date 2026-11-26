@@ -301,6 +301,7 @@ pub trait NcmKernels: Backend {
         codes: IntTensor<Self>,
         scales: FloatTensor<Self>,
         position: IntTensor<Self>,
+        per: usize,
         dims: RetrievalDims,
     ) -> FloatTensor<Self>;
 }
@@ -811,6 +812,7 @@ impl NcmKernels for CubeBackend {
         codes: CubeTensor,
         scales: CubeTensor,
         position: CubeTensor,
+        per: usize,
         dims: RetrievalDims,
     ) -> CubeTensor {
         use retrieval::{CUBE, INDEX_CUBE};
@@ -847,6 +849,7 @@ impl NcmKernels for CubeBackend {
                 codes.clone().into_tensor_arg(),
                 scales.clone().into_tensor_arg(),
                 position.clone().into_tensor_arg(),
+                per,
                 b,
                 scale,
                 d.eps as f32,
@@ -878,6 +881,7 @@ impl NcmKernels for CubeBackend {
                     scales.into_tensor_arg(),
                     scores.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
+                    per,
                     blocks,
                     1.0 / ((d.index_heads * d.index_dim) as f32).sqrt(),
                     d.index_heads,
@@ -895,6 +899,7 @@ impl NcmKernels for CubeBackend {
                     scores.into_tensor_arg(),
                     picked.clone().into_tensor_arg(),
                     position.clone().into_tensor_arg(),
+                    per,
                     blocks,
                     d.topk,
                     d.block,
@@ -919,6 +924,7 @@ impl NcmKernels for CubeBackend {
                 part_sum.clone().into_tensor_arg(),
                 part_acc.clone().into_tensor_arg(),
                 position.clone().into_tensor_arg(),
+                per,
                 chunks,
                 tiles,
                 d.topk,
@@ -942,6 +948,7 @@ impl NcmKernels for CubeBackend {
                 part_acc.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
                 position.into_tensor_arg(),
+                per,
                 chunks,
                 h,
                 d.v_dim,
@@ -1165,8 +1172,11 @@ pub fn retrieval_prefill_attend(
     Tensor::from_dispatch(out)
 }
 
-/// One-token sparse retrieval decode at the position held by the device tensor `position`
-/// (`[1]`, i32) from the layer's input projection `proj` `[B, 1, W]`: writes the position's entry
+/// Sparse retrieval decode of `t` new positions per stream from the device tensor `position`
+/// (`[1]` or one per batch row, i32: each stream's first new position; negative marks an idle
+/// pool row) and the layer's input projection `proj` `[B, t, W]` (`t` small: a decode step, a
+/// verify pass, a few speculative tokens; causal within each stream's rows), with the RoPE
+/// tables one per query row `[B t, 1, 1, dr]` (or one for all when `B t` is 1): writes the position's entry
 /// into the cache in place (`kv` `[B, S, l + dr]` and the indexer `keys`, whoever else holds them),
 /// selects blocks with the indexer on the device and attends over them and the local window (or
 /// the whole context when it has no more candidates than `topk`, or in dense mode). Returns the
@@ -1194,6 +1204,9 @@ pub fn retrieval_decode(
         IndexKeys::Float(k) => (k.clone(), position.clone().reshape([1, 1, 1]), k.clone()),
         IndexKeys::Int8 { codes, scales } => (scales.clone(), codes.clone(), scales.clone()),
     };
+    // `per` new positions per stream: one query row each, cache row `b / per`.
+    let [rows, per, width] = proj.dims();
+    let proj = proj.reshape([rows * per, 1, width]);
     let out = <Dispatch as NcmKernels>::ncm_retrieval_decode(
         proj.into_dispatch(),
         q.into_dispatch(),
@@ -1209,9 +1222,12 @@ pub fn retrieval_decode(
         codes.into_dispatch(),
         scales.into_dispatch(),
         position.clone().into_dispatch(),
+        per,
         dims,
     );
-    Tensor::from_dispatch(out)
+    let out: Tensor<3> = Tensor::from_dispatch(out);
+    let hv = out.dims()[2];
+    out.reshape([rows, per, hv])
 }
 
 /// `x.argmax(D - 1)` for `x` `[..., n]` in one kernel launch (one cube per row); the result has

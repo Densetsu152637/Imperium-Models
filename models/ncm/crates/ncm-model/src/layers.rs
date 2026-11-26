@@ -980,7 +980,7 @@ impl Block {
         // row of the pool's position buffer, which the batched kernels read.
         #[cfg(feature = "cuda")]
         if let (Mixer::Retrieval(ret), MixInput::Projected(p)) = (&self.attn, input)
-            && p.dims()[1] == 1
+            && p.dims()[1] <= SparseRetrieval::POOLED_TOKENS
             && crate::fused::active(&p.device())
         {
             let lats: Option<Vec<&crate::retrieval::LatentCache>> = caches
@@ -990,7 +990,7 @@ impl Block {
                     _ => None,
                 })
                 .collect();
-            if !lats.is_some_and(|l| SparseRetrieval::rows_pooled(&l)) {
+            if !lats.is_some_and(|l| SparseRetrieval::rows_pooled(&l, p.dims()[1])) {
                 return None;
             }
             let mut lats: Vec<&mut crate::retrieval::LatentCache> =
