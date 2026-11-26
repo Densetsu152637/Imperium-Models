@@ -223,6 +223,23 @@ impl KvCache {
             .collect()
     }
 
+    /// A growing cache's keys and values for a masked multi-token step. On CUDA the view is
+    /// padded to [`key_bucket`] slots (the padding masked by the caller), so a prefill over a
+    /// growing cache meets a few key lengths, each compiled and allocated once, instead of a new
+    /// one per chunk; elsewhere it is exactly [`Self::view`].
+    fn padded_view(&self) -> (Tensor<4>, Tensor<4>) {
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(&self.device) {
+            let n = key_bucket(self.length, self.capacity);
+            let (k, v) = (self.k.clone().expect("cache"), self.v.clone().expect("cache"));
+            if n == self.capacity {
+                return (k, v);
+            }
+            return (k.slice(s![.., .., 0..n]), v.slice(s![.., .., 0..n]));
+        }
+        self.view()
+    }
+
     /// Add new keys and values; return (K, V, mask) for the queries at the same positions.
     /// Single-token steps need no mask: everything held is visible.
     pub fn append(
@@ -241,8 +258,11 @@ impl KvCache {
         let qpos: Vec<i32> = (start..start + t).map(|p| p as i32).collect();
         if self.window.is_none() {
             self.write(k, v);
-            let (keys, values) = self.view();
-            let kpos: Vec<i32> = (0..self.length).map(|p| p as i32).collect();
+            let (keys, values) = self.padded_view();
+            let held = keys.dims()[2];
+            // Padding slots (past the length) hold a far-future position: always masked.
+            let kpos: Vec<i32> =
+                (0..held).map(|p| if p < self.length { p as i32 } else { EMPTY_SLOT }).collect();
             let mask = build_mask(&self.device, &qpos, &kpos, None);
             return (keys, values, Some(mask));
         }
@@ -254,6 +274,20 @@ impl KvCache {
         self.write(k, v);
         (keys, values, Some(mask))
     }
+}
+
+/// Key slots a masked step over `n` cached positions attends to (at most `capacity`): `n`
+/// rounded up to an eighth of its next power of two (at least 512), so lengths fall into four
+/// buckets per doubling and the padding adds at most a quarter of the keys.
+pub fn key_bucket(n: usize, capacity: usize) -> usize {
+    const MIN: usize = 512;
+    let bucket = if n <= MIN {
+        MIN
+    } else {
+        let step = (n.next_power_of_two() / 8).max(1);
+        n.div_ceil(step) * step
+    };
+    bucket.min(capacity).max(n)
 }
 
 /// A copy of `t` in a buffer of its own (on the CPU a clone suffices: writes there copy a
@@ -396,5 +430,30 @@ impl LayerCache {
             Self::Latent(c) => c,
             _ => unreachable!("a retrieval layer gets the cache it made"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_bucket;
+
+    #[test]
+    fn key_buckets_are_few_and_cover() {
+        assert_eq!(key_bucket(1, 100_000), 512);
+        assert_eq!(key_bucket(512, 100_000), 512);
+        assert_eq!(key_bucket(513, 100_000), 640);
+        assert_eq!(key_bucket(1100, 100_000), 1280);
+        assert_eq!(key_bucket(40_000, 100_000), 40_960);
+        assert_eq!(key_bucket(300, 200), 300);
+        assert_eq!(key_bucket(150, 200), 200);
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 1..=131_072 {
+            let b = key_bucket(n, 1 << 20);
+            assert!(b >= n && (b <= 512 || b * 4 <= n * 5));
+            seen.insert(b);
+        }
+        // Four per doubling from 512 to 128k, plus the minimum.
+        assert!(seen.len() <= 4 * 8 + 1, "{} buckets", seen.len());
+        assert!(seen.len() >= 8);
     }
 }
