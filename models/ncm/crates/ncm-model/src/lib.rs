@@ -19,6 +19,8 @@ pub(crate) mod inplace;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 pub mod layers;
+#[cfg(feature = "cuda")]
+pub mod mlp_fused;
 pub mod ncm;
 pub mod quant;
 pub mod retrieval;

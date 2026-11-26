@@ -29,6 +29,8 @@ use burn::tensor::{Device, Int, Tensor};
 
 pub use convert::{QuantError, load_quantized, quantize_model, read_spec, save_quantized};
 pub use format::Format;
+#[cfg(feature = "cuda")]
+pub(crate) use linear::KernelWeight;
 pub use linear::{QLinear, dequantize};
 
 /// Rows (tokens) up to which a quantised layer takes the GEMV kernel on CUDA.

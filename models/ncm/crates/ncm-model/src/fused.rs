@@ -14,6 +14,19 @@ static FUSED_KERNELS: AtomicBool = AtomicBool::new(true);
 #[cfg(feature = "cuda")]
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static CUDA_GRAPHS: AtomicBool = AtomicBool::new(true);
+static FUSED_MLP: AtomicBool = AtomicBool::new(true);
+
+/// Allow (the default) or forbid the fused MLP kernels ([`crate::mlp_fused`]: the norm folded
+/// into the gate/up GEMV, SwiGLU and the residual add into its epilogues); without them the MLP
+/// runs as separate norm, GEMV and elementwise ops. Process-wide, for A/B runs.
+pub fn set_fused_mlp(on: bool) {
+    FUSED_MLP.store(on, Ordering::Relaxed);
+}
+
+/// Whether decode MLPs on `device` take the fused MLP kernels now.
+pub fn fused_mlp_active(device: &Device) -> bool {
+    FUSED_MLP.load(Ordering::Relaxed) && active(device)
+}
 
 /// Allow (the default) or forbid replaying decode steps as captured CUDA graphs
 /// ([`crate::ncm::GraphedDecoder`], [`crate::layers::GraphedStack`]); without them the same

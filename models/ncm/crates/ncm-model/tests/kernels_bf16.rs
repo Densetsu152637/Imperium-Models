@@ -157,3 +157,9 @@ fn graphed_decoder_waits_for_a_full_ring_bf16() {
     let (device, _lock) = setup(DTYPE);
     graphed_decoder_waits_for_a_full_ring(&device);
 }
+
+#[test]
+fn fused_mlp_matches_unfused_bf16() {
+    let (device, _lock) = setup(DTYPE);
+    fused_mlp_matches(&device, TOL);
+}

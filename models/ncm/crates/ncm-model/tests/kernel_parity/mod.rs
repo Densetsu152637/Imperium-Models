@@ -80,6 +80,45 @@ pub fn gemv_matches(device: &Device, tol: f32) {
     }
 }
 
+/// The fused MLP half ([`ncm_model::layers::Mlp::residual_step`]: add, norm, gate/up GEMV with
+/// SwiGLU, down GEMV with the residual add) against the same block run unfused on the CUDA
+/// path (`fused::set_fused_mlp(false)`) and on the CPU in f32: the models' widths, one and
+/// four rows, dense and quantised weights, with and without the residual delta.
+pub fn fused_mlp_matches(device: &Device, tol: f32) {
+    use ncm_model::fused::set_fused_mlp;
+    use ncm_model::layers::{Mlp, rms_norm};
+    let normal = Distribution::Normal(0.0, 1.0);
+    for (rows, d, ff) in [(1, 1024, 2688), (4, 512, 1536), (1, 64, 128), (2, 1000, 600)] {
+        for spec in [None, Some(quant_specs()[0]), Some(quant_specs()[1])] {
+            device.seed(6);
+            let mlp = quant::build(spec, || Mlp::new(d, ff, device));
+            let norm = rms_norm(d, 1e-6, device);
+            let x = Tensor::<3>::random([1, rows, d], normal, device);
+            let delta = Tensor::<3>::random([1, rows, d], normal, device);
+            for with_delta in [true, false] {
+                let delta = with_delta.then(|| delta.clone());
+                let got = mlp
+                    .residual_step(&norm, &x, delta.as_ref())
+                    .expect("the fused MLP takes the models' shapes");
+                set_fused_mlp(false);
+                assert!(mlp.residual_step(&norm, &x, delta.as_ref()).is_none());
+                let s = match &delta {
+                    Some(delta) => x.clone() + delta.clone(),
+                    None => x.clone(),
+                };
+                let unfused = s.clone() + mlp.forward(norm.forward(s.clone()));
+                set_fused_mlp(true);
+                let cpu_mlp = cpu_copy(&mlp);
+                let cpu_norm = cpu_copy(&norm);
+                let s_cpu = to_cpu(&s);
+                let want = values(s_cpu.clone() + cpu_mlp.forward(cpu_norm.forward(s_cpu)));
+                let what = format!("fused mlp {rows}x{d}x{ff} {spec:?} delta {with_delta}");
+                assert_close(&what, &values(got), &values(unfused), &want, tol);
+            }
+        }
+    }
+}
+
 /// The fused RMSNorm kernels (plain, and after a residual add) against Burn's `RmsNorm` on the
 /// CPU in f32 with the same weights and inputs: the models' widths at one and four rows,
 /// QK-norm's per-head rows, and a strided (narrowed) input. Also against the CUDA reference

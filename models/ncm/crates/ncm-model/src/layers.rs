@@ -329,6 +329,40 @@ impl Mlp {
         let (gate, up) = (parts.next().expect("gate"), parts.next().expect("up"));
         self.down.forward(silu(gate) * up)
     }
+
+    /// A pre-norm block's whole MLP half in two fused launches (CUDA, decode-sized runs):
+    /// `s = x + delta` (or `x`), then `s + mlp(norm(s))`, the new residual stream
+    /// ([`crate::mlp_fused`]). None when the fused kernels do not take it; the caller then runs
+    /// [`crate::fused::add_rms_norm`] and [`Self::forward`].
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+    pub fn residual_step(
+        &self,
+        norm: &RmsNorm,
+        x: &Tensor<3>,
+        delta: Option<&Tensor<3>>,
+    ) -> Option<Tensor<3>> {
+        #[cfg(feature = "cuda")]
+        {
+            if !crate::fused::fused_mlp_active(&x.device()) {
+                return None;
+            }
+            let [b, t, d] = x.dims();
+            let rows = b * t;
+            let x2 = x.clone().reshape([rows, d]);
+            let delta = delta.map(|v| v.clone().reshape([rows, d]));
+            let gamma = norm.gamma.val();
+            let (act, sum) =
+                crate::mlp_fused::mlp_in(x2.clone(), delta, gamma, norm.epsilon, &self.gate_up)?;
+            let resid = sum.unwrap_or(x2);
+            let out = match crate::mlp_fused::mlp_out(act.clone(), &self.down, resid.clone()) {
+                Some(out) => out,
+                None => resid + self.down.forward(act),
+            };
+            Some(out.reshape([b, t, d]))
+        }
+        #[cfg(not(feature = "cuda"))]
+        None
+    }
 }
 
 /// Causal GQA self-attention; `window` None means full attention. The v2 design adds QK-norm
@@ -680,7 +714,8 @@ impl Block {
     /// The block on `x` plus `pending` (the previous block's MLP output, not yet added: the add
     /// runs in one kernel with this block's first norm, [`crate::fused::add_rms_norm`]).
     /// Returns the residual stream after the mixer and this block's MLP output, likewise
-    /// pending.
+    /// pending; or, when the fused MLP kernels ran ([`Mlp::residual_step`]), the stream with
+    /// the MLP output already added and nothing pending.
     fn forward(
         &self,
         x: Tensor<3>,
@@ -689,11 +724,14 @@ impl Block {
         ropes: &Ropes,
         cache: Option<&mut LayerCache>,
         step: Option<&KvStep>,
-    ) -> (Tensor<3>, Tensor<3>) {
+    ) -> (Tensor<3>, Option<Tensor<3>>) {
         let (x, h) = norm_after(&self.n1, x, pending);
         let mixed = self.mix(h, start, ropes, cache, step);
+        if let Some(x) = self.mlp.residual_step(&self.n2, &x, Some(&mixed)) {
+            return (x, None);
+        }
         let (x, h) = crate::fused::add_rms_norm(&self.n2, x, mixed);
-        (x, self.mlp.forward(h))
+        (x, Some(self.mlp.forward(h)))
     }
 
     fn make_cache(&self, max_positions: usize, batch: usize, device: &Device) -> LayerCache {
@@ -903,8 +941,7 @@ impl Stack {
         for (i, block) in self.blocks.iter().enumerate() {
             let cache = caches.as_mut().map(|c| &mut c[i]);
             let step = steps.and_then(|s| s[i].as_ref());
-            let (next, out) = block.forward(x, pending, start, ropes, cache, step);
-            (x, pending) = (next, Some(out));
+            (x, pending) = block.forward(x, pending, start, ropes, cache, step);
         }
         norm_after(&self.norm, x, pending).1
     }

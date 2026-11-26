@@ -79,6 +79,22 @@ impl QLinear {
         (self.d_in, self.d_out)
     }
 
+    /// The weight as a fused kernel reads it: dense `[d_in, d_out]`, or the packed codes,
+    /// scales and format.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn kernel_weight(&self) -> KernelWeight {
+        match (&self.weight, self.format()) {
+            (Some(w), _) => KernelWeight::Dense(w.val()),
+            (None, Some(format)) => KernelWeight::Quant {
+                packed: self.qweight_val(),
+                scales: self.scales_val(),
+                format,
+                d_in: self.d_in,
+            },
+            (None, None) => unreachable!("a layer is dense or quantised"),
+        }
+    }
+
     /// The packed weight read back to the host, or None when dense.
     pub fn packed(&self) -> Option<Packed> {
         let format = self.format()?;
@@ -186,4 +202,12 @@ pub fn dequantize(
         .expand([d_out, groups, len])
         .reshape([d_out, k_pad]);
     (values * scales).narrow(1, 0, d_in).transpose()
+}
+
+/// A [`QLinear`]'s weight as the fused kernels read it ([`QLinear::kernel_weight`]).
+#[cfg(feature = "cuda")]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum KernelWeight {
+    Dense(Tensor<2>),
+    Quant { packed: Tensor<2, Int>, scales: Tensor<2>, format: Format, d_in: usize },
 }

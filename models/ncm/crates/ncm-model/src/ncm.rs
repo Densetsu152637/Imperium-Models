@@ -79,15 +79,20 @@ impl DecoderBlock {
         self_cache: &mut KvCache,
         cross_cache: &KvCache,
         pending: Option<Tensor<3>>,
-    ) -> (Tensor<3>, Tensor<3>) {
+    ) -> (Tensor<3>, Option<Tensor<3>>) {
         // As `Block::forward`: `pending`, the previous layer's MLP output, is added together with
-        // the first norm, and this layer's MLP output is returned pending.
+        // the first norm, and this layer's MLP output is returned pending, or added already by
+        // the fused MLP kernels (`Mlp::residual_step`).
         let (x, h) = norm_after(&self.n1, x, pending);
         let attn = self.self_attn.forward(h, rope_self, Some(self_cache));
         let (x, h) = add_rms_norm(&self.n2, x, attn);
         let (keys, values) = cross_cache.view();
-        let (x, h) = add_rms_norm(&self.n3, x, self.cross.forward(h, rope_q, keys, values, None));
-        (x, self.mlp.forward(h))
+        let crossed = self.cross.forward(h, rope_q, keys, values, None);
+        if let Some(x) = self.mlp.residual_step(&self.n3, &x, Some(&crossed)) {
+            return (x, None);
+        }
+        let (x, h) = add_rms_norm(&self.n3, x, crossed);
+        (x, Some(self.mlp.forward(h)))
     }
 }
 
@@ -556,8 +561,7 @@ impl NcmLm {
                 self.dec_blocks.iter().zip(cache.dec_self.iter_mut()).zip(cache.cross.iter());
             let mut pending = None;
             for ((blk, self_cache), cross_cache) in layers {
-                let (next, out) = blk.step(x, &rs, &rq, self_cache, cross_cache, pending);
-                (x, pending) = (next, Some(out));
+                (x, pending) = blk.step(x, &rs, &rq, self_cache, cross_cache, pending);
             }
             let lg = self.project(norm_after(&self.dec_norm, x, pending).1);
             let next = pick(j, &lg);
