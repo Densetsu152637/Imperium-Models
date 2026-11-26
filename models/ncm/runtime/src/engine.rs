@@ -10,9 +10,10 @@
 //! write into the caches' own buffers on CUDA, so the decode graphs are captured once and kept.
 //! All GPU work runs on one worker thread ([`Engine`]), as the kept graphs require.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 
 use burn::module::{Module, ModuleMapper, Param};
@@ -157,6 +158,22 @@ pub trait Backend: Send + Sync {
 
     /// Rejects a prompt that cannot be served, before any generation starts.
     fn check_prompt(&self, tokens: usize) -> Result<(), EngineError>;
+
+    /// Why the backend can serve no more requests (it panicked; its state may be broken), or
+    /// None while it is healthy. The server then reports itself unavailable so that a
+    /// supervisor restarts it.
+    fn broken(&self) -> Option<String> {
+        None
+    }
+}
+
+/// The message of a panic payload.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,6 +470,8 @@ struct Run<'a> {
     constraint: Option<Box<dyn Constraint>>,
     ids: Specials,
     on_token: &'a mut dyn FnMut(u32) -> bool,
+    /// Set when the listener left: the decode loops check it before each step.
+    cancel: &'a AtomicBool,
     max_tokens: usize,
     emitted: usize,
 }
@@ -513,13 +532,20 @@ pub struct Engine {
     info: ModelInfo,
     vocab: Arc<Vocab>,
     jobs: Mutex<mpsc::Sender<Job>>,
+    /// Set (with the panic's message) when a request panicked on the worker thread, which then
+    /// stops: its model, caches and graphs may be inconsistent.
+    dead: Arc<OnceLock<String>>,
 }
+
+/// Events in flight between the worker and a request's caller: about two NCM concepts'
+/// tokens, so the worker cannot run far ahead of a slow listener.
+const EVENTS_IN_FLIGHT: usize = 8;
 
 /// A request for the worker thread, the channel its events go back on, and the flag the caller
 /// sets when its listener left.
 struct Job {
     request: GenRequest,
-    events: mpsc::Sender<Event>,
+    events: mpsc::SyncSender<Event>,
     cancel: Arc<AtomicBool>,
 }
 
@@ -536,33 +562,57 @@ impl Engine {
         let (ready, built) = mpsc::channel();
         let (jobs, queue) = mpsc::channel::<Job>();
         let worker_vocab = vocab.clone();
+        let dead = Arc::new(OnceLock::new());
+        let worker_dead = dead.clone();
         std::thread::Builder::new()
             .name("ncm-engine".into())
             .spawn(move || {
-                let core = match Core::build(options, worker_vocab) {
-                    Ok(core) => {
+                let built = catch_unwind(AssertUnwindSafe(|| Core::build(options, worker_vocab)));
+                let core = match built {
+                    Ok(Ok(core)) => {
                         ready.send(Ok(core.info.clone())).ok();
                         core
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         ready.send(Err(e)).ok();
                         return;
                     }
+                    Err(panic) => {
+                        let message = panic_message(panic.as_ref());
+                        ready
+                            .send(Err(EngineError::Device(format!("loading panicked: {message}"))))
+                            .ok();
+                        return;
+                    }
                 };
-                // Ends when the engine (its sender) is dropped.
+                // Ends when the engine (its sender) is dropped, or after a panic.
                 for Job { request, events, cancel } in queue {
                     let mut on_token = |token| {
                         !cancel.load(Ordering::Relaxed) && events.send(Event::Token(token)).is_ok()
                     };
-                    let result = core.generate(request, &mut on_token);
-                    events.send(Event::Done(result)).ok();
+                    let result = catch_unwind(AssertUnwindSafe(|| {
+                        core.generate(request, &cancel, &mut on_token)
+                    }));
+                    match result {
+                        Ok(result) => {
+                            events.send(Event::Done(result)).ok();
+                        }
+                        Err(panic) => {
+                            let message = panic_message(panic.as_ref());
+                            worker_dead.set(message.clone()).ok();
+                            let error =
+                                EngineError::Device(format!("generation panicked: {message}"));
+                            events.send(Event::Done(Err(error))).ok();
+                            return;
+                        }
+                    }
                 }
             })
             .map_err(|e| EngineError::Device(format!("cannot start the engine thread: {e}")))?;
         let info = built
             .recv()
             .map_err(|_| EngineError::Device("the engine thread stopped while loading".into()))??;
-        Ok(Self { info, vocab, jobs: Mutex::new(jobs) })
+        Ok(Self { info, vocab, jobs: Mutex::new(jobs), dead })
     }
 }
 
@@ -579,13 +629,22 @@ impl Backend for Engine {
         check_prompt(&self.info, tokens)
     }
 
+    fn broken(&self) -> Option<String> {
+        self.dead.get().cloned()
+    }
+
     fn generate(
         &self,
         request: GenRequest,
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<GenStats, EngineError> {
         check_prompt(&self.info, request.prompt.len())?;
-        let (events, received) = mpsc::channel();
+        if let Some(message) = self.dead.get() {
+            return Err(EngineError::Device(format!(
+                "the engine stopped after a panic: {message}"
+            )));
+        }
+        let (events, received) = mpsc::sync_channel(EVENTS_IN_FLIGHT);
         let cancel = Arc::new(AtomicBool::new(false));
         let job = Job { request, events, cancel: cancel.clone() };
         let gone = || EngineError::Device("the engine thread stopped".into());
@@ -611,6 +670,7 @@ impl Core {
     fn generate(
         &self,
         request: GenRequest,
+        cancel: &AtomicBool,
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<GenStats, EngineError> {
         check_prompt(&self.info, request.prompt.len())?;
@@ -620,6 +680,7 @@ impl Core {
             constraint: request.constraint,
             ids: self.vocab.ids,
             on_token,
+            cancel,
             max_tokens: request.max_tokens.max(1),
             emitted: 0,
         };
@@ -711,6 +772,9 @@ impl Core {
         let decode_started = Instant::now();
         let mut last = Some(logits);
         let finish = loop {
+            if run.cancel.load(Ordering::Relaxed) {
+                break Finish::Stop;
+            }
             let token = run.choose(&row);
             run.advance(token);
             match run.emit(token) {
@@ -826,6 +890,9 @@ impl Core {
         let mut empty_concepts = 0;
         let mut forced: &[i32] = pending;
         let finish = 'generate: loop {
+            if run.cancel.load(Ordering::Relaxed) {
+                break Finish::Stop;
+            }
             // A concept's tokens: the pending prompt tokens first, then chosen on the host
             // when sampling, constrained, or completing a forced start, else by argmax on the
             // device.
@@ -957,6 +1024,9 @@ impl Core {
         };
         let decode_started = Instant::now();
         let finish = loop {
+            if run.cancel.load(Ordering::Relaxed) {
+                break Finish::Stop;
+            }
             let id = read_ids(&token)[0];
             match run.emit(id) {
                 Emit::Stop => break Finish::Stop,
@@ -1026,6 +1096,9 @@ impl Core {
         let fresh = !(if speculate { append.is_captured() } else { step.is_captured() });
         let mut empty_concepts = 0;
         let finish = loop {
+            if run.cancel.load(Ordering::Relaxed) {
+                break Finish::Stop;
+            }
             let picked = read_ids(&tokens);
             let before = run.emitted;
             let concept = match self.emit_concept(&picked, skip, k, run) {

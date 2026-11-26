@@ -397,3 +397,45 @@ async fn concurrent_requests_all_complete() {
         assert_eq!(join.await.unwrap(), "Same answer.");
     }
 }
+
+/// A backend whose generation panics.
+struct Panicking(Scripted);
+
+impl ncm_server::engine::Backend for Panicking {
+    fn info(&self) -> &ncm_server::engine::ModelInfo {
+        self.0.info()
+    }
+
+    fn vocab(&self) -> &Arc<ncm_server::vocab::Vocab> {
+        self.0.vocab()
+    }
+
+    fn generate(
+        &self,
+        _request: ncm_server::engine::GenRequest,
+        _on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<ncm_server::engine::GenStats, ncm_server::engine::EngineError> {
+        panic!("a scripted failure")
+    }
+
+    fn check_prompt(&self, tokens: usize) -> Result<(), ncm_server::engine::EngineError> {
+        self.0.check_prompt(tokens)
+    }
+}
+
+#[tokio::test]
+async fn a_panic_in_generation_fails_the_request_and_health() {
+    let backend = Arc::new(Panicking(Scripted::new("Hi.<|im_end|>", 4096)));
+    let state = Arc::new(AppState::ready(backend, "m", SamplingParams::GREEDY));
+    let server = TestServer::start(state).await;
+    assert_eq!(reqwest::get(server.url("/health")).await.unwrap().status(), 200);
+    let response = post(&server, "/v1/chat/completions", &chat_body(json!({}))).await;
+    assert!(!response.status().is_success(), "the panicking request fails");
+    let text = response.text().await.unwrap();
+    assert!(text.contains("a scripted failure"), "{text}");
+    // The server is broken from now on: a supervisor restarts it.
+    let health = reqwest::get(server.url("/health")).await.unwrap();
+    assert_eq!(health.status(), 503);
+    let again = post(&server, "/v1/chat/completions", &chat_body(json!({}))).await;
+    assert_eq!(again.status(), 503);
+}

@@ -43,6 +43,8 @@ pub struct AppState {
     backend: OnceLock<Arc<dyn Backend>>,
     /// Why loading failed, if it did.
     failure: OnceLock<String>,
+    /// Why the backend broke, if generation panicked on the caller's thread.
+    broken: Arc<OnceLock<String>>,
     /// The model name in responses.
     pub alias: String,
     pub model_path: String,
@@ -57,6 +59,7 @@ impl AppState {
         Self {
             backend: OnceLock::new(),
             failure: OnceLock::new(),
+            broken: Arc::new(OnceLock::new()),
             alias: alias.to_owned(),
             model_path: model_path.to_owned(),
             slots,
@@ -84,11 +87,20 @@ impl AppState {
         self.failure.get().cloned()
     }
 
+    /// The loaded backend, or why there is none to serve with: still loading, failed to load,
+    /// or broken by a panic (then every request, `/health` included, answers 503, so that
+    /// Imperium's supervisor restarts the server).
     fn backend(&self) -> Result<&Arc<dyn Backend>, ApiError> {
-        self.backend.get().ok_or_else(|| match self.failure.get() {
+        let backend = self.backend.get().ok_or_else(|| match self.failure.get() {
             Some(message) => ApiError::unavailable(format!("the model failed to load: {message}")),
             None => ApiError::unavailable("Loading model"),
-        })
+        })?;
+        match self.broken.get().cloned().or_else(|| backend.broken()) {
+            Some(message) => Err(ApiError::unavailable(format!(
+                "the model stopped after an internal error: {message}"
+            ))),
+            None => Ok(backend),
+        }
     }
 
     fn next_id(&self) -> String {
@@ -241,13 +253,25 @@ enum Message {
 }
 
 /// Starts generation on a blocking thread and returns the channel its tokens arrive on. The
-/// thread stops by itself when the receiver is dropped (the client left).
-fn start_generation(backend: Arc<dyn Backend>, request: GenRequest) -> mpsc::Receiver<Message> {
+/// thread stops by itself when the receiver is dropped (the client left). A panic in the backend
+/// fails the request and marks the server broken (`broken`).
+fn start_generation(
+    backend: Arc<dyn Backend>,
+    broken: Arc<OnceLock<String>>,
+    request: GenRequest,
+) -> mpsc::Receiver<Message> {
     let (tx, rx) = mpsc::channel(256);
     tokio::task::spawn_blocking(move || {
         let sender = tx.clone();
-        let result = backend
-            .generate(request, &mut |token| sender.blocking_send(Message::Token(token)).is_ok());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend
+                .generate(request, &mut |token| sender.blocking_send(Message::Token(token)).is_ok())
+        }));
+        let result = result.unwrap_or_else(|panic| {
+            let message = crate::engine::panic_message(panic.as_ref());
+            broken.set(message.clone()).ok();
+            Err(EngineError::Device(format!("generation panicked: {message}")))
+        });
         tx.blocking_send(Message::Done(result)).ok();
     });
     rx
@@ -293,7 +317,7 @@ async fn chat_completions(
     let created = unix_time();
     let Prepared { request, generation, parse_tools } = prepared;
     let cache_bytes = backend.info().cache_bytes;
-    let rx = start_generation(backend.clone(), generation);
+    let rx = start_generation(backend.clone(), state.broken.clone(), generation);
     if request.stream {
         Ok(stream_response(backend, rx, request, parse_tools, id, model, created, cache_bytes))
     } else {
