@@ -14,6 +14,15 @@ fn device() -> Device {
     Device::flex()
 }
 
+/// The tests share the CPU device's random stream (`device.seed`, weight init), so they run one
+/// at a time: a test drawing from it while another seeds and builds a model would change the
+/// other's weights.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `got` within `rel` of the design's hand count `want`.
 fn assert_near(what: &str, got: usize, want: f64, rel: f64) {
     let err = (got as f64 - want).abs() / want;
@@ -22,6 +31,7 @@ fn assert_near(what: &str, got: usize, want: f64, rel: f64) {
 
 #[test]
 fn hybrid_config_parses_and_round_trips() {
+    let _serial = serial();
     let cfg = Config::parse(NCM_250M_HYBRID_TOML).expect("the hybrid config parses");
     let Config::Ncm(ncm) = &cfg else { panic!("an NCM config") };
     let hybrid = ncm.hybrid.as_ref().expect("a [hybrid] table");
@@ -40,6 +50,7 @@ fn hybrid_config_parses_and_round_trips() {
 /// high): gated DeltaNet ~11.7M, sparse retrieval ~12.5M at d = 1024 with MLP 2,112, 7 of each.
 #[test]
 fn hybrid_backbone_layers_match_the_budget() {
+    let _serial = serial();
     let device = device();
     let cfg = ncm_250m_hybrid();
     let (_, backbone) = ncm_specs(&cfg);
@@ -99,6 +110,7 @@ fn tiny_cfg() -> (ncm_model::NcmConfig, HybridConfig) {
 
 #[test]
 fn resampling_matrices_match_pytorch() {
+    let _serial = serial();
     // interpolate(mode="area") from 32 to 12: windows [0, 3), [2, 6), [5, 8), ...
     let m = area_matrix(12, 32);
     assert_close(
@@ -114,10 +126,12 @@ fn resampling_matrices_match_pytorch() {
         }
     }
     // interpolate(mode="linear", align_corners=False) from 2 to 8: output 0 clamps to input 0,
-    // output 2 sits at 0.375 (weights 0.625 / 0.375).
+    // output 2 sits at source (2 + 0.5) * 2 / 8 - 0.5 = 0.125 (weights 0.875 / 0.125; PyTorch
+    // gives [0, 0, 0.125, 0.375, 0.625, 0.875, 1, 1] for the input [0, 1]).
     let u = linear_matrix(8, 2);
     assert_close(&u[0..2], &[1.0, 0.0], 1e-7, 0.0);
-    assert_close(&u[4..6], &[0.625, 0.375], 1e-6, 0.0);
+    assert_close(&u[4..6], &[0.875, 0.125], 1e-6, 0.0);
+    assert_close(&u[6..8], &[0.625, 0.375], 1e-6, 0.0);
     assert_close(&u[14..16], &[0.0, 1.0], 1e-7, 0.0);
     for row in linear_matrix(32, 12).chunks(12) {
         assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-6);
@@ -129,6 +143,7 @@ fn resampling_matrices_match_pytorch() {
 
 #[test]
 fn quantiser_residual_adds_up() {
+    let _serial = serial();
     let device = device();
     device.seed(1);
     let (cfg, h) = tiny_cfg();
@@ -152,6 +167,7 @@ fn quantiser_residual_adds_up() {
 
 #[test]
 fn ema_with_no_memory_moves_entries_to_their_means() {
+    let _serial = serial();
     let device = device();
     device.seed(2);
     let (cfg, h) = tiny_cfg();
@@ -179,6 +195,7 @@ fn ema_with_no_memory_moves_entries_to_their_means() {
 
 #[test]
 fn nested_dropout_never_drops_everything() {
+    let _serial = serial();
     let mut state = 0.123f64;
     let mut uniform = || {
         state = (state * 997.0 + 0.1).fract();
@@ -193,6 +210,7 @@ fn nested_dropout_never_drops_everything() {
 
 #[test]
 fn tokenizer_trains_through_the_straight_through_path() {
+    let _serial = serial();
     let device = device();
     device.seed(4);
     let (cfg, h) = tiny_cfg();
@@ -219,6 +237,7 @@ use ncm_model::{TokenLm, tok_250m_v2};
 /// design's 254.4M, and the hybrid at most 2% larger than the token baseline.
 #[test]
 fn hybrid_parameter_counts_match_the_budget() {
+    let _serial = serial();
     let device = device();
     let parts = HybridLm::new(&ncm_250m_hybrid(), &device).parts();
     // (part, design hand count, tolerance). The design counts the token decoder's and the
@@ -270,6 +289,7 @@ fn block_codes(model: &HybridLm, tokens: Tensor<2, Int>) -> Tensor<2, Int> {
 
 #[test]
 fn training_forward_gives_finite_losses() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(10);
     let n = 6 * h.block;
     let toks = tokens(&device, cfg.vocab_size, 2, n, 11);
@@ -299,6 +319,7 @@ fn training_forward_gives_finite_losses() {
 /// leaves the token decoder's outputs at earlier positions unchanged.
 #[test]
 fn training_forward_is_causal_across_blocks() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(12);
     let l = h.block;
     let nb = 6;
@@ -326,8 +347,13 @@ fn training_forward_is_causal_across_blocks() {
                 "block {blk} level {k}"
             );
         }
+        // The visible entries only: hidden ones (the known prefix past its length, padding)
+        // may hold anything, the attention masks them.
         let mem = |m: &ncm_model::hybrid::Memory| {
-            (values(m.extra.clone().narrow(1, blk, 1)), m.windows[blk])
+            let extra = m.extra.clone().narrow(1, blk, 1);
+            let hidden = m.extra_hidden.clone().narrow(1, blk, 1).unsqueeze_dim::<4>(3);
+            let shown = extra.clone().mask_fill(hidden.expand(extra.dims()), 0.0);
+            (values(shown), m.windows[blk])
         };
         assert_eq!(mem(&base.memory), mem(&other.memory), "block {blk} memory entries");
         let (lo, hi) = base.memory.windows[blk];
@@ -357,6 +383,7 @@ fn host_ints(t: Tensor<2, Int>) -> Vec<i32> {
 /// inference passes over the same block memory, teacher-forced on the same codes.
 #[test]
 fn generator_training_logits_match_per_level_passes() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(20);
     let l = h.block;
     let nb = 5;
@@ -393,6 +420,7 @@ fn generator_training_logits_match_per_level_passes() {
 /// token log-probabilities with z = 0; and its memories match the training memories.
 #[test]
 fn incremental_autoregressive_path_matches_training_forward() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(22);
     let l = h.block;
     let nb = 6;
@@ -442,6 +470,7 @@ fn greedy(verified: bool) -> DecodeOptions {
 /// and re-decodes forced at every allowed point or never.
 #[test]
 fn verified_mode_equals_autoregressive_greedy() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(24);
     let l = h.block;
     let v = cfg.vocab_size as i32;
@@ -484,6 +513,7 @@ fn verified_mode_equals_autoregressive_greedy() {
 /// position is the same.
 #[test]
 fn autoregressive_rows_ignore_codes_drafts_and_redecodes() {
+    let _serial = serial();
     use std::collections::HashMap;
     let (model, cfg, h, device) = tiny_model(26);
     let l = h.block;
@@ -532,6 +562,7 @@ fn autoregressive_rows_ignore_codes_drafts_and_redecodes() {
 /// stop mid-block followed by a new message leaves the state of prefilling the whole stream.
 #[test]
 fn offsets_and_stops_match_prefill() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(28);
     let l = h.block;
     let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 8 * l, 29));
@@ -579,6 +610,7 @@ fn offsets_and_stops_match_prefill() {
 /// continuation of the tokens before them.
 #[test]
 fn mixed_block_switches_to_verified_mode() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(30);
     let l = h.block;
     let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 6 * l, 31));
@@ -612,6 +644,7 @@ fn mixed_block_switches_to_verified_mode() {
 /// recent states.
 #[test]
 fn hybrid_cache_at_1m_matches_the_design() {
+    let _serial = serial();
     let bytes = hybrid_cache_bytes(&ncm_250m_hybrid(), 1 << 20, 2, 1) as f64 / GIB;
     assert!((0.27..=0.33).contains(&bytes), "{bytes:.3} GiB at 1M tokens");
 }
@@ -626,6 +659,7 @@ use ncm_model::hybrid::FastSession;
 /// acceptance.
 #[test]
 fn fast_path_matches_the_reference_loop() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(40);
     let l = h.block;
     let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 8 * l, 41));
@@ -658,6 +692,7 @@ fn fast_path_matches_the_reference_loop() {
 /// synthetic acceptance decides (it changes only how fast the tokens come).
 #[test]
 fn fast_verified_mode_equals_autoregressive_greedy() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(42);
     let l = h.block;
     let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 6 * l, 43));
@@ -689,6 +724,7 @@ fn fast_verified_mode_equals_autoregressive_greedy() {
 /// token. Every emitted token is allowed, and the fast path agrees with the reference loop.
 #[test]
 fn constraint_scan_rejects_what_it_should() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(44);
     let l = h.block;
     let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 6 * l, 45));
@@ -770,6 +806,7 @@ fn verified_sampling_matches_the_path(device: Device, fast: bool) {
 
 #[test]
 fn verified_sampling_has_the_paths_distribution() {
+    let _serial = serial();
     verified_sampling_matches_the_path(device(), false);
 }
 
@@ -777,6 +814,7 @@ fn verified_sampling_has_the_paths_distribution() {
 #[cfg(feature = "cuda")]
 #[test]
 fn fast_verified_sampling_has_the_paths_distribution_on_cuda() {
+    let _serial = serial();
     verified_sampling_matches_the_path(Device::cuda(0), true);
 }
 
@@ -788,6 +826,7 @@ fn fast_verified_sampling_has_the_paths_distribution_on_cuda() {
 /// the same losses, and bit-identical results run to run.
 #[test]
 fn chunked_memory_and_target_logprobs_match_the_reference() {
+    let _serial = serial();
     let device = device();
     let (base, h) = tiny_cfg();
     let l = h.block;
@@ -840,6 +879,7 @@ fn chunked_memory_and_target_logprobs_match_the_reference() {
 /// 2% of the token baseline; each file parses and round-trips.
 #[test]
 fn one_b_configs_have_their_parameter_counts() {
+    let _serial = serial();
     use ncm_model::config::{NCM_1B_TOML, NCM_HYBRID_1B_TOML, TOK_1B_TOML};
     use ncm_model::{NcmLm, ncm_1b, ncm_hybrid_1b, tok_1b};
     for text in [TOK_1B_TOML, NCM_1B_TOML, NCM_HYBRID_1B_TOML] {
@@ -928,6 +968,7 @@ fn lockstep(
 /// temperature 0, verified and parallel, from prompts of different lengths and offsets.
 #[test]
 fn batched_slots_decode_what_single_sessions_do() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(60);
     let l = h.block;
     let stream = host_ints(tokens(&device, cfg.vocab_size, 1, 10 * l, 61));
@@ -956,6 +997,7 @@ fn batched_slots_decode_what_single_sessions_do() {
 /// Batched prefill of equal-length chunks leaves each session as prefilling it alone does.
 #[test]
 fn batched_hybrid_prefill_matches_single() {
+    let _serial = serial();
     let (model, cfg, h, device) = tiny_model(62);
     let l = h.block;
     let a = host_ints(tokens(&device, cfg.vocab_size, 1, 3 * l + 2, 63));
