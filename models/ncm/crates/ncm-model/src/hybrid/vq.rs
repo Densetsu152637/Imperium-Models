@@ -428,6 +428,38 @@ impl BlockTokenizer {
         self.phi(k, up)
     }
 
+    /// `acc + contribution_with(k, codes, r)` (or the contribution alone): on CUDA with the
+    /// fused kernels on, one launch from the codes to the sum
+    /// ([`crate::kernels::hybrid::level_tail`]).
+    pub fn add_contribution(
+        &self,
+        k: usize,
+        codes: Tensor<2, Int>,
+        r: &Resampler,
+        acc: Option<Tensor<3>>,
+    ) -> Tensor<3> {
+        #[cfg(feature = "cuda")]
+        if crate::fused::active(&codes.device()) {
+            let conv = &self.phis[phi_index(k, self.levels.len(), self.phis.len())];
+            let tail = crate::kernels::hybrid::level_tail(
+                codes.clone(),
+                self.codebook(k),
+                r.up[k].clone(),
+                conv,
+                self.phi_ratio,
+                acc.clone(),
+            );
+            if let Some(y) = tail {
+                return y;
+            }
+        }
+        let c = self.contribution_with(k, codes, r);
+        match acc {
+            Some(a) => a + c,
+            None => c,
+        }
+    }
+
     /// [`Self::pool`] with the tables of `r`.
     pub fn pool_with(&self, k: usize, x: Tensor<3>, r: &Resampler) -> Tensor<3> {
         match &r.down[k] {

@@ -429,11 +429,7 @@ impl FastSession {
             let out = model.generator_fast(x, &c.level_ropes[k], &memory);
             let logits = tok.code_logits_with(k, out, &c.resampler);
             let codes = self.pick_codes(k, logits, mode);
-            let contribution = tok.contribution_with(k, codes, &c.resampler);
-            zhat = Some(match zhat {
-                Some(z) => z + contribution,
-                None => contribution,
-            });
+            zhat = Some(tok.add_contribution(k, codes, &c.resampler, zhat));
         }
         let zhat = zhat.expect("at least one level");
         // The draft, the known prefix forced.

@@ -1117,3 +1117,39 @@ pub fn sampler_rows_are_independent(device: &Device) {
         assert_eq!(alone[0], drawn[r], "row {r} alone");
     }
 }
+
+/// The hybrid's fused level tail (codes to contribution plus ẑ) against the reference ops on
+/// the same device: every level of the tiny hybrid (upsampled and identity levels), with and
+/// without an accumulator.
+pub fn level_tail_matches(device: &Device, tol: f32) {
+    let cfg = ncm_model::tiny_hybrid(ncm_model::tiny_v2(2, 2, 4));
+    let h = cfg.hybrid.clone().expect("hybrid");
+    device.seed(5);
+    let tok = ncm_model::hybrid::BlockTokenizer::new(
+        &h,
+        cfg.vocab_size,
+        cfg.local_dim,
+        cfg.norm_eps,
+        device,
+    );
+    let r = tok.resampler(device);
+    for (k, &n) in h.levels.iter().enumerate() {
+        let codes: Vec<i32> = (0..2 * n).map(|i| ((i * 7 + k) % h.codebook) as i32).collect();
+        let codes = Tensor::<2, Int>::from_data(TensorData::new(codes, [2, n]), device);
+        let acc =
+            Tensor::<3>::random([2, h.block, h.latent], Distribution::Normal(0.0, 0.02), device);
+        for with_acc in [false, true] {
+            let a = with_acc.then(|| acc.clone());
+            let got = tok.add_contribution(k, codes.clone(), &r, a.clone());
+            let want = reference(|| {
+                let c = tok.contribution_with(k, codes.clone(), &r);
+                match a.clone() {
+                    Some(a) => a + c,
+                    None => c,
+                }
+            });
+            let what = format!("level tail {k} (acc {with_acc})");
+            assert_close(&what, &values(got), &values(want.clone()), &values(want), tol);
+        }
+    }
+}

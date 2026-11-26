@@ -180,3 +180,9 @@ fn sampler_rows_are_independent_f32() {
     let (device, _lock) = setup(DTYPE);
     sampler_rows_are_independent(&device);
 }
+
+#[test]
+fn level_tail_matches_reference_f32() {
+    let (device, _lock) = setup(DTYPE);
+    level_tail_matches(&device, TOL);
+}

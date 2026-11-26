@@ -10,6 +10,7 @@ mod assign;
 mod attend;
 mod delta;
 mod gemv;
+pub mod hybrid;
 mod norm;
 mod quant;
 mod retrieval;
