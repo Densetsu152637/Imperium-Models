@@ -12,7 +12,10 @@
 //! The same kernels serve the attention half: [`norm_linear`] folds the pre-attention norm
 //! into a mixer's input projection (and the gate's sigmoid into its epilogue), and
 //! [`gated_linear`] folds the output gate's product into the output projection's prologue.
-//! Up to eight rows (tokens) per launch.
+//! Up to eight rows (tokens) per launch take the GEMV kernels below; 9 to 64 rows (verify
+//! passes, batched slot steps, short prefill pieces) a small-M GEMM with the same prologues and
+//! epilogues ([`kernel::tile_kernel`], weight tiles staged in shared memory, q8/q4 decoded on
+//! the fly), so those steps keep the fusion.
 //!
 //! Dense weights take a vectorised split-K GEMV whose splits are combined deterministically by
 //! the last cube of each column tile to finish (a device fence, then an atomic arrival count in
@@ -553,6 +556,296 @@ mod kernel {
             }
         }
     }
+    /// Output columns per cube of [`tile_kernel`].
+    pub(super) const TILE_COLS: usize = 64;
+    /// `K` per staged tile of [`tile_kernel`] (a multiple of every format's codes per word).
+    pub(super) const TILE_K: usize = 32;
+    /// Row groups of [`tile_kernel`]: unit `u` owns column `u % TILE_COLS` of rows
+    /// `u / TILE_COLS + TILE_GROUPS i`.
+    pub(super) const TILE_GROUPS: usize = CUBE / TILE_COLS;
+    /// Most rows of [`tile_kernel`] (verify passes, batched slot steps, short prefill pieces).
+    pub(super) const TILE_ROWS: usize = 64;
+
+    /// Stages weight columns `col0 .. col0 + TILE_COLS` (of `n_w`) over `kb .. kb + TILE_K`
+    /// (zeros past `k_end`) into `ws` `[TILE_K, TILE_COLS]`: dense `w` `[K, N_w]` through its
+    /// strides, or with `quant` the codes of features `col0 ..` (rows of `packed`) decoded with
+    /// their scales.
+    #[cube]
+    #[allow(clippy::too_many_arguments)]
+    fn stage_weight<F: Float>(
+        w: &Tensor<F>,
+        packed: &Tensor<i32>,
+        scales: &Tensor<f32>,
+        ws: &mut Shared<[f32]>,
+        kb: usize,
+        k_end: usize,
+        col0: usize,
+        n_w: usize,
+        words: usize,
+        #[comptime] quant: bool,
+        #[comptime] bits: u32,
+        #[comptime] group_words: usize,
+    ) {
+        let tid = UNIT_POS as usize;
+        if comptime!(quant) {
+            let per = comptime!(32 / bits) as usize;
+            let wpt = comptime!(TILE_K / (32 / bits) as usize);
+            let mask = comptime!((1u32 << bits) - 1) as i32;
+            let offset = comptime!(1u32 << (bits - 1)) as f32;
+            let mut i = tid;
+            while i < TILE_COLS * wpt {
+                let (cc, wi) = (i / wpt, i % wpt);
+                let feature = col0 + cc;
+                let wd = kb / per + wi;
+                let live = feature < n_w && wd < words;
+                let f = select(live, feature, 0usize);
+                let wc = select(live, wd, 0usize);
+                let word = packed[f * packed.stride(0) + wc * packed.stride(1)];
+                let scale = select(
+                    live,
+                    scales[f * scales.stride(0) + (wc / group_words) * scales.stride(1)],
+                    0.0f32,
+                );
+                #[unroll]
+                for j in 0..per {
+                    let code = f32::cast_from((word >> comptime!(j as u32 * bits) as i32) & mask);
+                    ws[(wi * per + j) * TILE_COLS + cc] = (code - offset) * scale;
+                }
+                i += CUBE;
+            }
+        } else {
+            let (w0, w1) = (w.stride(0), w.stride(1));
+            let mut i = tid;
+            while i < TILE_K * TILE_COLS {
+                let (kk, cc) = (i / TILE_COLS, i % TILE_COLS);
+                let (at, cn) = (kb + kk, col0 + cc);
+                let mut v = 0.0f32;
+                if at < k_end && cn < n_w {
+                    v = f32::cast_from(w[at * w0 + cn * w1]);
+                }
+                ws[kk * TILE_COLS + cc] = v;
+                i += CUBE;
+            }
+        }
+    }
+
+    /// The fused projection for 9 to [`TILE_ROWS`] rows as a small-M GEMM: cube `(tile, split)`
+    /// computes output columns `tile * TILE_COLS ..` of every row over `K` in
+    /// `split * k_split ..` (a multiple of `TILE_K`), staging `TILE_K`-deep tiles of the prologue's
+    /// input (add, norm, gate product as in [`quant_kernel`]; every cube computes the rows' RMS
+    /// over all of `K`, one plane per row) and of the weight (dense, or q8/q4 codes decoded on
+    /// the fly; with `glu` the gate and up halves) in shared memory, each unit keeping its
+    /// column of `rows_per` rows in registers. With one split the epilogue (sigmoid, SwiGLU,
+    /// residual) runs here; with several, f32 partials go to `part` `[splits, m, 2, n]` for
+    /// [`tile_finish_kernel`]. `out` as for `dense_kernel` (the sum written by the column-0
+    /// cubes of every split, each for its `K` range).
+    #[cube(launch_unchecked)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tile_kernel<F: Float>(
+        x: &Tensor<F>,
+        delta: &Tensor<F>,
+        gamma: &Tensor<F>,
+        resid: &Tensor<F>,
+        mulby: &Tensor<F>,
+        w: &Tensor<F>,
+        packed: &Tensor<i32>,
+        scales: &Tensor<f32>,
+        out: &mut Tensor<F>,
+        part: &mut Tensor<f32>,
+        m: usize,
+        k: usize,
+        n: usize,
+        words: usize,
+        k_split: usize,
+        eps: f32,
+        #[comptime] rows_per: usize,
+        #[comptime] quant: bool,
+        #[comptime] bits: u32,
+        #[comptime] group_words: usize,
+        #[comptime] split: bool,
+        #[comptime] norm: bool,
+        #[comptime] add: bool,
+        #[comptime] glu: bool,
+        #[comptime] residual: bool,
+        #[comptime] mul: bool,
+        #[comptime] sigmoid: bool,
+        #[define(F)] _dtype: ElemType,
+    ) {
+        let tid = UNIT_POS as usize;
+        let c = tid % TILE_COLS;
+        let g = tid / TILE_COLS;
+        let n0 = CUBE_POS_X as usize * TILE_COLS;
+        let col = n0 + c;
+        let s = CUBE_POS_Y as usize;
+        let k_start = s * k_split;
+        let k_end = select(k_start + k_split < k, k_start + k_split, k);
+        let n_w = select(glu, 2 * n, n);
+        let mut xs = Shared::<[f32]>::new_slice(comptime!(TILE_ROWS * (TILE_K + 1)));
+        let mut wg = Shared::<[f32]>::new_slice(comptime!(TILE_K * TILE_COLS));
+        let mut wu = Shared::<[f32]>::new_slice(comptime!(TILE_K * TILE_COLS));
+        let mut rms = Shared::<[f32]>::new_slice(TILE_ROWS);
+        if comptime!(norm) {
+            // One plane per row: the RMS of all of K, rounded as the norm kernel rounds it.
+            let lane = UNIT_POS_PLANE as usize;
+            let mut r = tid / 32;
+            while r < m {
+                let mut sq = 0.0f32;
+                let mut kk = lane;
+                while kk < k {
+                    let v = f32::cast_from(input(x, delta, r, kk, add));
+                    sq += v * v;
+                    kk += 32;
+                }
+                let total = plane_sum(sq);
+                if lane == 0 {
+                    rms[r] =
+                        f32::cast_from(F::cast_from(f32::sqrt(total / f32::cast_from(k) + eps)));
+                }
+                r += CUBE / 32;
+            }
+            sync_cube();
+        }
+        let mut ag = Array::<f32>::new(rows_per);
+        let mut au = Array::<f32>::new(rows_per);
+        #[unroll]
+        for i in 0..rows_per {
+            ag[i] = 0.0;
+            au[i] = 0.0;
+        }
+        let mut kb = k_start;
+        while kb < k_end {
+            let mut i = tid;
+            while i < m * TILE_K {
+                let (r, kk) = (i / TILE_K, i % TILE_K);
+                let at = kb + kk;
+                let mut val = 0.0f32;
+                if at < k_end {
+                    let sv = input(x, delta, r, at, add);
+                    val = f32::cast_from(sv);
+                    if comptime!(norm) {
+                        val = normed::<F>(sv, rms[r], gamma[at * gamma.stride(0)]);
+                    }
+                    if comptime!(mul) {
+                        let mv = f32::cast_from(mulby[r * mulby.stride(0) + at * mulby.stride(1)]);
+                        val = f32::cast_from(F::cast_from(val * mv));
+                    }
+                    if comptime!(add) {
+                        if CUBE_POS_X == 0 {
+                            out[m * n + r * k + at] = sv;
+                        }
+                    }
+                }
+                xs[r * (TILE_K + 1) + kk] = val;
+                i += CUBE;
+            }
+            stage_weight::<F>(
+                w,
+                packed,
+                scales,
+                &mut wg,
+                kb,
+                k_end,
+                n0,
+                n_w,
+                words,
+                quant,
+                bits,
+                group_words,
+            );
+            if comptime!(glu) {
+                stage_weight::<F>(
+                    w,
+                    packed,
+                    scales,
+                    &mut wu,
+                    kb,
+                    k_end,
+                    n + n0,
+                    n_w,
+                    words,
+                    quant,
+                    bits,
+                    group_words,
+                );
+            }
+            sync_cube();
+            #[unroll]
+            for kk in 0..TILE_K {
+                let gv = wg[kk * TILE_COLS + c];
+                let mut uv = 0.0f32;
+                if comptime!(glu) {
+                    uv = wu[kk * TILE_COLS + c];
+                }
+                #[unroll]
+                for i in 0..rows_per {
+                    let r = g + i * TILE_GROUPS;
+                    if r < m {
+                        let xv = xs[r * (TILE_K + 1) + kk];
+                        ag[i] += xv * gv;
+                        if comptime!(glu) {
+                            au[i] += xv * uv;
+                        }
+                    }
+                }
+            }
+            sync_cube();
+            kb += TILE_K;
+        }
+        if col < n {
+            #[unroll]
+            for i in 0..rows_per {
+                let r = g + i * TILE_GROUPS;
+                if r < m {
+                    if comptime!(split) {
+                        let at = ((s * m + r) * 2) * n + col;
+                        part[at] = ag[i];
+                        part[at + n] = au[i];
+                    } else {
+                        let mut rv = 0.0f32;
+                        if comptime!(residual) {
+                            rv = f32::cast_from(resid[r * resid.stride(0) + col * resid.stride(1)]);
+                        }
+                        out[r * n + col] = epilogue::<F>(ag[i], au[i], rv, glu, sigmoid, residual);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adds [`tile_kernel`]'s split partials in split order and runs the epilogue: unit `i` of
+    /// `m * n` outputs.
+    #[cube(launch_unchecked)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tile_finish_kernel<F: Float>(
+        part: &Tensor<f32>,
+        resid: &Tensor<F>,
+        out: &mut Tensor<F>,
+        m: usize,
+        n: usize,
+        splits: usize,
+        #[comptime] glu: bool,
+        #[comptime] residual: bool,
+        #[comptime] sigmoid: bool,
+        #[define(F)] _dtype: ElemType,
+    ) {
+        let i = ABSOLUTE_POS;
+        if i >= m * n {
+            terminate!();
+        }
+        let (r, col) = (i / n, i % n);
+        let mut gs = 0.0f32;
+        let mut us = 0.0f32;
+        for s in 0..splits {
+            let at = ((s * m + r) * 2) * n + col;
+            gs += part[at];
+            us += part[at + n];
+        }
+        let mut rv = 0.0f32;
+        if comptime!(residual) {
+            rv = f32::cast_from(resid[r * resid.stride(0) + col * resid.stride(1)]);
+        }
+        out[r * n + col] = epilogue::<F>(gs, us, rv, glu, sigmoid, residual);
+    }
 }
 
 fn elem(dtype: DType) -> ElemType {
@@ -602,6 +895,21 @@ pub trait NcmFusedMlp: Backend {
         fusion: Fusion,
     ) -> FloatTensor<Self>;
 
+    /// See [`mlp_in`] and [`mlp_out`]: 9 to 64 rows (small-M GEMM), dense `w` or (with
+    /// `fusion.bits`) q8/q4 `packed` and `scales`; the unused weight is any stand-in.
+    #[allow(clippy::too_many_arguments)]
+    fn ncm_fmlp_tile(
+        x: FloatTensor<Self>,
+        delta: FloatTensor<Self>,
+        gamma: FloatTensor<Self>,
+        resid: FloatTensor<Self>,
+        mulby: FloatTensor<Self>,
+        w: FloatTensor<Self>,
+        packed: IntTensor<Self>,
+        scales: FloatTensor<Self>,
+        fusion: Fusion,
+    ) -> FloatTensor<Self>;
+
     /// See [`mlp_in`] and [`mlp_out`] (q8/q4 weights).
     #[allow(clippy::too_many_arguments)]
     fn ncm_fmlp_quant(
@@ -624,6 +932,96 @@ fn flat_out(x: &CubeTensor, len: usize) -> CubeTensor {
 }
 
 impl NcmFusedMlp for CubeBackend {
+    fn ncm_fmlp_tile(
+        x: CubeTensor,
+        delta: CubeTensor,
+        gamma: CubeTensor,
+        resid: CubeTensor,
+        mulby: CubeTensor,
+        w: CubeTensor,
+        packed: CubeTensor,
+        scales: CubeTensor,
+        f: Fusion,
+    ) -> CubeTensor {
+        use kernel::{CUBE, TILE_COLS, TILE_GROUPS, TILE_K};
+        let [m, k] = x.meta.shape().dims::<2>();
+        let n = f.n;
+        let quant = f.bits != 0;
+        let words = if quant { packed.meta.shape().dims::<2>()[1] } else { 0 };
+        let client = x.client.clone();
+        let sms = client.properties().hardware.num_streaming_multiprocessors.unwrap_or(84);
+        let rows_per = m.div_ceil(TILE_GROUPS).next_multiple_of(4).max(4);
+        let tiles = n.div_ceil(TILE_COLS);
+        let splits = (WAVES * sms as usize).div_ceil(tiles).clamp(1, k.div_ceil(256).max(1));
+        let k_split = k.div_ceil(splits).next_multiple_of(TILE_K);
+        let splits = k.div_ceil(k_split);
+        let out = flat_out(&x, m * n + if f.add { m * k } else { 0 });
+        let part = empty_device_contiguous_dtype(
+            client.clone(),
+            x.device.clone(),
+            vec![if splits > 1 { splits * m * 2 * n } else { 1 }].into(),
+            DType::F32,
+        );
+        let dtype = elem(x.dtype);
+        // Dense: bits stays 0, which no comptime branch then reads; give it a valid width.
+        let bits = if quant { f.bits } else { 8 };
+        let group_words = f.group_words.max(1);
+        unsafe {
+            kernel::tile_kernel::launch_unchecked(
+                &client,
+                CubeCount::Static(tiles as u32, splits as u32, 1),
+                CubeDim::new_1d(CUBE as u32),
+                x.into_tensor_arg(),
+                delta.into_tensor_arg(),
+                gamma.into_tensor_arg(),
+                resid.clone().into_tensor_arg(),
+                mulby.into_tensor_arg(),
+                w.into_tensor_arg(),
+                packed.into_tensor_arg(),
+                scales.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+                part.clone().into_tensor_arg(),
+                m,
+                k,
+                n,
+                words,
+                k_split,
+                f.eps as f32,
+                rows_per,
+                quant,
+                bits,
+                group_words,
+                splits > 1,
+                f.norm,
+                f.add,
+                f.glu,
+                f.residual,
+                f.mul,
+                f.sigmoid,
+                dtype,
+            );
+            if splits > 1 {
+                let count = m * n;
+                kernel::tile_finish_kernel::launch_unchecked(
+                    &client,
+                    CubeCount::Static(count.div_ceil(CUBE) as u32, 1, 1),
+                    CubeDim::new_1d(CUBE as u32),
+                    part.into_tensor_arg(),
+                    resid.into_tensor_arg(),
+                    out.clone().into_tensor_arg(),
+                    m,
+                    n,
+                    splits,
+                    f.glu,
+                    f.residual,
+                    f.sigmoid,
+                    dtype,
+                );
+            }
+        }
+        out
+    }
+
     fn ncm_fmlp_dense(
         x: CubeTensor,
         delta: CubeTensor,
@@ -776,7 +1174,8 @@ enum Weight {
 
 /// The layer's weight if the fused kernels take it for `rows` rows of `x` `[rows, d_in]`.
 fn weight(layer: &QLinear, rows: usize, d_in: usize, out_cols: usize) -> Option<Weight> {
-    if rows == 0 || rows > kernel::MAX_ROWS {
+    // Up to eight rows the GEMV kernels, up to 64 the small-M tile kernel.
+    if rows == 0 || rows > kernel::TILE_ROWS {
         return None;
     }
     match layer.kernel_weight() {
@@ -812,29 +1211,53 @@ fn launch(
     let gamma = gamma.unwrap_or_else(|| x.clone().reshape([rows * k]));
     let resid = resid.unwrap_or_else(|| x.clone());
     let mulby = mulby.unwrap_or_else(|| x.clone());
-    let out = match weight {
-        Weight::Dense(w) => <Dispatch as NcmFusedMlp>::ncm_fmlp_dense(
+    let out = if rows > kernel::MAX_ROWS {
+        // The small-M tile kernel; the weight kind it does not read gets a stand-in.
+        let (w, packed, scales, fusion) = match weight {
+            Weight::Dense(w) => {
+                let codes = Tensor::<2, Int>::zeros([1, 1], &device).cast(IntDType::I32);
+                (w.clone(), codes, w, fusion)
+            }
+            Weight::Quant { packed, scales, bits, group_words } => {
+                (x.clone(), packed, scales, Fusion { bits, group_words, ..fusion })
+            }
+        };
+        <Dispatch as NcmFusedMlp>::ncm_fmlp_tile(
             x.into_dispatch(),
             delta.into_dispatch(),
             gamma.into_dispatch(),
             resid.into_dispatch(),
             mulby.into_dispatch(),
             w.into_dispatch(),
-            counters(&device).into_dispatch(),
+            packed.into_dispatch(),
+            scales.into_dispatch(),
             fusion,
-        ),
-        Weight::Quant { packed, scales, bits, group_words } => {
-            let fusion = Fusion { bits, group_words, ..fusion };
-            <Dispatch as NcmFusedMlp>::ncm_fmlp_quant(
+        )
+    } else {
+        match weight {
+            Weight::Dense(w) => <Dispatch as NcmFusedMlp>::ncm_fmlp_dense(
                 x.into_dispatch(),
                 delta.into_dispatch(),
                 gamma.into_dispatch(),
                 resid.into_dispatch(),
                 mulby.into_dispatch(),
-                packed.into_dispatch(),
-                scales.into_dispatch(),
+                w.into_dispatch(),
+                counters(&device).into_dispatch(),
                 fusion,
-            )
+            ),
+            Weight::Quant { packed, scales, bits, group_words } => {
+                let fusion = Fusion { bits, group_words, ..fusion };
+                <Dispatch as NcmFusedMlp>::ncm_fmlp_quant(
+                    x.into_dispatch(),
+                    delta.into_dispatch(),
+                    gamma.into_dispatch(),
+                    resid.into_dispatch(),
+                    mulby.into_dispatch(),
+                    packed.into_dispatch(),
+                    scales.into_dispatch(),
+                    fusion,
+                )
+            }
         }
     };
     let out = Tensor::<1>::from_dispatch(out);

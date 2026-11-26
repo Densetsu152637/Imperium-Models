@@ -125,7 +125,16 @@ pub fn fused_mlp_matches(device: &Device, tol: f32) {
     use ncm_model::fused::set_fused_mlp;
     use ncm_model::layers::{Mlp, rms_norm};
     let normal = Distribution::Normal(0.0, 1.0);
-    for (rows, d, ff) in [(1, 1024, 2688), (4, 512, 1536), (1, 64, 128), (2, 1000, 600)] {
+    // GEMV rows and the small-M tile kernel (9 ..= 64 rows).
+    for (rows, d, ff) in [
+        (1, 1024, 2688),
+        (4, 512, 1536),
+        (1, 64, 128),
+        (2, 1000, 600),
+        (16, 1024, 2688),
+        (40, 512, 1536),
+        (64, 200, 600),
+    ] {
         for spec in [None, Some(quant_specs()[0]), Some(quant_specs()[1])] {
             device.seed(6);
             let mlp = quant::build(spec, || Mlp::new(d, ff, device));
@@ -168,7 +177,14 @@ pub fn fused_projections_match(device: &Device, tol: f32) {
     use ncm_model::quant::QLinear;
     let normal = Distribution::Normal(0.0, 1.0);
     // Eight rows of 960 still fit the quantised kernel's staged row (8 * (960 + 31) slots).
-    for (rows, d, n) in [(1, 1024, 4112), (3, 512, 1536), (8, 960, 1024), (8, 128, 72)] {
+    for (rows, d, n) in [
+        (1, 1024, 4112),
+        (3, 512, 1536),
+        (8, 960, 1024),
+        (8, 128, 72),
+        (24, 960, 1024),
+        (33, 128, 72),
+    ] {
         for spec in [None, Some(quant_specs()[0]), Some(quant_specs()[1])] {
             device.seed(7);
             let layer = quant::build(spec, || QLinear::new(d, n, device));
