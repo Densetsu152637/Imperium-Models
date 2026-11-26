@@ -19,6 +19,7 @@ use std::time::Instant;
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::{Device, FloatDType, Int, Tensor, TensorData};
 use ncm_model::cache::LayerSnapshot;
+use ncm_model::hybrid::{FastSession, HybridLm};
 use ncm_model::ncm::NcmSnapshot;
 use ncm_model::quant::{self, QuantError, QuantSpec};
 use ncm_model::weights::{self, WeightsError};
@@ -116,6 +117,45 @@ pub enum DecodePath {
     /// Continuous batching (`--parallel` above 1, [`crate::batch`]): batched eager steps over
     /// the decoding slots.
     Batched,
+    /// The NCM hybrid's block decode loop (`ncm_model::hybrid::FastSession`), with what its
+    /// blocks did.
+    Hybrid(HybridAcceptance),
+}
+
+/// What the hybrid's blocks did in one request: acceptance is the draft tokens the first
+/// check pass of each block accepted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HybridAcceptance {
+    pub blocks: u32,
+    /// Draft tokens accepted by first check passes, summed, and the passes counted.
+    pub first_accepted: u32,
+    pub first_passes: u32,
+    pub redecodes: u32,
+    /// Tokens written on the autoregressive path one per pass.
+    pub ar_tokens: u32,
+    /// The block and autoregressive passes replayed captured graphs.
+    pub graphed: bool,
+}
+
+impl HybridAcceptance {
+    fn add(&mut self, stats: &ncm_model::hybrid::BlockStats) {
+        self.blocks += 1;
+        if let Some(a) = stats.first_accepted {
+            self.first_accepted += a as u32;
+            self.first_passes += 1;
+        }
+        self.redecodes += u32::from(stats.redecoded);
+        self.ar_tokens += stats.ar_tokens as u32;
+    }
+
+    /// Mean draft tokens accepted per first check pass.
+    pub fn mean_first_accepted(&self) -> f64 {
+        if self.first_passes == 0 {
+            0.0
+        } else {
+            self.first_accepted as f64 / self.first_passes as f64
+        }
+    }
 }
 
 impl DecodePath {
@@ -126,6 +166,7 @@ impl DecodePath {
             Self::GraphedSampled => "graphed-sampled",
             Self::Speculative => "speculative",
             Self::Batched => "batched",
+            Self::Hybrid(_) => "hybrid",
         }
     }
 }
@@ -359,6 +400,15 @@ pub(crate) struct Core {
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     speculate: bool,
     pub(crate) state: Mutex<State>,
+    /// The NCM hybrid and its decode session (then `state` is empty).
+    hybrid: Option<Mutex<HybridState>>,
+}
+
+/// The NCM hybrid on the sequential engine: the model and one fast decode session, reset per
+/// request (its buffers, and the graphs captured against them, are kept).
+struct HybridState {
+    model: HybridLm,
+    session: FastSession,
 }
 
 /// Burn initialises parameters when first used, drawing from the device's generator then.
@@ -437,6 +487,7 @@ impl Core {
         // Whole concepts only: the NCM reads and writes `k` tokens at a time.
         let capacity = ctx - ctx % unit;
         device.seed(seed);
+        let mut hybrid = None;
         let (state, params, arch) = match &config {
             Config::Tok(cfg) => {
                 let build = || TokenLm::new(cfg, &device);
@@ -449,11 +500,18 @@ impl Core {
                 (state, params, "tok")
             }
             Config::Ncm(cfg) if cfg.hybrid.is_some() => {
-                // TODO: serve the hybrid (block decode loop, batched at block granularity);
-                // its reference loop (`ncm_model::hybrid::HybridSession`) runs at batch 1.
-                return Err(EngineError::Unsupported(
-                    "ncm-server does not serve the NCM hybrid yet ([hybrid] config)".into(),
-                ));
+                // TODO: batch the hybrid at block granularity; it serves one slot for now.
+                if slots > 1 {
+                    return Err(EngineError::Unsupported(
+                        "the NCM hybrid serves one request at a time (--parallel 1)".into(),
+                    ));
+                }
+                let build = || HybridLm::new(cfg, &device);
+                let model = load_model(weights.as_deref(), dtype, quant, &device, build)?;
+                let session = FastSession::new(&model, capacity, &device);
+                let params = HybridLm::new(cfg, &device).parts().inference();
+                hybrid = Some(Mutex::new(HybridState { model, session }));
+                (State::Empty, params, "hybrid")
             }
             Config::Ncm(cfg) => {
                 let build = || NcmLm::new(cfg, &device);
@@ -469,7 +527,12 @@ impl Core {
             arch,
             params,
             ctx: capacity,
-            cache_bytes: slots.max(1) * cache_bytes(&config, capacity, itemsize(dtype), 1),
+            cache_bytes: match &config {
+                Config::Ncm(c) if c.hybrid.is_some() => {
+                    ncm_model::hybrid::hybrid_cache_bytes(c, capacity, itemsize(dtype), 1)
+                }
+                _ => slots.max(1) * cache_bytes(&config, capacity, itemsize(dtype), 1),
+            },
             dtype: format!("{dtype:?}").to_lowercase(),
             device: device_name,
             vocab_size: config.vocab_size(),
@@ -484,6 +547,7 @@ impl Core {
             prefix_reuse,
             speculate,
             state: Mutex::new(state),
+            hybrid,
         };
         if warmup {
             core.warm_up();
@@ -865,6 +929,10 @@ impl Core {
             max_tokens: request.max_tokens.max(1),
             emitted: 0,
         };
+        if let Some(hybrid) = &self.hybrid {
+            let mut hybrid = hybrid.lock().unwrap_or_else(|p| p.into_inner());
+            return self.generate_hybrid(&mut hybrid, &request.prompt, &mut run);
+        }
         let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match &mut *state {
             State::Tok { model, caches, kept, graphs } => {
@@ -879,6 +947,115 @@ impl Core {
 }
 
 impl Core {
+    /// The NCM hybrid: the prompt prefilled from scratch (TODO: prefix reuse), then block after
+    /// block on the fast path ([`FastSession::decode_block`]), each block's tokens streamed as
+    /// it closes. Verified mode for constrained requests, whose grammar scans every check
+    /// pass's tokens and picks every autoregressive token; `<tool_call>` switches a block to
+    /// verified mode until the block in which `</tool_call>` appears ends. Top-k is not applied
+    /// (TODO).
+    fn generate_hybrid(
+        &self,
+        hybrid: &mut HybridState,
+        prompt: &[u32],
+        run: &mut Run<'_>,
+    ) -> Result<GenStats, EngineError> {
+        use std::cell::RefCell;
+        let HybridState { model, session } = hybrid;
+        let ids = run.ids;
+        self.sync();
+        let started = Instant::now();
+        session.reset(model);
+        if run.cancel.load(Ordering::Relaxed) {
+            return Ok(aborted(prompt.len()));
+        }
+        let stream: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+        session.prefill(model, &stream);
+        self.sync();
+        let prompt_s = started.elapsed().as_secs_f64();
+        let params = run.params;
+        let opts = ncm_model::hybrid::DecodeOptions {
+            temperature: if params.is_greedy() { 0.0 } else { f64::from(params.temperature) },
+            top_p: f64::from(params.top_p),
+            seed: params.seed.unwrap_or_else(crate::sampling::entropy),
+            verified: run.constraint.is_some(),
+            stop: [ids.im_end, ids.end_of_text, ids.im_start].iter().map(|&t| t as i32).collect(),
+            switch_on: vec![ids.tool_call as i32],
+            switch_off: vec![ids.tool_call_end as i32],
+            ..Default::default()
+        };
+        let constraint = RefCell::new(run.constraint.take());
+        let sampler = RefCell::new(Sampler::new(params));
+        let constrained = constraint.borrow().is_some();
+        let mut acceptance = HybridAcceptance::default();
+        let decode_started = Instant::now();
+        let finish = 'reply: loop {
+            if run.cancel.load(Ordering::Relaxed) {
+                break Finish::Stop;
+            }
+            let room = self.capacity.saturating_sub(session.tokens().len());
+            let remaining = run.max_tokens.saturating_sub(run.emitted).min(room);
+            if remaining == 0 {
+                break Finish::Length;
+            }
+            let mut scan = |proposed: &[i32]| {
+                let mut c = constraint.borrow_mut();
+                let Some(c) = c.as_mut() else { return proposed.len() };
+                let mut n = 0;
+                for &t in proposed {
+                    if !c.allows(t as u32) {
+                        break;
+                    }
+                    c.advance(t as u32);
+                    n += 1;
+                }
+                n
+            };
+            let mut pick = |row: &[f32]| {
+                let mut c = constraint.borrow_mut();
+                let token = sampler.borrow_mut().pick(row, c.as_deref()).unwrap_or(ids.im_end);
+                if let Some(c) = c.as_mut() {
+                    c.advance(token);
+                }
+                token as i32
+            };
+            let mut hooks = ncm_model::hybrid::Hooks::default();
+            if constrained {
+                hooks.scan = Some(&mut scan);
+                hooks.pick = Some(&mut pick);
+            }
+            let block = session.decode_block(model, remaining, &opts, &mut hooks);
+            acceptance.add(&block.stats);
+            for &t in &block.tokens {
+                match run.emit(t as u32) {
+                    Emit::Stop => break 'reply Finish::Stop,
+                    Emit::Limit => break 'reply Finish::Length,
+                    Emit::Go => {}
+                }
+            }
+            if block.stopped || block.tokens.is_empty() {
+                break Finish::Length;
+            }
+        };
+        self.sync();
+        acceptance.graphed = cfg!(feature = "cuda")
+            && ncm_model::fused::graphs_active(&self.device)
+            && session.failure().is_none();
+        Ok(GenStats {
+            prompt_tokens: prompt.len(),
+            completion_tokens: run.emitted,
+            finish,
+            prompt_s,
+            decode_s: decode_started.elapsed().as_secs_f64(),
+            decode_tokens: run.emitted,
+            cached_tokens: 0,
+            capture_s: 0.0,
+            path: DecodePath::Hybrid(acceptance),
+            queue_s: 0.0,
+            mean_batch: 1.0,
+            forked: false,
+        })
+    }
+
     /// The kept state a prompt `ids` can start from: the longest one whose tokens `ids`
     /// extends (with its stored output when `ids` is exactly its tokens), as (index, whole).
     fn pick_kept<S, O>(&self, ids: &[i32], kept: &[Kept<S, O>]) -> Option<(usize, bool)> {

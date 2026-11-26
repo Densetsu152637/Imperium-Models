@@ -266,6 +266,13 @@ impl FastSession {
         self.session.tokens()
     }
 
+    /// Back to an empty stream, keeping every buffer (and so the captured graphs): the rings'
+    /// contents are hidden by the next block's staged visibility.
+    pub fn reset(&mut self, model: &HybridLm) {
+        self.session.reset(model);
+        self.rings.upto = 0;
+    }
+
     // ------------------------------------------------------------------ rings and inputs
 
     /// Projects the encoded states not yet in the rings (those still held) into their slots.

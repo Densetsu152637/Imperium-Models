@@ -267,6 +267,17 @@ pub fn timings_json(stats: &GenStats, cache_bytes: usize) -> Value {
         "cache_bytes": cache_bytes,
         "graph_capture_ms": stats.capture_s * 1000.0,
         "decode_path": stats.path.name(),
+        "hybrid": match stats.path {
+            crate::engine::DecodePath::Hybrid(a) => json!({
+                "blocks": a.blocks,
+                "mean_first_accepted": a.mean_first_accepted(),
+                "first_passes": a.first_passes,
+                "redecodes": a.redecodes,
+                "ar_tokens": a.ar_tokens,
+                "graphed": a.graphed,
+            }),
+            _ => Value::Null,
+        },
         "queue_ms": stats.queue_s * 1000.0,
         "mean_batch": stats.mean_batch,
         "forked": stats.forked,

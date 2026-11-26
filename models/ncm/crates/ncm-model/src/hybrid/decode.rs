@@ -200,6 +200,21 @@ impl HybridSession {
         &self.tokens
     }
 
+    /// Back to an empty stream, in the caches' own buffers on CUDA (a server reuses one
+    /// session, and the graphs captured against it, across requests).
+    pub fn reset(&mut self, model: &HybridLm) {
+        self.tokens.clear();
+        self.encoder.iter_mut().for_each(LayerCache::reset);
+        self.backbone.iter_mut().for_each(LayerCache::reset);
+        self.states = None;
+        self.states_start = 0;
+        self.encoded = 0;
+        self.pooled.clear();
+        self.cond = model.start_condition(1);
+        self.blocks = 0;
+        self.verified_span = false;
+    }
+
     /// Complete blocks (backbone steps run).
     pub fn blocks(&self) -> usize {
         self.blocks

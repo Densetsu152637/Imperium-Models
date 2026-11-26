@@ -1,6 +1,6 @@
-//! The hybrid NCM's decode benchmark (local test plan step 6), on the eager reference decode
-//! loop ([`ncm_model::hybrid::HybridSession`]): no fused kernels or CUDA graphs for the
-//! generator yet (TODO), so these rates measure the reference, not the design.
+//! The hybrid NCM's decode benchmark (local test plan step 6), on the fast decode path
+//! ([`ncm_model::hybrid::FastSession`]: memory rings, fixed-buffer block and autoregressive
+//! passes with acceptance on the device, replayed as CUDA graphs on CUDA with graphs on).
 //!
 //! Random weights accept almost no drafts, so every run but the autoregressive-path one decides
 //! acceptance synthetically: each draft token agrees with the check with probability p,
@@ -11,7 +11,7 @@
 use std::time::Instant;
 
 use burn::tensor::Device;
-use ncm_model::hybrid::{BlockStats, DecodeOptions, Hooks, HybridLm, HybridSession};
+use ncm_model::hybrid::{BlockStats, DecodeOptions, FastSession, Hooks, HybridLm};
 use ncm_model::quant::{self, QuantSpec};
 use ncm_model::{Config, ncm_250m_hybrid, tiny_hybrid, tiny_v2};
 use serde_json::{Value, json};
@@ -76,7 +76,7 @@ fn reply(
     device: &Device,
 ) -> Reply {
     let l = model.config().block;
-    let mut session = HybridSession::new(model, prompt.len() + new_tokens + l, device);
+    let mut session = FastSession::new(model, prompt.len() + new_tokens + l, device);
     let t0 = Instant::now();
     session.prefill(model, prompt);
     device.sync().expect("device sync");
@@ -133,7 +133,7 @@ pub fn bench_hybrid(
     let new_tokens = cli.new_tokens.max(l);
     println!(
         "hybrid (L = {l}, K = {}): {:.1}M params at inference ({:.1}M trained), {new_tokens} new tokens \
-         (eager reference decode loop)",
+         (fast decode path)",
         model.config().depth(),
         parts.inference() as f64 / 1e6,
         parts.trained() as f64 / 1e6,
@@ -202,7 +202,7 @@ pub fn bench_hybrid(
         "params_trained": parts.trained(),
         "parts": parts.rows().iter().map(|(n, c)| json!({"name": n, "params": c})).collect::<Vec<_>>(),
         "new_tokens": new_tokens,
-        "reference_decode_loop": true,
+        "decode_loop": "fast",
         "contexts": contexts,
     });
     (result, rates)

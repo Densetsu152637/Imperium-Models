@@ -37,7 +37,7 @@ More switches:
 | `--no-cuda-graphs` | Keep the fused kernels but run them eagerly instead of replaying the NCM decoder, draft and verify passes and the v2 backbone step as CUDA graphs |
 | `--speculate on` | After each plain NCM run, decode the NCM again by self-speculation (the draft head proposes each concept in one pass, the decoder verifies it in one parallel pass; `docs/attention.md`) and report its tok/s, the share of draft tokens kept and the verify passes per concept. The token baseline always decodes plainly |
 | `--assume-accept 1.0 0.75 0.5` | With `--speculate on`, one more speculative run per rate that keeps that share of draft tokens whatever the decoder says. **Synthetic**: it times the passes a trained model with that acceptance would run (random weights accept few drafts); the output is not the model's, and the report labels it |
-| `--model hybrid` / `all` | The NCM hybrid (`configs/ncm-250m-hybrid.toml`, block decoder over 32-token blocks; `all` adds the token baseline and the k = 4 NCM, and reports hybrid / k = 4 ratios with the local test plan's step 6 gate). Runs the **eager reference** decode loop (`ncm_model::hybrid`): no fused kernels or graphs for the generator yet |
+| `--model hybrid` / `all` | The NCM hybrid (`configs/ncm-250m-hybrid.toml`, block decoder over 32-token blocks; `all` adds the token baseline and the k = 4 NCM, and reports hybrid / k = 4 ratios with the local test plan's step 6 gate). Runs the fast decode path (`ncm_model::hybrid::FastSession`, graphed on CUDA) |
 | `--hybrid-p 1.0 0.986 0.967 0.950` | The hybrid's **synthetic** per-token agreement rates (geometric first rejections, re-decodes and autoregressive fills run for real), plus a run on the autoregressive path alone and one with full rejection |
 
 ```
@@ -70,7 +70,7 @@ All models support a context of at least 1M tokens. Tests allocate 2k to 16k.
 - Memory keys carry RoPE at absolute token positions: recent and known-prefix states at their own, slots and retrieved tokens at the block's start; generator queries sit at the block's start.
 - The copy head points at memory token entries, each standing for the token after it; a null entry keeps blocks with nothing to copy valid.
 - Parallel mode accepts a draft token only when the check pass also agrees with it (the next position was conditioned on the draft), besides the top probability being at least tau.
-- Not yet: the grammar constraint scan, the ncm-server integration, fused kernels and CUDA graphs for the generator, ring-projected memory keys.
+- The fast decode path (`hybrid/fast.rs`): memory keys and values projected once into rings, fixed-buffer block passes (generator, draft, check, acceptance on the device) and autoregressive passes, captured as CUDA graphs; the level tail (codes to contribution) is one kernel (`kernels/hybrid.rs`). The grammar scan runs on the host over the tokens a check pass reads back (TODO: a GPU scan needs a bounded-depth token automaton). ncm-server serves the hybrid on one slot.
 
 ## Data
 
