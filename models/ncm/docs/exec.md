@@ -92,12 +92,31 @@ aligned to 4 KiB; a weight appears once whatever number of graphs use it) and `m
   `MatMulNBits` is not used.
 - **DeltaNet**: the decode step, and the chunked prefill with the f32 triangular inverse in the
   graph: 5 squarings and 5 multiplies of 64 x 64 at chunk 64 (`(I+N)(I+N^2)...(I+N^32)`).
-- **Coverage today**: the token baseline in the fallback design (GQA attention with sliding or
-  full rings, SwiGLU MLP, DeltaNet) exports completely. **Not written yet** (`--describe` lists
-  them; `export` fails naming the layer): the v2 design's sparse-retrieval layers (absorbed MLA
-  and the indexer), the v2 gated attention with QK-norm, every hybrid phase graph (backbone
-  step, block pass, fill, token check, the split retrieval graphs beyond the local window), the
-  k = 4 NCM (no ONNX path by plan), and the NPU target profiles (they wait for plan stage 0b).
+- **Coverage today** (everything below is **unverified**: written from the Burn code, compiled
+  and linted, never run):
+  - the fallback-design token baseline (GQA attention with sliding or full rings, SwiGLU MLP,
+    DeltaNet): decode and prefill-bucket graphs;
+  - the v2 gated attention with QK-norm (`layers::AttnExtras`);
+  - **sparse retrieval** (absorbed MLA, the four norms, decoupled partial RoPE with YaRN, the
+    8-bit indexer keys as outputs) as **dense attention over the whole latent cache**
+    (`retrieval_dense`): exact while the Burn selection would pick every block
+    (`position < local + topk * block`, recorded per layer as `dense_exact_until`);
+  - **the split sparse path** for decode beyond that: the decode step is cut at every
+    retrieval layer (`decode_split_<k>` graphs, `Phase::DecodeSplit`: segment `k` ends at the
+    layer's projection, the next starts at its attention). Between segments `ncm-ort` scores
+    the cached 8-bit indexer keys, takes block maxima and the top-k, and gathers the picked
+    blocks and the local window (`ncm_exec::retrieval`, mirroring `attend_selected`: ties go to
+    the earlier block, picked positions inside the window are masked). Prefill buckets are used
+    only below the dense range; beyond it prefill runs token by token through the split step.
+    The index cache is host RAM, snapshotted with the layer.
+- **Not written**: every **hybrid** phase graph (encoder and backbone step, the block pass with
+  its K generator levels, the codebook lookups, the tokenizer decoder and check pass, the fill
+  pass, the copy head) and `OrtBlockRun::begin_block`; the k = 4 NCM (no ONNX path by plan);
+  the NPU target profiles (they wait for plan stage 0b). The hybrid is not a graph translation
+  alone: `FastSession` stages ring projections, visibility biases, retrieved tokens and known
+  prefixes per block (about 1,400 lines plus `HybridSession::close_block`, the pooled retrieval
+  history and `select_retrieved`), all of which the ORT session would have to reimplement
+  against graphs nobody has run. That was judged not writable correctly blind.
 
 ## The ONNX Runtime backend (`ncm-ort`)
 

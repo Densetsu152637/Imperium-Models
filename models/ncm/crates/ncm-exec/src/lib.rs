@@ -15,6 +15,7 @@ pub mod exec;
 pub mod footprint;
 pub mod hybrid;
 pub mod manifest;
+pub mod retrieval;
 pub mod rope;
 
 pub use exec::{

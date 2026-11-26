@@ -243,15 +243,39 @@ impl Plan<'_> {
         }
     }
 
-    fn build(&self, name: &str, t: usize, pool: &mut WeightPool) -> Result<Built, ExportError> {
+    /// Builds one phase graph. `seg` is None for a whole-model graph (dense retrieval); for the
+    /// split decode step (`t == 1`) it is the segment: layers from the previous retrieval layer
+    /// attention to the next retrieval layer projection (UNVERIFIED).
+    fn build(
+        &self,
+        name: &str,
+        t: usize,
+        pool: &mut WeightPool,
+        seg: Option<usize>,
+    ) -> Result<Built, ExportError> {
         let cfg = self.cfg;
         let (d, v) = (cfg.d_model, cfg.vocab_size);
         let ti = t as i64;
         let mut g = Graph::new(name);
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
-        let token = g.input("token", DType::I64, &[1, ti]);
-        inputs.push(io("token", DType::I64, &[1, ti], Role::Token, None));
+        let retr: Vec<usize> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l, LayerSpec::Retrieval { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let first = match seg {
+            Some(k) if k > 0 => retr[k - 1],
+            _ => 0,
+        };
+        let last = seg.and_then(|k| retr.get(k).copied());
+        let embeds = seg.is_none_or(|k| k == 0);
+        let token = embeds.then(|| g.input("token", DType::I64, &[1, ti]));
+        if embeds {
+            inputs.push(io("token", DType::I64, &[1, ti], Role::Token, None));
+        }
         // RoPE tables of the rope kinds the layers use.
         let mut tables: Vec<Option<(Val, Val)>> = vec![None; self.rope.len()];
         for (r, spec) in self.rope.iter().enumerate() {
@@ -270,14 +294,33 @@ impl Plan<'_> {
         }
         let emb = self.names.get("emb.weight")?;
         expect_shape(&emb, &[v, d], "emb.weight")?;
+        // The embedding feeds the first segment and, tied, the last one's logits.
+        let _ = &retr;
         let emb_v =
             g.weight(pool, "emb.weight", crate::onnx::HostTensor::f32(&emb.shape, &emb.data));
-        let mut x = g.gather(&emb_v, &token, 0);
+        let mut x = if embeds {
+            g.gather(&emb_v, token.as_ref().expect("the first segment has the token"), 0)
+        } else {
+            let hidden = g.input("hidden", DType::F32, &[1, 1, d as i64]);
+            inputs.push(io("hidden", DType::F32, &[1, 1, d as i64], Role::Hidden, None));
+            hidden
+        };
         let mut cx = Cx { g: &mut g, pool, form: self.form };
-        for (i, kind) in self.kinds.iter().enumerate() {
+        let mut cut = false;
+        'layers: for (i, kind) in self.kinds.iter().enumerate() {
+            if i < first || last.is_some_and(|l| i > l) {
+                continue;
+            }
             let base = format!("stack.blocks.{i}");
-            let n1 = self.names.get(&format!("{base}.n1.gamma"))?;
-            let normed = cx.rms_norm(&format!("{base}.n1.gamma"), &x, &n1, cfg.norm_eps);
+            // A split segment starting at a retrieval layer begins at its attention: the norm
+            // and the projection belong to the segment before.
+            let at_attend = seg.is_some_and(|k| k > 0) && i == first;
+            let normed = if at_attend {
+                x.clone()
+            } else {
+                let n1 = self.names.get(&format!("{base}.n1.gamma"))?;
+                cx.rms_norm(&format!("{base}.n1.gamma"), &x, &n1, cfg.norm_eps)
+            };
             let mixed = match (kind, &self.layers[i]) {
                 (LayerKind::DeltaNet, LayerSpec::DeltaNet { .. }) => {
                     let dm = self.delta_dims();
@@ -365,7 +408,10 @@ impl Plan<'_> {
                     outputs.push(io(&nv, DType::F32, &new_shape, Role::NewV, Some(i)));
                     out.y
                 }
-                (LayerKind::Retrieval, LayerSpec::Retrieval { cache, rope, .. }) => {
+                (
+                    LayerKind::Retrieval,
+                    LayerSpec::Retrieval { cache, rope, block, topk, local, .. },
+                ) => {
                     let rs = self.spec.retrieval();
                     let dm = RetDims {
                         d: rs.d,
@@ -390,32 +436,124 @@ impl Plan<'_> {
                     };
                     expect_shape(&rw.proj, &[dm.d, dm.proj_width()], "retrieval proj")?;
                     let w = dm.entry_width() as i64;
-                    let cache_shape = [1, *cache as i64, w];
-                    let bias_shape = [ti, (*cache + t) as i64];
-                    let (ln, bn) = (format!("l{i}.latent"), format!("l{i}.bias"));
-                    let lat = cx.g.input(&ln, DType::F32, &cache_shape);
-                    let bias = cx.g.input(&bn, DType::F32, &bias_shape);
-                    inputs.push(io(&ln, DType::F32, &cache_shape, Role::Latent, Some(i)));
-                    inputs.push(io(&bn, DType::F32, &bias_shape, Role::Bias, Some(i)));
-                    let (cos, sin) = tables[*rope].clone().expect("the layer rope table");
-                    let out = cx.retrieval_dense(
-                        &Names::key(i, "retrieval"),
-                        &dm,
-                        &rw,
-                        &normed,
-                        &cos,
-                        &sin,
-                        &lat,
-                        &bias,
-                        t,
-                    )?;
-                    let (en, kn) = (format!("l{i}.new_latent"), format!("l{i}.new_index_key"));
-                    let (es, ks) = ([1, ti, w], [1, ti, dm.index_dim as i64]);
-                    cx.g.output(&en, &out.entry, DType::F32, &es);
-                    cx.g.output(&kn, &out.index_key, DType::F32, &ks);
-                    outputs.push(io(&en, DType::F32, &es, Role::NewLatent, Some(i)));
-                    outputs.push(io(&kn, DType::F32, &ks, Role::NewIndexKey, Some(i)));
-                    out.y
+                    let key = Names::key(i, "retrieval");
+                    let (hh, lat_w) = (dm.heads as i64, dm.latent as i64 + dm.rope_dim as i64);
+                    match seg {
+                        None => {
+                            let cache_shape = [1, *cache as i64, w];
+                            let bias_shape = [ti, (*cache + t) as i64];
+                            let (ln, bn) = (format!("l{i}.latent"), format!("l{i}.bias"));
+                            let lat = cx.g.input(&ln, DType::F32, &cache_shape);
+                            let bias = cx.g.input(&bn, DType::F32, &bias_shape);
+                            inputs.push(io(&ln, DType::F32, &cache_shape, Role::Latent, Some(i)));
+                            inputs.push(io(&bn, DType::F32, &bias_shape, Role::Bias, Some(i)));
+                            let (cos, sin) = tables[*rope].clone().expect("the layer rope table");
+                            let out = cx.retrieval_dense(
+                                &key, &dm, &rw, &normed, &cos, &sin, &lat, &bias, t,
+                            )?;
+                            let (en, kn) =
+                                (format!("l{i}.new_latent"), format!("l{i}.new_index_key"));
+                            let (es, ks) = ([1, ti, w], [1, ti, dm.index_dim as i64]);
+                            cx.g.output(&en, &out.pre.entry, DType::F32, &es);
+                            cx.g.output(&kn, &out.pre.index_key, DType::F32, &ks);
+                            outputs.push(io(&en, DType::F32, &es, Role::NewLatent, Some(i)));
+                            outputs.push(io(&kn, DType::F32, &ks, Role::NewIndexKey, Some(i)));
+                            out.y
+                        }
+                        Some(_) if last == Some(i) => {
+                            // The cut: everything up to the attention, for the host to select.
+                            let (cos, sin) = tables[*rope].clone().expect("the layer rope table");
+                            let pre = cx.retrieval_pre(&key, &dm, &rw, &normed, &cos, &sin, t)?;
+                            let outs = [
+                                (
+                                    "hidden_out".to_owned(),
+                                    &x,
+                                    vec![1, 1, d as i64],
+                                    Role::Hidden,
+                                    None,
+                                ),
+                                (
+                                    format!("l{i}.q_all"),
+                                    &pre.q_all,
+                                    vec![1, hh, 1, lat_w],
+                                    Role::QAll,
+                                    Some(i),
+                                ),
+                                (
+                                    format!("l{i}.gate"),
+                                    &pre.gate,
+                                    vec![1, 1, hh * dm.v_dim as i64],
+                                    Role::GateVal,
+                                    Some(i),
+                                ),
+                                (
+                                    format!("l{i}.index_q"),
+                                    &pre.index_q,
+                                    vec![1, 1, (dm.index_heads * dm.index_dim) as i64],
+                                    Role::IndexQ,
+                                    Some(i),
+                                ),
+                                (
+                                    format!("l{i}.index_w"),
+                                    &pre.index_w,
+                                    vec![1, 1, dm.index_heads as i64],
+                                    Role::IndexW,
+                                    Some(i),
+                                ),
+                                (
+                                    format!("l{i}.new_latent"),
+                                    &pre.entry,
+                                    vec![1, 1, w],
+                                    Role::NewLatent,
+                                    Some(i),
+                                ),
+                                (
+                                    format!("l{i}.new_index_key"),
+                                    &pre.index_key,
+                                    vec![1, 1, dm.index_dim as i64],
+                                    Role::NewIndexKey,
+                                    Some(i),
+                                ),
+                            ];
+                            for (name, v, shape, role, layer) in outs {
+                                cx.g.output(&name, v, DType::F32, &shape);
+                                outputs.push(io(&name, DType::F32, &shape, role, layer));
+                            }
+                            cut = true;
+                            break 'layers;
+                        }
+                        Some(_) => {
+                            // The attention over the entries the host gathered.
+                            let g_n = (*topk * *block + *local) as i64;
+                            let (qn, gn, vn, bn) = (
+                                format!("l{i}.q_all"),
+                                format!("l{i}.gate"),
+                                format!("l{i}.gathered"),
+                                format!("l{i}.bias"),
+                            );
+                            let q_all = cx.g.input(&qn, DType::F32, &[1, hh, 1, lat_w]);
+                            let gate = cx.g.input(&gn, DType::F32, &[1, 1, hh * dm.v_dim as i64]);
+                            let kv = cx.g.input(&vn, DType::F32, &[1, g_n, w]);
+                            let bias = cx.g.input(&bn, DType::F32, &[1, g_n]);
+                            inputs.push(io(
+                                &qn,
+                                DType::F32,
+                                &[1, hh, 1, lat_w],
+                                Role::QAll,
+                                Some(i),
+                            ));
+                            inputs.push(io(
+                                &gn,
+                                DType::F32,
+                                &[1, 1, hh * dm.v_dim as i64],
+                                Role::GateVal,
+                                Some(i),
+                            ));
+                            inputs.push(io(&vn, DType::F32, &[1, g_n, w], Role::Gathered, Some(i)));
+                            inputs.push(io(&bn, DType::F32, &[1, g_n], Role::Bias, Some(i)));
+                            cx.retrieval_attend(&key, &dm, &rw, &q_all, &gate, &kv, &bias, t)?
+                        }
+                    }
                 }
                 (kind, _) => {
                     return Err(ExportError::Unsupported(format!("layer {i} ({kind:?})")));
@@ -428,6 +566,11 @@ impl Plan<'_> {
             let down = self.names.get(&format!("{base}.mlp.down.weight"))?;
             let mlp = cx.mlp(&format!("{base}.mlp"), &normed, &gate_up, &down, cfg.ff_dim)?;
             x = cx.g.add(&x, &mlp);
+        }
+        if cut {
+            // A split segment ends at a retrieval projection: no logits.
+            g.validate().map_err(|problem| ExportError::Graph { graph: name.into(), problem })?;
+            return Ok(Built { graph: g, inputs, outputs });
         }
         // Only the last position's logits are needed (the norm is per position).
         let last = if t == 1 { x } else { cx.g.slice(&x, 1, ti - 1, ti) };
@@ -579,19 +722,33 @@ pub fn export(
     let data_file = "weights.bin";
     let mut specs = Vec::new();
     let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut builds: Vec<(String, Phase, usize)> = vec![("decode".into(), Phase::Decode, 1)];
+    // (name, phase, tokens, segment of the split decode step)
+    let mut builds: Vec<(String, Phase, usize, Option<usize>)> =
+        vec![("decode".into(), Phase::Decode, 1, None)];
     for &b in &opts.buckets {
-        builds.push((format!("prefill_{b}"), Phase::Prefill, b));
+        builds.push((format!("prefill_{b}"), Phase::Prefill, b, None));
+    }
+    // A model whose retrieval layers select sparsely beyond the dense range also gets the
+    // decode step cut at every retrieval layer (host top-k and gather between segments).
+    let retrievals = layers.iter().filter(|l| matches!(l, LayerSpec::Retrieval { .. })).count();
+    let sparse = layers.iter().any(|l| {
+        matches!(l, LayerSpec::Retrieval { dense_exact_until, .. } if *dense_exact_until != usize::MAX)
+    });
+    if sparse {
+        for k in 0..=retrievals {
+            builds.push((format!("decode_split_{k}"), Phase::DecodeSplit, 1, Some(k)));
+        }
     }
     let mut graphs = Vec::new();
-    for (name, phase, tokens) in &builds {
-        let built = plan.build(name, *tokens, &mut pool)?;
+    for (name, phase, tokens, segment) in &builds {
+        let built = plan.build(name, *tokens, &mut pool, *segment)?;
         let file = format!("{name}.onnx");
         specs.push(GraphSpec {
             name: name.clone(),
             file: file.clone(),
             phase: *phase,
             tokens: *tokens,
+            segment: segment.unwrap_or(0),
             inputs: built.inputs,
             outputs: built.outputs,
         });
@@ -670,6 +827,45 @@ mod tests {
             add(format!("{b}.n2.gamma"), vec![d], 0.0, true);
             add(format!("{b}.mlp.gate_up.weight"), vec![d, 2 * ff], 0.05, false);
             add(format!("{b}.mlp.down.weight"), vec![ff, d], 0.05, false);
+            let a = format!("{b}.attn");
+            match kind {
+                LayerKind::DeltaNet => {
+                    let dm = spec.delta();
+                    let (h, hd, c) = (dm.heads(), dm.head_dim, dm.conv_channels());
+                    add(
+                        format!("{a}.DeltaNet.proj.weight"),
+                        vec![d, 4 * h * hd + 2 * h],
+                        0.05,
+                        false,
+                    );
+                    add(format!("{a}.DeltaNet.conv"), vec![dm.conv, c], 0.05, false);
+                    add(format!("{a}.DeltaNet.a_log"), vec![h], 0.05, false);
+                    add(format!("{a}.DeltaNet.dt_bias"), vec![h], 0.05, false);
+                    add(format!("{a}.DeltaNet.norm.gamma"), vec![hd], 0.0, true);
+                    add(format!("{a}.DeltaNet.o.weight"), vec![h * hd, d], 0.05, false);
+                }
+                LayerKind::Retrieval => {
+                    let r = spec.retrieval();
+                    let (h, qd) = (r.heads, r.nope_dim + r.rope_dim);
+                    let width = h * qd
+                        + r.latent
+                        + r.rope_dim
+                        + h * r.v_dim
+                        + r.index_heads * r.index_dim
+                        + r.index_dim
+                        + r.index_heads;
+                    let n = format!("{a}.Retrieval");
+                    add(format!("{n}.proj.weight"), vec![d, width], 0.05, false);
+                    add(format!("{n}.q_norm.gamma"), vec![qd], 0.0, true);
+                    add(format!("{n}.kv_norm.gamma"), vec![r.latent], 0.0, true);
+                    add(format!("{n}.rope_norm.gamma"), vec![r.rope_dim], 0.0, true);
+                    add(format!("{n}.index_norm.gamma"), vec![r.index_dim], 0.0, true);
+                    add(format!("{n}.uk.weight"), vec![r.latent, h * r.nope_dim], 0.05, false);
+                    add(format!("{n}.uv.weight"), vec![r.latent, h * r.v_dim], 0.05, false);
+                    add(format!("{n}.o.weight"), vec![h * r.v_dim, d], 0.05, false);
+                }
+                LayerKind::Attention { .. } => {}
+            }
             if let LayerKind::Attention { .. } = kind {
                 let (h, kvh, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
                 add(
@@ -747,6 +943,29 @@ mod tests {
         let q = std::fs::metadata(dir.path().join("weights.bin")).unwrap().len();
         let f = std::fs::metadata(f32_dir.path().join("weights.bin")).unwrap().len();
         assert!(q < f, "int8 weights take less room than f32 ({q} vs {f})");
+    }
+
+    #[test]
+    fn the_v2_design_exports_dense_and_split_graphs() {
+        let cfg = TokConfig { vocab_size: 272, ..tiny_tok_v2(tiny_v2(4, 2, 8)) };
+        let weights = tiny_weights(&cfg);
+        let dir = tempfile::tempdir().unwrap();
+        let opts =
+            ExportOptions { ctx: 64, buckets: vec![], form: WeightForm::F32, target: Target::Cpu };
+        let m = export(&Config::Tok(cfg.clone()), &weights, dir.path(), &opts).unwrap();
+        let retrievals =
+            m.layers.iter().filter(|l| matches!(l, LayerSpec::Retrieval { .. })).count();
+        assert!(retrievals > 0);
+        let segments = m.split_segments();
+        assert_eq!(segments.len(), retrievals + 1);
+        // Every cut hands the next segment its hidden state, queries and gate; the last has logits.
+        for (k, g) in segments.iter().enumerate() {
+            assert_eq!(g.inputs.iter().any(|i| i.role == Role::Hidden), k > 0);
+            assert_eq!(g.outputs.iter().any(|o| o.role == Role::Logits), k == retrievals);
+            assert_eq!(g.outputs.iter().any(|o| o.role == Role::QAll), k < retrievals);
+            assert_eq!(g.inputs.iter().any(|i| i.role == Role::Gathered), k > 0);
+        }
+        assert!(m.graph(Phase::Decode, 1).is_some());
     }
 
     #[test]

@@ -163,3 +163,45 @@ fn sliding_rings_wrap_like_the_reference() {
     let d = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
     assert!(d <= 1e-4, "after a wrapped prefill: max |dlogit| = {d}");
 }
+
+/// The v2 token baseline (DeltaNet and sparse-retrieval layers): ORT's dense graphs below the
+/// point the selection starts to differ, the split path (host indexer scores, top-k and gather
+/// between graph segments) beyond it, against Burn's own selection. UNVERIFIED: written
+/// without a run.
+#[test]
+fn v2_retrieval_matches_beyond_the_dense_range() {
+    use ncm_model::{tiny_tok_v2, tiny_v2};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let device = device();
+    // Blocks of 4, top 2, local window 8: selection differs from dense from position 16 on.
+    let cfg = TokConfig { vocab_size: 272, ..tiny_tok_v2(tiny_v2(4, 2, 8)) };
+    let model = TokenLm::new(&cfg, &device);
+    let weights = dir.path().join("v2.safetensors");
+    save_weights(&model, &Config::Tok(cfg.clone()), &weights).expect("saves the model");
+    let out = dir.path().join("onnx");
+    let opts =
+        ExportOptions { ctx: CTX, buckets: vec![], form: WeightForm::F32, target: Target::Cpu };
+    export(&Config::Tok(cfg), &Weights::open(&weights).unwrap(), &out, &opts).expect("exports");
+    let ort = OrtBackend::load(&OrtOptions { dir: out, ..Default::default() }).expect("loads");
+    assert!(!ort.manifest().split_segments().is_empty(), "the export has split graphs");
+
+    let mut session = ort.new_session(CTX).unwrap();
+    let stream: Vec<i32> = (0..24).map(|i| 16 + (i * 13) % 200).collect();
+    session.prefill(&stream, 512).unwrap();
+    let mut row = session.pending_logits().unwrap();
+    let mut caches = model.make_cache(CTX, 1, &device);
+    let mut want = host(model.prefill(ids(&device, &stream), &mut caches, 512).unwrap());
+    let mut worst = 0f32;
+    for _ in 0..24 {
+        worst = worst.max(row.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max));
+        let token = argmax(&want) as i32;
+        let StepOut::Logits(next) = session.decode_step(&[token], &PickSpec::host()).unwrap()
+        else {
+            panic!("a host pick returns logits")
+        };
+        row = next;
+        want = host(model.step(ids(&device, &[token]), &mut caches));
+    }
+    assert!(worst <= 1e-3, "v2 max |dlogit| across the dense/sparse boundary = {worst}");
+}

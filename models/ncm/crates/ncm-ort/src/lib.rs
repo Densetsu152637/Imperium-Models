@@ -16,6 +16,7 @@
 //! [`OrtOptions::dylib`], else `ORT_DYLIB_PATH`, else the platform's default name. Its version
 //! must match the one `ort` was built for (1.31) unless `allow_version_skew` is set.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -23,6 +24,7 @@ use ncm_exec::hybrid::{BlockLogic, BlockOut, BlockPhase, DecodeOptions, Hooks, P
 use ncm_exec::manifest::{
     FILE_NAME, GraphSpec, IoSpec, LayerSpec, Manifest, Phase, Role, RopeSpec,
 };
+use ncm_exec::retrieval::{IndexCache, candidates, select};
 use ncm_exec::rope::{Yarn, rope_rows};
 use ncm_exec::{
     Capabilities, Dtype, ExecBackend, ExecError, ExecSession, Footprint, FootprintRequest,
@@ -105,6 +107,8 @@ struct Graphs {
     decode: Mutex<Session>,
     /// `(tokens, session)` of the prefill buckets, largest first.
     prefill: Vec<(usize, Mutex<Session>)>,
+    /// The split decode step's segments, in order (empty without sparse retrieval).
+    split: Vec<Mutex<Session>>,
 }
 
 /// The backend over one export.
@@ -159,9 +163,13 @@ impl OrtBackend {
             prefill.push((graph.tokens, open(graph)?));
         }
         prefill.sort_by_key(|(tokens, _)| std::cmp::Reverse(*tokens));
+        let mut split = Vec::new();
+        for graph in manifest.split_segments() {
+            split.push(open(graph)?);
+        }
         Ok(Self {
             manifest: Arc::new(manifest),
-            graphs: Arc::new(Graphs { decode, prefill }),
+            graphs: Arc::new(Graphs { decode, prefill, split }),
             ort_info,
             dir: options.dir.clone(),
         })
@@ -257,6 +265,14 @@ impl ExecBackend for OrtBackend {
 
 // ---------------------------------------------------------------------- the session
 
+/// What a graph run returned beyond the state it folded in.
+struct RunOut {
+    logits: Option<Vec<f32>>,
+    /// The hidden state, absorbed queries, gate and indexer outputs of a split segment, by
+    /// output name.
+    boundary: HashMap<String, Vec<f32>>,
+}
+
 /// One layer's host-owned state.
 #[derive(Clone, Debug, PartialEq)]
 enum LayerState {
@@ -271,6 +287,7 @@ enum LayerState {
     /// A retrieval layer's latent cache `[cache, latent + rope_dim]`.
     Latent {
         kv: Vec<f32>,
+        index: IndexCache,
     },
 }
 
@@ -319,8 +336,11 @@ impl OrtSession {
                     k: vec![0.0; kv_heads * ring * head_dim],
                     v: vec![0.0; kv_heads * ring * head_dim],
                 },
-                LayerSpec::Retrieval { cache, latent, rope_dim, .. } => {
-                    LayerState::Latent { kv: vec![0.0; cache * (latent + rope_dim)] }
+                LayerSpec::Retrieval { cache, latent, rope_dim, index_dim, .. } => {
+                    LayerState::Latent {
+                        kv: vec![0.0; cache * (latent + rope_dim)],
+                        index: IndexCache::new(*index_dim),
+                    }
                 }
             })
             .collect();
@@ -364,7 +384,9 @@ impl OrtSession {
         graph: &GraphSpec,
         session: &Mutex<Session>,
         tokens: &[i32],
-    ) -> Result<Vec<f32>, ExecError> {
+        extra: &HashMap<String, Vec<f32>>,
+        advance: bool,
+    ) -> Result<RunOut, ExecError> {
         let t = tokens.len();
         if self.len + t > self.ctx {
             return Err(backend_error(format!(
@@ -381,6 +403,11 @@ impl OrtSession {
             Tensor::from_array((shape, data)).map(Into::into).map_err(backend_error)
         };
         for io in &graph.inputs {
+            // Values the caller computed (the split path hidden state, queries, gathered entries).
+            if let Some(data) = extra.get(&io.name) {
+                feed.push((io.name.clone(), tensor_f32(&io.shape, data.clone())?));
+                continue;
+            }
             let value = match (io.role, io.layer, io.rope) {
                 (Role::Token, _, _) => {
                     let ids: Vec<i64> = tokens.iter().map(|&x| i64::from(x)).collect();
@@ -413,7 +440,7 @@ impl OrtSession {
                     _ => return Err(self.mismatch(io)),
                 },
                 (Role::Latent, Some(l), _) => match &self.layers[l] {
-                    LayerState::Latent { kv } => tensor_f32(&io.shape, kv.clone())?,
+                    LayerState::Latent { kv, .. } => tensor_f32(&io.shape, kv.clone())?,
                     _ => return Err(self.mismatch(io)),
                 },
                 (Role::ConvIn, Some(l), _) => match &self.layers[l] {
@@ -431,6 +458,7 @@ impl OrtSession {
         let mut guard = session.lock().unwrap_or_else(|p| p.into_inner());
         let outputs = guard.run(feed).map_err(backend_error)?;
         let mut logits = None;
+        let mut boundary: HashMap<String, Vec<f32>> = HashMap::new();
         let start = self.len;
         for io in &graph.outputs {
             let value = outputs.get(&io.name).ok_or_else(|| {
@@ -439,6 +467,18 @@ impl OrtSession {
             let (_, data) = value.try_extract_tensor::<f32>().map_err(backend_error)?;
             match (io.role, io.layer) {
                 (Role::Logits, _) => logits = Some(data.to_vec()),
+                (Role::Hidden | Role::QAll | Role::GateVal | Role::IndexQ | Role::IndexW, _) => {
+                    boundary.insert(io.name.clone(), data.to_vec());
+                }
+                (Role::NewIndexKey, Some(l)) => {
+                    // [1, t, index_dim]: the normed key of each new position, kept 8-bit.
+                    if let LayerState::Latent { index, .. } = &mut self.layers[l] {
+                        let di = data.len() / t.max(1);
+                        for j in 0..t {
+                            index.put(start + j, &data[j * di..(j + 1) * di]);
+                        }
+                    }
+                }
                 (Role::ConvOut, Some(l)) => {
                     if let LayerState::Delta { conv, .. } = &mut self.layers[l] {
                         conv.copy_from_slice(data);
@@ -448,7 +488,7 @@ impl OrtSession {
                     // `data` is [1, t, w]: position start + j goes to row (start + j) % cache.
                     let w = self.latent_width(l);
                     let cache = self.ring_of(l);
-                    if let LayerState::Latent { kv } = &mut self.layers[l] {
+                    if let LayerState::Latent { kv, .. } = &mut self.layers[l] {
                         for j in 0..t {
                             let row = (start + j) % cache;
                             kv[row * w..(row + 1) * w].copy_from_slice(&data[j * w..(j + 1) * w]);
@@ -487,9 +527,85 @@ impl OrtSession {
         }
         drop(outputs);
         drop(guard);
-        self.len += t;
-        logits
-            .ok_or_else(|| backend_error(format!("the graph `{}` returned no logits", graph.name)))
+        if advance {
+            self.len += t;
+        }
+        Ok(RunOut { logits, boundary })
+    }
+
+    /// The first position the sparse selection differs from dense attention at (the smallest
+    /// `dense_exact_until` over the retrieval layers), if the export has split graphs.
+    fn dense_until(&self) -> Option<usize> {
+        if self.graphs.split.is_empty() {
+            return None;
+        }
+        self.manifest
+            .layers
+            .iter()
+            .filter_map(|l| match l {
+                LayerSpec::Retrieval { dense_exact_until, .. } => Some(*dense_exact_until),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// One token at position `len` through the split decode step: segment by segment, with the
+    /// host's indexer scores, top-k and gather between them (UNVERIFIED).
+    fn step_split(&mut self, token: i32) -> Result<(), ExecError> {
+        let graphs = self.graphs.clone();
+        let manifest = self.manifest.clone();
+        let specs = manifest.split_segments();
+        let retr: Vec<usize> = manifest
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l, LayerSpec::Retrieval { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let pos = self.len;
+        let mut extra: HashMap<String, Vec<f32>> = HashMap::new();
+        for (k, spec) in specs.iter().enumerate() {
+            let last = k == retr.len();
+            let out = self.run(spec, &graphs.split[k], &[token], &extra, last)?;
+            if last {
+                self.pending = out.logits;
+                return Ok(());
+            }
+            let r = retr[k];
+            let LayerSpec::Retrieval { block, topk, local, latent, rope_dim, cache, .. } =
+                manifest.layers[r]
+            else {
+                unreachable!("a retrieval layer");
+            };
+            let take = |name: String| -> Result<Vec<f32>, ExecError> {
+                out.boundary
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| backend_error(format!("segment {k} returned no `{name}`")))
+            };
+            let (q, w) = (take(format!("l{r}.index_q"))?, take(format!("l{r}.index_w"))?);
+            let width = latent + rope_dim;
+            let LayerState::Latent { kv, index } = &self.layers[r] else {
+                return Err(backend_error("a retrieval layer without a latent cache"));
+            };
+            let n = candidates(pos, block, local);
+            let scores = index.scores(&q, &w, n * block);
+            let sel = select(pos, block, topk, local, &scores).ok_or_else(|| {
+                backend_error("the split path ran where dense attention is exact")
+            })?;
+            let mut gathered = Vec::with_capacity(sel.positions.len() * width);
+            for &p in &sel.positions {
+                let row = p % cache;
+                gathered.extend_from_slice(&kv[row * width..(row + 1) * width]);
+            }
+            extra.clear();
+            extra.insert("hidden".into(), take("hidden_out".into())?);
+            extra.insert(format!("l{r}.q_all"), take(format!("l{r}.q_all"))?);
+            extra.insert(format!("l{r}.gate"), take(format!("l{r}.gate"))?);
+            extra.insert(format!("l{r}.gathered"), gathered);
+            extra.insert(format!("l{r}.bias"), sel.bias);
+        }
+        Err(backend_error("the split decode step has no final segment"))
     }
 
     fn mismatch(&self, io: &IoSpec) -> ExecError {
@@ -525,16 +641,18 @@ impl OrtSession {
         let graphs = self.graphs.clone();
         let manifest = self.manifest.clone();
         let spec = manifest.graph(Phase::Decode, 1).expect("loaded with a decode graph");
-        match self.run(spec, &graphs.decode, &[token]) {
-            Ok(logits) => {
-                self.pending = Some(logits);
-                Ok(())
-            }
-            Err(e) => {
-                self.failure = Some(e.to_string());
-                Err(e)
-            }
-        }
+        let step = if self.dense_until().is_some_and(|until| self.len >= until) {
+            self.step_split(token)
+        } else {
+            self.run(spec, &graphs.decode, &[token], &HashMap::new(), true).and_then(|out| {
+                self.pending = out.logits;
+                self.pending
+                    .is_some()
+                    .then_some(())
+                    .ok_or_else(|| backend_error("the decode graph returned no logits"))
+            })
+        };
+        step.inspect_err(|e| self.failure = Some(e.to_string()))
     }
 }
 
@@ -566,7 +684,10 @@ impl ExecSession for OrtSession {
                     k.fill(0.0);
                     v.fill(0.0);
                 }
-                LayerState::Latent { kv } => kv.fill(0.0),
+                LayerState::Latent { kv, index } => {
+                    kv.fill(0.0);
+                    index.truncate(0);
+                }
             }
         }
         self.len = 0;
@@ -589,7 +710,10 @@ impl ExecSession for OrtSession {
                     k.copy_from_slice(ks);
                     v.copy_from_slice(vs);
                 }
-                (LayerState::Latent { kv }, LayerState::Latent { kv: s }) => kv.copy_from_slice(s),
+                (LayerState::Latent { kv, index }, LayerState::Latent { kv: s, index: si }) => {
+                    kv.copy_from_slice(s);
+                    index.clone_from(si);
+                }
                 _ => panic!("a snapshot of another model"),
             }
         }
@@ -603,14 +727,22 @@ impl ExecSession for OrtSession {
         let mut rest = tokens;
         while !rest.is_empty() {
             // The largest bucket that fits, else one token on the decode graph.
-            let bucket = graphs.prefill.iter().find(|(n, _)| *n <= rest.len());
+            // (A bucket runs dense attention: only where every position is below the point the
+            // sparse selection starts to differ.)
+            let until = self.dense_until().unwrap_or(usize::MAX);
+            let bucket = graphs
+                .prefill
+                .iter()
+                .find(|(n, _)| *n <= rest.len() && self.len.saturating_add(*n) <= until);
             match bucket {
                 Some((n, session)) => {
                     let spec = manifest.graph(Phase::Prefill, *n).expect("a loaded bucket");
-                    let logits = self.run(spec, session, &rest[..*n]).inspect_err(|e| {
-                        self.failure = Some(e.to_string());
-                    })?;
-                    self.pending = Some(logits);
+                    let out = self
+                        .run(spec, session, &rest[..*n], &HashMap::new(), true)
+                        .inspect_err(|e| {
+                            self.failure = Some(e.to_string());
+                        })?;
+                    self.pending = out.logits;
                     rest = &rest[*n..];
                 }
                 None => {

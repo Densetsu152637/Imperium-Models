@@ -37,6 +37,17 @@ pub enum Role {
     Latent,
     NewLatent,
     NewIndexKey,
+    /// The split sparse path (UNVERIFIED), per retrieval layer `i` at a segment boundary: the
+    /// absorbed queries `[1, H, 1, latent + rope_dim]`, the sigmoid gate `[1, 1, H * v_dim]`,
+    /// the indexer queries `[1, 1, index_heads * index_dim]` and head weights
+    /// `[1, 1, index_heads]` (outputs of the segment ending at layer `i`), and the gathered
+    /// entries `[1, topk * block + local, latent + rope_dim]` (input of the next segment, with
+    /// its `Bias` `[1, topk * block + local]`).
+    QAll,
+    GateVal,
+    IndexQ,
+    IndexW,
+    Gathered,
     /// The new keys / values of the positions just processed `[1, KVH, T, D]`, for the host to
     /// write into the ring.
     NewK,
@@ -77,6 +88,11 @@ pub enum Phase {
     Prefill,
     /// The f32 triangular inverse of the DeltaNet chunk (split out on NPU targets).
     DeltaInverse,
+    /// One decode step cut at every retrieval layer (UNVERIFIED): segment `k` ends at the
+    /// layer's projection and the next one starts at its attention, with the host's top-k and
+    /// gather ([`crate::retrieval`]) between. `segments = retrieval layers + 1` graphs, in
+    /// [`GraphSpec::segment`] order.
+    DecodeSplit,
 }
 
 /// One exported graph.
@@ -87,6 +103,9 @@ pub struct GraphSpec {
     pub phase: Phase,
     /// Tokens the graph processes (1 for decode, the bucket for prefill).
     pub tokens: usize,
+    /// Which segment of a [`Phase::DecodeSplit`] step this is (0 otherwise).
+    #[serde(default)]
+    pub segment: usize,
     pub inputs: Vec<IoSpec>,
     pub outputs: Vec<IoSpec>,
 }
@@ -180,6 +199,14 @@ impl Manifest {
         self.graphs.iter().find(|g| g.phase == phase && g.tokens == tokens)
     }
 
+    /// The segments of the split decode step, in order (empty without one).
+    pub fn split_segments(&self) -> Vec<&GraphSpec> {
+        let mut v: Vec<&GraphSpec> =
+            self.graphs.iter().filter(|g| g.phase == Phase::DecodeSplit).collect();
+        v.sort_by_key(|g| g.segment);
+        v
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("a manifest serialises")
     }
@@ -196,6 +223,15 @@ impl Manifest {
     /// Cross-checks the manifest: layer indices and rope indices are in range, every graph has
     /// a token input and the per-layer ring and state inputs its layers need.
     pub fn check(&self) -> Result<(), String> {
+        let retrievals =
+            self.layers.iter().filter(|l| matches!(l, LayerSpec::Retrieval { .. })).count();
+        let split = self.split_segments();
+        if !split.is_empty() && split.len() != retrievals + 1 {
+            return Err(format!(
+                "{} split segments for {retrievals} retrieval layers (expected one more)",
+                split.len()
+            ));
+        }
         for g in self.graphs.iter().filter(|g| g.phase != Phase::DeltaInverse) {
             for io in g.inputs.iter().chain(&g.outputs) {
                 if io.layer.is_some_and(|l| l >= self.layers.len()) {
@@ -210,6 +246,19 @@ impl Manifest {
                         g.name, io.name
                     ));
                 }
+            }
+            if g.phase == Phase::DecodeSplit {
+                // Segments carry only the layers between two cuts: the first has the token, the
+                // last the logits, the per-layer checks below do not apply.
+                let first = g.segment == 0;
+                let last = g.segment == retrievals;
+                if first && !g.inputs.iter().any(|i| i.role == Role::Token) {
+                    return Err(format!("{}: no token input", g.name));
+                }
+                if last && !g.outputs.iter().any(|o| o.role == Role::Logits) {
+                    return Err(format!("{}: no logits output", g.name));
+                }
+                continue;
             }
             if !g.inputs.iter().any(|i| i.role == Role::Token) {
                 return Err(format!("{}: no token input", g.name));
@@ -282,6 +331,7 @@ mod tests {
                 file: "decode.onnx".into(),
                 phase: Phase::Decode,
                 tokens: 1,
+                segment: 0,
                 inputs: vec![
                     io("token", Role::Token, None),
                     io("l0.conv_in", Role::ConvIn, Some(0)),

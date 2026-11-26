@@ -540,13 +540,16 @@ pub struct RetWeights {
     pub o: F32Tensor,
 }
 
-/// What a retrieval layer returns.
-pub struct RetOut {
-    pub y: Val,
+/// The part of a retrieval layer before its attention: everything the projection gives.
+pub struct RetPre {
+    /// The absorbed queries `[1, H, T, latent + rope_dim]`.
+    pub q_all: Val,
+    /// The sigmoid output gate `[1, T, H * v_dim]`.
+    pub gate: Val,
     /// The new latent-cache entries `[1, T, latent + rope_dim]` for the host to store.
     pub entry: Val,
-    /// The new positions' normed indexer keys `[1, T, index_dim]` (the host keeps them, 8-bit
-    /// if it likes, for the split sparse path).
+    /// The new positions' normed indexer keys `[1, T, index_dim]` (the host keeps them, 8-bit,
+    /// for the split sparse path).
     pub index_key: Val,
     /// The indexer queries `[1, T, index_heads * index_dim]` and head weights
     /// `[1, T, index_heads]`, for the split sparse path.
@@ -554,19 +557,19 @@ pub struct RetOut {
     pub index_w: Val,
 }
 
+/// What a dense retrieval layer returns.
+pub struct RetOut {
+    pub y: Val,
+    pub pre: RetPre,
+}
+
 impl Cx<'_> {
-    /// One retrieval layer as **dense** attention over its whole latent cache (absorbed MLA:
-    /// the key up-projection folded into the queries, the value up-projection after the
-    /// weighted sum), mirroring `SparseRetrieval::core_projected` and `attend_latent`.
-    /// `cache` is `[1, S, latent + rope_dim]` (the previous positions), `bias` `[T, S + T]`
-    /// additive; `cos`/`sin` `[1, 1, T, rope_dim]` are the layer's YaRN table.
-    ///
-    /// Exact against the Burn layer while its sparse selection would pick every block
-    /// (`positions < local + topk * block`) or when the config is `dense`; beyond that it
-    /// attends to more than the reference does. UNVERIFIED: written from the Burn code
-    /// without a run.
+    /// A retrieval layer up to its attention (`SparseRetrieval::core_projected`): the
+    /// projection, the four norms, the decoupled RoPE, the absorbed queries (the key
+    /// up-projection folded in) and the cache entry. `cos`/`sin` `[1, 1, T, rope_dim]` are the
+    /// layer YaRN table.
     #[allow(clippy::too_many_arguments)]
-    pub fn retrieval_dense(
+    pub fn retrieval_pre(
         &mut self,
         key: &str,
         dm: &RetDims,
@@ -574,10 +577,8 @@ impl Cx<'_> {
         x: &Val,
         cos: &Val,
         sin: &Val,
-        cache: &Val,
-        bias: &Val,
         t: usize,
-    ) -> Result<RetOut, ExportError> {
+    ) -> Result<RetPre, ExportError> {
         let (h, dn, dr, dv, l) = (
             dm.heads as i64,
             dm.nope_dim as i64,
@@ -620,18 +621,38 @@ impl Cx<'_> {
         let entry = self.g.concat(&[&latent, &rope_key], 2);
         let index_key =
             self.rms_norm(&format!("{key}.index_norm.gamma"), &index_k, &w.index_norm, dm.eps);
-        // Absorbed attention over [cache | entry].
+        // The key up-projection absorbed into the queries.
         let uk = self.f32_weight(&format!("{key}.uk.weight"), &w.uk);
         let uk = self.g.reshape(&uk, &[l, h, dn]);
         let uk = self.g.transpose(&uk, &[1, 2, 0]);
         let uk = self.g.reshape(&uk, &[1, h, dn, l]);
         let q_lat = self.g.matmul(&q_nope, &uk);
         let q_all = self.g.concat(&[&q_lat, &q_rope], 3);
-        let kv = self.g.concat(&[cache, &entry], 1);
+        let gate = self.g.sigmoid(&gate);
+        Ok(RetPre { q_all, gate, entry, index_key, index_q, index_w })
+    }
+
+    /// A retrieval layer attention and output projection (`attend_latent`) over `kv`
+    /// `[1, N, latent + rope_dim]` (the cache and new entries, or the gathered blocks and the
+    /// local window), `bias` `[T, N]` additive: scores over the latents plus RoPE keys, the
+    /// weighted latent sum, the value up-projection, the gate, then `o`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retrieval_attend(
+        &mut self,
+        key: &str,
+        dm: &RetDims,
+        w: &RetWeights,
+        pre_q: &Val,
+        gate: &Val,
+        kv: &Val,
+        bias: &Val,
+        t: usize,
+    ) -> Result<Val, ExportError> {
+        let (h, dv, l) = (dm.heads as i64, dm.v_dim as i64, dm.latent as i64);
         let width = (dm.latent + dm.rope_dim) as i64;
-        let kv = self.g.reshape(&kv, &[1, 1, -1, width]);
+        let kv = self.g.reshape(kv, &[1, 1, -1, width]);
         let kvt = self.g.transpose(&kv, &[0, 1, 3, 2]);
-        let scores = self.g.matmul(&q_all, &kvt);
+        let scores = self.g.matmul(pre_q, &kvt);
         let scale = 1.0 / ((dm.nope_dim + dm.rope_dim) as f32).sqrt();
         let scores = self.g.mul_scalar(&scores, scale);
         let scores = self.g.add(&scores, bias);
@@ -644,11 +665,37 @@ impl Cx<'_> {
         let uv = self.g.reshape(&uv, &[1, h, l, dv]);
         let out = self.g.matmul(&mixed, &uv);
         let merged = self.g.transpose(&out, &[0, 2, 1, 3]);
-        let merged = self.g.reshape(&merged, &[1, ti, h * dv]);
-        let gate = self.g.sigmoid(&gate);
-        let gated = self.g.mul(&merged, &gate);
-        let y = self.linear(&format!("{key}.o.weight"), &gated, &w.o)?;
-        Ok(RetOut { y, entry, index_key, index_q, index_w })
+        let merged = self.g.reshape(&merged, &[1, t as i64, h * dv]);
+        let gated = self.g.mul(&merged, gate);
+        self.linear(&format!("{key}.o.weight"), &gated, &w.o)
+    }
+
+    /// One retrieval layer as **dense** attention over its whole latent cache (absorbed MLA),
+    /// mirroring `SparseRetrieval::core_projected` and `attend_latent`: [`Self::retrieval_pre`],
+    /// then [`Self::retrieval_attend`] over `[cache | entry]`. `cache` is `[1, S, latent +
+    /// rope_dim]` (the previous positions), `bias` `[T, S + T]`.
+    ///
+    /// Exact against the Burn layer while its sparse selection would pick every block
+    /// (`positions < local + topk * block`) or when the config is `dense`; beyond that the
+    /// split path (host top-k and gather) is the one that matches. UNVERIFIED: written from the
+    /// Burn code without a run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retrieval_dense(
+        &mut self,
+        key: &str,
+        dm: &RetDims,
+        w: &RetWeights,
+        x: &Val,
+        cos: &Val,
+        sin: &Val,
+        cache: &Val,
+        bias: &Val,
+        t: usize,
+    ) -> Result<RetOut, ExportError> {
+        let pre = self.retrieval_pre(key, dm, w, x, cos, sin, t)?;
+        let kv = self.g.concat(&[cache, &pre.entry], 1);
+        let y = self.retrieval_attend(key, dm, w, &pre.q_all, &pre.gate, &kv, bias, t)?;
+        Ok(RetOut { y, pre })
     }
 }
 
@@ -866,8 +913,8 @@ mod tests {
             .retrieval_dense("r", &dm, &w, &x, &cos, &sin, &cache, &bias, 2)
             .unwrap();
         g.output("y", &out.y, DType::F32, &[1, 2, 32]);
-        g.output("entry", &out.entry, DType::F32, &[1, 2, 20]);
-        g.output("index_key", &out.index_key, DType::F32, &[1, 2, 8]);
+        g.output("entry", &out.pre.entry, DType::F32, &[1, 2, 20]);
+        g.output("index_key", &out.pre.index_key, DType::F32, &[1, 2, 8]);
         g.validate().unwrap();
         assert_eq!(dm.entry_width(), 20);
         assert!(pool.tensor("r.uk.weight").is_some());
