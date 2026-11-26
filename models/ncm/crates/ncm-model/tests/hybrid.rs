@@ -208,3 +208,137 @@ fn tokenizer_trains_through_the_straight_through_path() {
     let loss = ncm_model::hybrid::tokenizer_loss(&out, blocks);
     assert!(values(loss)[0].is_finite());
 }
+
+// ----------------------------------------------------------------------------- model, training
+
+use ncm_model::hybrid::{HybridLm, TrainPlan};
+use ncm_model::{TokenLm, tok_250m_v2};
+
+/// Exact counts of the 250M hybrid against the design's budget table (hand counts, about 1%
+/// high in total): every row within its tolerance, the inference total within 2% of the
+/// design's 254.4M, and the hybrid at most 2% larger than the token baseline.
+#[test]
+fn hybrid_parameter_counts_match_the_budget() {
+    let device = device();
+    let parts = HybridLm::new(&ncm_250m_hybrid(), &device).parts();
+    // (part, design hand count, tolerance). The design counts the token decoder's and the
+    // generator's attention as full multi-head; the token decoder keeps the k = 4 decoder's
+    // grouped keys (4 of 8 heads), so it and the rows around it come in under the hand count.
+    let rows = [
+        ("embeddings", parts.embeddings, 16.4e6, 0.01),
+        ("local encoder", parts.encoder, 10.5e6, 0.02),
+        ("block pooling", parts.pooling, 0.5e6, 0.1),
+        ("backbone", parts.backbone, 169.6e6, 0.01),
+        ("generator layers", parts.generator, 26.8e6, 0.02),
+        ("generator input, levels, head", parts.generator_io, 0.3e6, 0.15),
+        ("codebooks", parts.codebooks, 8.4e6, 0.01),
+        ("token decoder layers", parts.token_decoder, 17.8e6, 0.15),
+        ("token decoder z input, copy head", parts.token_decoder_io, 0.5e6, 0.25),
+        ("tokenizer decoder", parts.tokenizer_decoder, 1.0e6, 0.05),
+        ("memory slots", parts.memory, 2.6e6, 0.25),
+    ];
+    for (what, got, want, rel) in rows {
+        assert_near(what, got, want, rel);
+    }
+    // Not in the design's table: four shared phi convolutions of 256 x 256 x 3.
+    assert_eq!(parts.phi, 4 * (256 * 256 * 3 + 256));
+    assert_eq!(parts.tokenizer_encoder, 32_000 * 256 + 32 * 256);
+    let total = parts.inference();
+    assert_near("inference total", total, 254.4e6, 0.02);
+    let baseline = TokenLm::new(&tok_250m_v2(), &device).parts().total();
+    let gap = total as f64 / baseline as f64 - 1.0;
+    assert!(
+        gap <= 0.02,
+        "hybrid {total} is {:.2}% larger than the baseline {baseline}",
+        gap * 100.0
+    );
+}
+
+fn tiny_model(seed: u64) -> (HybridLm, ncm_model::NcmConfig, HybridConfig, Device) {
+    let device = device();
+    device.seed(seed);
+    let (cfg, h) = tiny_cfg();
+    (HybridLm::new(&cfg, &device), cfg, h, device)
+}
+
+/// Codes of every block of `tokens` `[B, N]`, row-major `[B * nb, Σℓ]`.
+fn block_codes(model: &HybridLm, tokens: Tensor<2, Int>) -> Tensor<2, Int> {
+    let [b, n] = tokens.dims();
+    let l = model.config().block;
+    model.tokenizer().encode(tokens.reshape([b * n / l, l]))
+}
+
+#[test]
+fn training_forward_gives_finite_losses() {
+    let (model, cfg, h, device) = tiny_model(10);
+    let n = 6 * h.block;
+    let toks = tokens(&device, cfg.vocab_size, 2, n, 11);
+    let codes = block_codes(&model, toks.clone());
+    let mut state = 0.37f64;
+    let mut uniform = || {
+        state = (state * 991.0 + 0.13).fract();
+        state
+    };
+    let plan = TrainPlan::sample(&h, codes.clone(), &mut uniform);
+    let out = model.forward_train(toks.clone(), codes.clone(), &plan);
+    assert_eq!(out.code_logits.len(), h.depth());
+    for (logits, &l) in out.code_logits.iter().zip(&h.levels) {
+        assert_eq!(logits.dims(), [2 * 6, l, h.codebook]);
+    }
+    assert_eq!(out.token_logp.dims(), [2, n, cfg.vocab_size]);
+    // Log-probabilities of a distribution: they sum to about 1 per position.
+    let p = values(out.token_logp.clone().exp().sum_dim(2));
+    assert_close(&p, &vec![1.0; p.len()], 1e-4, 0.0);
+    let loss = model.loss(&out, toks, codes, &plan);
+    assert!(values(loss.code)[0].is_finite() && values(loss.token)[0].is_finite());
+    assert_eq!(loss.per_level.len(), h.depth());
+}
+
+/// Causality in training mode: changing tokens at or after a block's start beyond its known
+/// prefix leaves that block's generator logits and memory unchanged (its codes held fixed), and
+/// leaves the token decoder's outputs at earlier positions unchanged.
+#[test]
+fn training_forward_is_causal_across_blocks() {
+    let (model, cfg, h, device) = tiny_model(12);
+    let l = h.block;
+    let nb = 6;
+    let n = nb * l;
+    let toks = tokens(&device, cfg.vocab_size, 1, n, 13);
+    let codes = block_codes(&model, toks.clone());
+    for (blk, known) in [(0usize, 0usize), (3, 0), (3, 5), (5, 7)] {
+        let mut plan = TrainPlan::exact(codes.clone());
+        plan.known[blk] = known;
+        let base = model.forward_train(toks.clone(), codes.clone(), &plan);
+        let cut = blk * l + known;
+        // Perturb every token from the cut on (codes unchanged: they are inputs).
+        let mut data: Vec<i32> =
+            toks.clone().into_data().convert::<i32>().try_to_vec::<i32>().unwrap();
+        for t in data.iter_mut().skip(cut) {
+            *t = (*t + 1) % cfg.vocab_size as i32;
+        }
+        let changed = Tensor::<2, Int>::from_data(TensorData::new(data, [1, n]), &device);
+        let other = model.forward_train(changed, codes.clone(), &plan);
+        for k in 0..h.depth() {
+            let pick = |t: &Tensor<3>| values(t.clone().narrow(0, blk, 1));
+            assert_eq!(
+                pick(&base.code_logits[k]),
+                pick(&other.code_logits[k]),
+                "block {blk} level {k}"
+            );
+        }
+        let mem = |m: &ncm_model::hybrid::Memory| {
+            (values(m.extra.clone().narrow(1, blk, 1)), m.windows[blk])
+        };
+        assert_eq!(mem(&base.memory), mem(&other.memory), "block {blk} memory entries");
+        let (lo, hi) = base.memory.windows[blk];
+        if hi > lo {
+            let seq = |m: &ncm_model::hybrid::Memory| {
+                values(m.seq.clone().unwrap().narrow(1, lo, hi - lo))
+            };
+            assert_eq!(seq(&base.memory), seq(&other.memory), "block {blk} token states");
+        }
+        // Token decoder rows 0..=cut predict tokens up to the cut from tokens before it.
+        let rows = |t: &Tensor<3>| values(t.clone().narrow(1, 0, cut + 1));
+        assert_eq!(rows(&base.token_logp), rows(&other.token_logp), "rows before {cut}");
+    }
+}

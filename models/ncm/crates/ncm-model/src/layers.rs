@@ -167,6 +167,24 @@ impl Rope {
         }
     }
 
+    /// Tables for the absolute positions `positions` (any order, repeats allowed), plain RoPE:
+    /// row i rotates by `positions[i]`.
+    pub fn at(positions: &[usize], head_dim: usize, base: f64, device: &Device) -> Self {
+        let n = positions.len();
+        let mut cos = vec![0.0; n * head_dim];
+        let mut sin = vec![0.0; n * head_dim];
+        let rows = cos.chunks_mut(head_dim).zip(sin.chunks_mut(head_dim));
+        for (&pos, (c, s)) in positions.iter().zip(rows) {
+            rope_values(pos, head_dim, base, 1.0, Yarn::OFF, c, s);
+        }
+        let shape = [1, 1, n, head_dim];
+        Self {
+            cos: Tensor::from_data(TensorData::new(cos, shape), device),
+            sin: Tensor::from_data(TensorData::new(sin, shape), device),
+            rot: rotation(head_dim, device),
+        }
+    }
+
     /// The tables `(cos, sin)` as host values, `len * head_dim` each (for tests).
     pub fn to_vecs(&self) -> (Vec<f32>, Vec<f32>) {
         let read = |t: &Tensor<4>| {

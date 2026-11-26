@@ -203,6 +203,11 @@ impl BlockTokenizer {
         self.emb.num_params() + self.pos.num_params()
     }
 
+    /// The phi convolutions' parameters.
+    pub fn phi_params(&self) -> usize {
+        self.phis.iter().map(Module::num_params).sum()
+    }
+
     /// The codebooks' parameters.
     pub fn codebook_params(&self) -> usize {
         self.codebooks.iter().map(Module::num_params).sum()

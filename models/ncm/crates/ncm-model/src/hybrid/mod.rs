@@ -4,6 +4,10 @@
 //!
 //! Plain Burn tensor code (the reference); fused kernels and CUDA graphs come later.
 
+pub mod memory;
+pub mod model;
 pub mod vq;
 
+pub use memory::Memory;
+pub use model::{HybridLm, HybridLoss, HybridParts, TrainOut, TrainPlan};
 pub use vq::{BlockTokenizer, Ema, Quantised, TokenizerOut, sample_keep, tokenizer_loss};
