@@ -3,9 +3,10 @@
 //! Princeps learns its limits from Imperium's harness and permission system, not from a chat
 //! model's topic refusals.
 //!
-//! What is dropped: "I cannot assist with that", "I'm not able to help with …", "violates
-//! safety and ethical guidelines", "as an AI I can't …", unrequested safer alternatives offered
-//! in place of the request, and lectures about why the request is inappropriate.
+//! What is dropped: a refusal phrase ("I cannot assist", "I'm not able to help with", "as an
+//! AI I can't", ...) given for a harm, legality, ethics, explicit-content or guidelines reason,
+//! and outright lectures ("violates safety", "against my guidelines") wherever they appear,
+//! together with any unrequested "safer alternatives" offered in their place.
 //!
 //! What is kept, because it is honest and not a topic refusal: "I don't know", "I couldn't
 //! verify that", reports of tool, permission or sandbox failures, capability limits ("I can't
@@ -44,41 +45,39 @@ const REFUSALS: [&str; 22] = [
     "as an ai, i cannot",
 ];
 
-/// Phrases that moralise about the request or cite guidelines as the reason not to do it.
-const MORALISING: [&str; 10] = [
+/// Phrases that are a topic refusal wherever they appear.
+const ALWAYS: [&str; 4] = [
     "violates safety",
     "against my guidelines",
     "against my ethical guidelines",
-    "ethical guidelines",
-    "safety guidelines",
-    "content policy",
-    "it would be inappropriate",
-    "it is not appropriate for me",
-    "it's not appropriate for me",
     "i'd encourage you to reconsider",
 ];
 
-/// Phrases that mark a "can't" as an honest capability limit (the tools offered, access, what
-/// the assistant can actually do) rather than a refusal of the topic. A refusal phrase next to
-/// one of these is kept; moralising never is.
-const CAPABILITY: [&str; 17] = [
-    "capabilit",
-    "i only have",
-    "i can only",
-    "only help with",
-    "available tool",
-    "provided tool",
-    "tools available",
-    "the tool",
-    "the provided \"",
-    "function only",
-    "don't have access",
-    "do not have access",
-    "not available",
-    "functionality",
-    "live updates",
-    "isn't covered by the tools",
-    "only current",
+/// Reasons a chat-tuned model gives for refusing a topic: harm, legality, ethics, explicit
+/// content, guidelines. A refusal phrase only counts beside one of these; a bare "I can't" is
+/// almost always an honest scope, tool, capability or operator-policy limit, which stays.
+const MORALISING: [&str; 21] = [
+    "harmful",
+    "unethical",
+    "illegal",
+    "inappropriate",
+    "not appropriate",
+    "explicit content",
+    "adult content",
+    "sexual",
+    "nsfw",
+    "offensive",
+    "ethical, legal",
+    "ethical restrictions",
+    "ethical concerns",
+    "ethical guidelines",
+    "safety guidelines",
+    "my guidelines",
+    "usage guidelines",
+    "content policy",
+    "promote or",
+    "condone",
+    "morally",
 ];
 
 fn fold(text: &str) -> String {
@@ -89,12 +88,11 @@ fn fold(text: &str) -> String {
 pub fn refusal_in(content: &str) -> Option<&'static str> {
     let text = fold(content);
     let hit = |list: &[&'static str]| list.iter().copied().find(|p| text.contains(p));
-    // An unrequested "safer alternative" is only dropped with a refusal or lecture beside it;
-    // offering alternatives on its own is fine.
-    if let Some(p) = hit(&MORALISING) {
+    if let Some(p) = hit(&ALWAYS) {
         return Some(p);
     }
-    hit(&REFUSALS).filter(|_| hit(&CAPABILITY).is_none())
+    // An unrequested "safer alternative" is only dropped as part of such a refusal.
+    hit(&REFUSALS).filter(|_| hit(&MORALISING).is_some())
 }
 
 /// The first refusal pattern in any assistant turn of a conversation, if any.
@@ -109,12 +107,13 @@ mod tests {
     #[test]
     fn topic_refusals_are_found() {
         for reply in [
-            "I cannot assist with finding that content.",
+            "I cannot assist with finding explicit content.",
             "I'm sorry, but I can't help with NSFW mods.",
             "This request violates safety and ethical guidelines.",
-            "I\u{2019}m not able to help with that request.",
-            "As an AI language model, I must decline.",
-            "I can't provide that. Instead, I can suggest some safer alternatives.",
+            "I\u{2019}m not able to help with that request; it would be inappropriate.",
+            "As an AI language model, I must decline: it is unethical.",
+            "I can't provide that because it could be harmful. Instead, I can suggest safer alternatives.",
+            "I can't help with that; it goes against my ethical guidelines and our content policy.",
         ] {
             assert!(refusal_in(reply).is_some(), "{reply}");
         }
@@ -133,6 +132,11 @@ mod tests {
             "I'm sorry, but I can't assist with ordering a pizza. I only have the capability to              help you create todo items using the `create_todo` tool.",
             "I cannot fulfill this request with the available tools.",
             "I cannot assist with this request as I do not have access to the required tools.",
+            "I'm sorry, but I can't approve a refund: our policy only allows refunds within 30 days.",
+            "I'm sorry, but I can't access your booking without first verifying your identity.",
+            "Health advisory: follow local safety guidelines when the AQI is above 100.",
+            "I'm a food delivery agent, so I can't assist with job applications.",
+            "There's no tool for ice hockey schedules, so I cannot provide them.",
         ] {
             assert_eq!(refusal_in(reply), None, "{reply}");
         }
