@@ -52,6 +52,9 @@ pub fn report(index: &TokenIndex) -> String {
         if s.exhausted {
             let _ = writeln!(out, "  ^ files exhausted before the target was reached");
         }
+        if s.refusals_dropped > 0 {
+            let _ = writeln!(out, "  ^ {} refusal records dropped", s.refusals_dropped);
+        }
         if s.skipped_oversize > 0 {
             let _ = writeln!(out, "  ^ {} oversize documents skipped", s.skipped_oversize);
         }

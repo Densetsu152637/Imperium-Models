@@ -69,6 +69,8 @@ pub struct Totals {
     pub val: usize,
     pub needs_regeneration: usize,
     pub excluded: usize,
+    /// Samples dropped by the no-refusals rule ([`crate::refusal`]), also counted in `excluded`.
+    pub topic_refusals_dropped: usize,
     pub characters: usize,
     pub with_think: usize,
     pub with_tool_calls: usize,
@@ -256,6 +258,9 @@ pub fn build(archive: &Path, out: &Path, model: Model, policy: &Policy) -> Resul
     let regen_path = out_dir.join("needs-regeneration.jsonl");
     let mut dataset = BufWriter::new(io(&dataset_path, File::create(&dataset_path))?);
     let mut regen = BufWriter::new(io(&regen_path, File::create(&regen_path))?);
+    // The refusal layer: samples kept out of the base set for refusing, with their class.
+    let refusals_path = out_dir.join("refusals.jsonl");
+    let mut refusals = BufWriter::new(io(&refusals_path, File::create(&refusals_path))?);
 
     let mut stats = Stats {
         model: model.name().to_owned(),
@@ -297,6 +302,25 @@ pub fn build(archive: &Path, out: &Path, model: Model, policy: &Policy) -> Resul
                     }
                 };
                 let outcome = convert(&raw, policy).and_then(|done| {
+                    // Princeps learns no topic refusals ([`crate::refusal`]).
+                    if let Some(found) = crate::refusal::classify(&done.messages) {
+                        let line = json!({
+                            "id": done.id,
+                            "source_file": label,
+                            "class": found.class.name(),
+                            "pattern": found.pattern,
+                            "messages": done.messages,
+                            "text": done.rendered.text,
+                        });
+                        // A failed write only loses a layer record; the base set is unaffected.
+                        let _ = serde_json::to_writer(&mut refusals, &line)
+                            .map_err(std::io::Error::from)
+                            .and_then(|()| refusals.write_all(b"\n"));
+                        return Err(Rejection::Excluded(format!(
+                            "topic_refusal:{}",
+                            found.pattern
+                        )));
+                    }
                     if seen.insert(done.id.clone()) {
                         Ok(done)
                     } else {
@@ -367,6 +391,7 @@ pub fn build(archive: &Path, out: &Path, model: Model, policy: &Policy) -> Resul
     }
     io(&dataset_path, dataset.flush())?;
     io(&regen_path, regen.flush())?;
+    io(&refusals_path, refusals.flush())?;
 
     for file in stats.files.values() {
         stats.totals.records_in += file.records_in;
@@ -376,6 +401,12 @@ pub fn build(archive: &Path, out: &Path, model: Model, policy: &Policy) -> Resul
         stats.totals.with_tool_calls += file.with_tool_calls;
         stats.totals.needs_regeneration += file.needs_regeneration.values().sum::<usize>();
         stats.totals.excluded += file.excluded.values().sum::<usize>();
+        stats.totals.topic_refusals_dropped += file
+            .excluded
+            .iter()
+            .filter(|(code, _)| code.starts_with("topic_refusal:"))
+            .map(|(_, n)| n)
+            .sum::<usize>();
     }
     let accepted = stats.totals.accepted.max(1) as f64;
     stats.totals.share_with_think = stats.totals.with_think as f64 / accepted;

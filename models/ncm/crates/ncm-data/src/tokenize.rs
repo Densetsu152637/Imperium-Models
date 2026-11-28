@@ -97,6 +97,8 @@ pub fn tokenize_source(
         train: Counts::default(),
         val: Counts::default(),
         skipped_oversize: 0,
+        refusals_dropped: 0,
+        refusal_layer: Default::default(),
         exhausted: false,
         files: files.len(),
     };
@@ -182,6 +184,7 @@ pub fn tokenize_source(
     drop(rx);
     stats.skipped_oversize =
         reader.join().map_err(|_| Error::Data("reader thread panicked".into()))?;
+    stats.refusals_dropped = crate::chat::take_refusals_dropped();
     outcome?;
     stats.exhausted = !reached;
     let mut shards = train.finish()?;
@@ -232,7 +235,14 @@ pub fn run(mix: &Mix, data_dir: &Path, only: &[String], opts: &Options) -> Resul
             source.target_tokens(opts.budget_tokens) as f64 / 1e9
         );
         let files = local_files(data_dir, &lock, source)?;
-        let (stats, shards) = tokenize_source(&tok, source, files, opts, &tokens_dir)?;
+        let layer_path = data_dir.join("refusal-layer").join(format!("{}.jsonl", source.name));
+        crate::chat::open_refusal_layer(&layer_path, &source.name)
+            .ctx(format!("creating {}", layer_path.display()))?;
+        let tokenized = tokenize_source(&tok, source, files, opts, &tokens_dir);
+        let layer =
+            crate::chat::close_refusal_layer().ctx(format!("writing {}", layer_path.display()))?;
+        let (mut stats, shards) = tokenized?;
+        stats.refusal_layer = layer;
         index.sources.retain(|s| s.name != source.name);
         index.shards.retain(|s| s.source != source.name);
         index.sources.push(stats);
