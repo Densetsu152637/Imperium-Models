@@ -7,11 +7,17 @@ Consul is a thinking model: its `<think>` block is removed before the answer is 
 `--max-tokens` leaves room for the reasoning as well as the critique.
 Before any scoring the held-out set is checked against the training tasks and the run refuses
 if they overlap.
+
+`--backend imperium` asks Consul through Imperium's headless agent loop instead (R5 eval H2,
+`consul.eval.imperium`): `--harness <profile>` once Imperium has harness profiles, otherwise the
+stock loop with Consul's prompt as an overlay. The report then lists each run's exit reason, prompt
+hash and engine version under `runs`.
 """
 
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from emperor.eval.cli import CONTEXT_TIERS, DEFAULT_BASE_URL
@@ -19,6 +25,7 @@ from emperor.eval.models import OpenAICompatModel
 
 from consul import prompts
 from consul.data import load_tasks
+from consul.eval.imperium import ImperiumSettings, imperium_answer
 from consul.eval.report import run_suite
 from consul.overlap import DEFAULT_THRESHOLD, overlap_report
 from consul.score import reference_critique
@@ -43,6 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dry-run", action="store_true", help="answer with the reference critique")
     parser.add_argument("--output", type=Path, help="write the JSON report here")
+    parser.add_argument("--backend", choices=["llamacpp", "imperium"], default="llamacpp")
+    parser.add_argument("--imperium", type=Path, help="imperium executable (--backend imperium)")
+    parser.add_argument("--root-model", help="imperium --root-model (default: --base-url)")
+    parser.add_argument("--harness", help="harness profile; omit for the overlay stand-in")
+    parser.add_argument("--permission-mode", default="plan")
+    parser.add_argument("--thinking", choices=["on", "off"])
     return parser
 
 
@@ -73,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     name = args.model.split(":", 1)[-1]
+    runs: list = []
     if args.dry_run:
         by_id = {t.id: t for t in tasks}
 
@@ -80,6 +94,21 @@ def main(argv: list[str] | None = None) -> int:
             return json.dumps(reference_critique(by_id[task.id]))
 
         backend = "replay"
+    elif args.backend == "imperium":
+        if not args.imperium:
+            print("eval: --backend imperium needs --imperium <executable>", file=sys.stderr)
+            return 2
+        settings = ImperiumSettings(
+            exe=args.imperium,
+            root_model=args.root_model or args.base_url,
+            model_id=name,
+            harness=args.harness,
+            permission_mode=args.permission_mode,
+            thinking=args.thinking,
+            context_tokens=CONTEXT_TIERS[args.context_tier],
+        )
+        answer = imperium_answer(settings, runs)
+        backend = settings.backend
     else:
         answer = model_answer(OpenAICompatModel(args.base_url, name, max_tokens=args.max_tokens))
         backend = "llamacpp"
@@ -93,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         context_tokens=CONTEXT_TIERS[args.context_tier],
         overlap=overlap,
     )
+    if runs:
+        report["runs"] = [asdict(r) for r in runs]
     text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
