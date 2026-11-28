@@ -55,6 +55,7 @@ Fine-tuning reuses the token-era DeepSeek teacher traces cached in `../../archiv
 - No Claude data: every dataset card was read for Claude or Anthropic as a data generator or filter, and the result is in the source's `claude_check`. Synthetic sets name their generators (DeepSeek-R1, QwQ-32B, Qwen3, GPT-OSS, Llama 3), recorded under `generators`.
 - Web text and papers dated March 2023 or later are dropped (Claude 1 shipped then; AI-written text on the web grows afterwards). The exclusion rules live in the manifest.
 - Every source is pinned to a 40-character commit revision; files come from `resolve/<revision>/` and are checked against the Hub's SHA-256.
+- No topic refusals (user decision, 2026-11-28), in every Princeps dataset: pretraining chat and trace sources, fine-tuning sets, teacher data and regenerations. A sample whose assistant refuses or moralises about a topic the user asked for ("I cannot assist…", "violates safety and ethical guidelines", lectures, unrequested safer alternatives) is dropped. Honest limits stay: "I don't know", "I couldn't verify", tool, permission and capability limits, and questions asking for missing information. The rule is `ncm_model::refusal` (patterns and tests there), applied by `ncm-sft` (counted as `totals.topic_refusals_dropped` and `excluded.topic_refusal:*` in `stats.json`) and by `ncm-data` for chat and trace sources (`refusals_dropped` per source in the token stats).
 
 ### The mix (20B tokens)
 

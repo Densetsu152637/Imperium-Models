@@ -43,6 +43,9 @@ pub struct SourceStats {
     pub val: Counts,
     /// Documents skipped for exceeding the size cap.
     pub skipped_oversize: u64,
+    /// Chat and trace records dropped by the no-refusals rule ([`ncm_model::refusal`]).
+    #[serde(default)]
+    pub refusals_dropped: u64,
     /// The files ran out before the token target was reached.
     pub exhausted: bool,
     pub files: usize,

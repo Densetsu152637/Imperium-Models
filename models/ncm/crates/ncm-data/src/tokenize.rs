@@ -97,6 +97,7 @@ pub fn tokenize_source(
         train: Counts::default(),
         val: Counts::default(),
         skipped_oversize: 0,
+        refusals_dropped: 0,
         exhausted: false,
         files: files.len(),
     };
@@ -182,6 +183,7 @@ pub fn tokenize_source(
     drop(rx);
     stats.skipped_oversize =
         reader.join().map_err(|_| Error::Data("reader thread panicked".into()))?;
+    stats.refusals_dropped = crate::chat::take_refusals_dropped();
     outcome?;
     stats.exhausted = !reached;
     let mut shards = train.finish()?;

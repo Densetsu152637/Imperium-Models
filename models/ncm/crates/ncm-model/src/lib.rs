@@ -9,6 +9,7 @@ pub mod chat;
 pub mod config;
 pub mod layers;
 pub mod ncm;
+pub mod refusal;
 pub mod tok;
 pub mod weights;
 

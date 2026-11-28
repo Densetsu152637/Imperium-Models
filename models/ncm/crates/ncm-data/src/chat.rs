@@ -6,7 +6,28 @@
 
 use std::borrow::Cow;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ncm_model::chat::{self, Message, Role, ToolCall, ToolDef};
+
+/// Chat and trace records dropped by the no-refusals rule ([`ncm_model::refusal`]) since the
+/// last [`take_refusals_dropped`]. Sources are tokenized one at a time, so this is per source.
+static REFUSALS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The count of records dropped by the no-refusals rule since the last call, reset to zero.
+pub fn take_refusals_dropped() -> u64 {
+    REFUSALS_DROPPED.swap(0, Ordering::SeqCst)
+}
+
+/// Whether `messages` hold a topic refusal; counts it if so. Princeps learns no topic
+/// refusals, in pretraining as in fine-tuning.
+fn refuses(messages: &[Message]) -> bool {
+    let hit = ncm_model::refusal::refusal(messages).is_some();
+    if hit {
+        REFUSALS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+    hit
+}
 use serde_json::Value;
 
 /// Make text safe to encode: a literal special-token string in a document must not become the
@@ -122,6 +143,9 @@ pub fn render_trace(problem: &str, response: &str) -> Option<String> {
         Message::new(Role::User, defuse(problem)),
         Message::assistant(defuse(answer), Some(&defuse(think))),
     ];
+    if refuses(&messages) {
+        return None;
+    }
     Some(chat::render(&messages, &[]).text)
 }
 
@@ -184,6 +208,9 @@ pub fn render(row: &Value, messages_field: &str) -> Option<String> {
         messages.push(Message::new(Role::System, system));
     }
     messages.extend(turns);
+    if refuses(&messages) {
+        return None;
+    }
     Some(chat::render(&messages, &tools).text)
 }
 

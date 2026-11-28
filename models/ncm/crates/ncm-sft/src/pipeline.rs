@@ -69,6 +69,8 @@ pub struct Totals {
     pub val: usize,
     pub needs_regeneration: usize,
     pub excluded: usize,
+    /// Samples dropped by the no-refusals rule ([`crate::refusal`]), also counted in `excluded`.
+    pub topic_refusals_dropped: usize,
     pub characters: usize,
     pub with_think: usize,
     pub with_tool_calls: usize,
@@ -297,6 +299,10 @@ pub fn build(archive: &Path, out: &Path, model: Model, policy: &Policy) -> Resul
                     }
                 };
                 let outcome = convert(&raw, policy).and_then(|done| {
+                    // Princeps learns no topic refusals ([`crate::refusal`]).
+                    if let Some(pattern) = crate::refusal::refusal(&done.messages) {
+                        return Err(Rejection::Excluded(format!("topic_refusal:{pattern}")));
+                    }
                     if seen.insert(done.id.clone()) {
                         Ok(done)
                     } else {
@@ -376,6 +382,12 @@ pub fn build(archive: &Path, out: &Path, model: Model, policy: &Policy) -> Resul
         stats.totals.with_tool_calls += file.with_tool_calls;
         stats.totals.needs_regeneration += file.needs_regeneration.values().sum::<usize>();
         stats.totals.excluded += file.excluded.values().sum::<usize>();
+        stats.totals.topic_refusals_dropped += file
+            .excluded
+            .iter()
+            .filter(|(code, _)| code.starts_with("topic_refusal:"))
+            .map(|(_, n)| n)
+            .sum::<usize>();
     }
     let accepted = stats.totals.accepted.max(1) as f64;
     stats.totals.share_with_think = stats.totals.with_think as f64 / accepted;

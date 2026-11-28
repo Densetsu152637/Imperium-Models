@@ -7,5 +7,6 @@ pub mod format;
 pub mod message;
 pub mod pipeline;
 pub mod qwen;
+pub use ncm_model::refusal;
 pub mod split;
 pub mod tools;
