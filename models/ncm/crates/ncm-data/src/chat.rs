@@ -6,6 +6,11 @@
 
 use std::borrow::Cow;
 
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ncm_model::chat::{self, Message, Role, ToolCall, ToolDef};
@@ -19,14 +24,64 @@ pub fn take_refusals_dropped() -> u64 {
     REFUSALS_DROPPED.swap(0, Ordering::SeqCst)
 }
 
-/// Whether `messages` hold a topic refusal; counts it if so. Princeps learns no topic
-/// refusals, in pretraining as in fine-tuning.
-fn refuses(messages: &[Message]) -> bool {
-    let hit = ncm_model::refusal::refusal(messages).is_some();
-    if hit {
-        REFUSALS_DROPPED.fetch_add(1, Ordering::SeqCst);
+/// Where the refusal layer of the source being tokenized goes: the dropped records, rendered,
+/// one JSON line each with their class (user decision, 2026-11-28: the base data has no
+/// refusals; the refusal layer is kept apart so an aligned variant can add it, class by class).
+struct Layer {
+    source: String,
+    out: BufWriter<File>,
+    by_class: BTreeMap<String, u64>,
+}
+
+static LAYER: Mutex<Option<Layer>> = Mutex::new(None);
+
+/// Starts writing the refusal layer of `source` to `path` (replacing it).
+pub fn open_refusal_layer(path: &Path, source: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
-    hit
+    let out = BufWriter::new(File::create(path)?);
+    let layer = Layer { source: source.to_owned(), out, by_class: BTreeMap::new() };
+    *LAYER.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(layer);
+    Ok(())
+}
+
+/// Finishes the open refusal layer; returns its record count per class.
+pub fn close_refusal_layer() -> std::io::Result<BTreeMap<String, u64>> {
+    let taken = LAYER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    match taken {
+        Some(mut layer) => {
+            layer.out.flush()?;
+            Ok(layer.by_class)
+        }
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+/// Whether `messages` hold a topic refusal. If so it is counted and, when a refusal layer is
+/// open, written there with its class. Princeps's base data learns no refusals, in
+/// pretraining as in fine-tuning.
+fn refuses(messages: &[Message], tools: &[ToolDef]) -> bool {
+    let Some(found) = ncm_model::refusal::classify(messages) else {
+        return false;
+    };
+    REFUSALS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    let mut guard = LAYER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(layer) = guard.as_mut() {
+        let class = found.class.name();
+        let line = serde_json::json!({
+            "source": layer.source,
+            "class": class,
+            "pattern": found.pattern,
+            "text": chat::render(messages, tools).text,
+        });
+        // A failed write only loses a layer record; the base data is unaffected.
+        if serde_json::to_writer(&mut layer.out, &line).is_ok() {
+            let _ = layer.out.write_all(b"\n");
+            *layer.by_class.entry(class.to_owned()).or_default() += 1;
+        }
+    }
+    true
 }
 use serde_json::Value;
 
@@ -143,7 +198,7 @@ pub fn render_trace(problem: &str, response: &str) -> Option<String> {
         Message::new(Role::User, defuse(problem)),
         Message::assistant(defuse(answer), Some(&defuse(think))),
     ];
-    if refuses(&messages) {
+    if refuses(&messages, &[]) {
         return None;
     }
     Some(chat::render(&messages, &[]).text)
@@ -208,7 +263,7 @@ pub fn render(row: &Value, messages_field: &str) -> Option<String> {
         messages.push(Message::new(Role::System, system));
     }
     messages.extend(turns);
-    if refuses(&messages) {
+    if refuses(&messages, &tools) {
         return None;
     }
     Some(chat::render(&messages, &tools).text)

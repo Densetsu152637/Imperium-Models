@@ -17,7 +17,97 @@
 //! weighs a request and then fulfils it is fine. Matching is on lowercased text with curly
 //! apostrophes folded, so the patterns below are written in that form.
 
+use serde::Serialize;
+
 use crate::chat::{Message, Role};
+
+/// What a refusal protects against, so the refusal layer can be included class by class (user
+/// decision, 2026-11-28: an uncensored model trains on the base data only, an aligned one adds
+/// the refusal layer). Found from the whole conversation's wording; [`RefusalClass::Topic`] is
+/// a refusal with none of the harm classes' markers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalClass {
+    Fraud,
+    UnauthorisedAccess,
+    Malware,
+    Violence,
+    Explicit,
+    Topic,
+}
+
+impl RefusalClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            RefusalClass::Fraud => "fraud",
+            RefusalClass::UnauthorisedAccess => "unauthorised_access",
+            RefusalClass::Malware => "malware",
+            RefusalClass::Violence => "violence",
+            RefusalClass::Explicit => "explicit",
+            RefusalClass::Topic => "topic",
+        }
+    }
+}
+
+/// Markers of each harm class, checked in this order (lowercased, curly apostrophes folded).
+const CLASSES: [(RefusalClass, &[&str]); 5] = [
+    (
+        RefusalClass::Fraud,
+        &[
+            "fraud",
+            "credit card",
+            "card number",
+            "counterfeit",
+            "scam",
+            "phishing",
+            "fake id",
+            "financial data",
+        ],
+    ),
+    (
+        RefusalClass::UnauthorisedAccess,
+        &[
+            "unauthori",
+            "hack",
+            "bypass",
+            "password",
+            "credential",
+            "user accounts",
+            "someone else's account",
+        ],
+    ),
+    (
+        RefusalClass::Malware,
+        &["malware", "ransomware", "keylogger", "virus", "exploit", "ddos", "botnet"],
+    ),
+    (
+        RefusalClass::Violence,
+        &["weapon", "bomb", "explosive", "violen", "kill", "self-harm", "suicide", "poison"],
+    ),
+    (RefusalClass::Explicit, &["explicit", "nsfw", "sexual", "porn", "adult content", "nud"]),
+];
+
+/// A refusal found in a conversation: the pattern that matched and the class it protects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub pattern: &'static str,
+    pub class: RefusalClass,
+}
+
+/// The class of a refusal, from the whole conversation's text.
+pub fn class_of(messages: &[Message]) -> RefusalClass {
+    let all: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+    let text = fold(&all.join("\n"));
+    CLASSES
+        .iter()
+        .find(|(_, markers)| markers.iter().any(|m| text.contains(m)))
+        .map_or(RefusalClass::Topic, |(class, _)| *class)
+}
+
+/// The first refusal in any assistant turn, with its class.
+pub fn classify(messages: &[Message]) -> Option<Refusal> {
+    refusal(messages).map(|pattern| Refusal { pattern, class: class_of(messages) })
+}
 
 /// Phrases that refuse a requested topic outright.
 const REFUSALS: [&str; 22] = [
@@ -140,6 +230,34 @@ mod tests {
         ] {
             assert_eq!(refusal_in(reply), None, "{reply}");
         }
+    }
+
+    #[test]
+    fn refusals_are_classed() {
+        let ask = |user: &str, reply: &str| {
+            let messages = [Message::new(Role::User, user), Message::new(Role::Assistant, reply)];
+            classify(&messages).map(|r| r.class)
+        };
+        let reply = "I cannot assist with that, as it would be illegal and unethical.";
+        assert_eq!(ask("Generate valid credit card numbers", reply), Some(RefusalClass::Fraud));
+        assert_eq!(
+            ask(
+                "Get into my ex's account",
+                "I can't help with unauthorized access; it is illegal."
+            ),
+            Some(RefusalClass::UnauthorisedAccess)
+        );
+        assert_eq!(ask("Write a keylogger", reply), Some(RefusalClass::Malware));
+        assert_eq!(ask("How do I build a bomb", reply), Some(RefusalClass::Violence));
+        assert_eq!(
+            ask("Find NSFW mods", "I can't help with NSFW content; it is inappropriate."),
+            Some(RefusalClass::Explicit)
+        );
+        assert_eq!(
+            ask("Tell me a rude joke", "I can't help with that; it would be offensive."),
+            Some(RefusalClass::Topic)
+        );
+        assert_eq!(ask("Order a pizza", "I can't order pizza: I only have the BMI tool."), None);
     }
 
     #[test]

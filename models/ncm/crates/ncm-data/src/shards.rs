@@ -46,6 +46,9 @@ pub struct SourceStats {
     /// Chat and trace records dropped by the no-refusals rule ([`ncm_model::refusal`]).
     #[serde(default)]
     pub refusals_dropped: u64,
+    /// The dropped records by class, written to `data/refusal-layer/<source>.jsonl`.
+    #[serde(default)]
+    pub refusal_layer: std::collections::BTreeMap<String, u64>,
     /// The files ran out before the token target was reached.
     pub exhausted: bool,
     pub files: usize,
